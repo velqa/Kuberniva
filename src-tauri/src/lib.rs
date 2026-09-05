@@ -1,11 +1,14 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::Utc;
 use futures_util::StreamExt;
+use k8s_openapi::api::authorization::v1::{
+    ResourceAttributes, SelfSubjectAccessReview, SelfSubjectAccessReviewSpec,
+};
 use k8s_openapi::api::core::v1::{Event, Namespace, Node, Pod};
 use kube::{
     api::{
-        Api, AttachParams, DeleteParams, DynamicObject, ListParams, LogParams, Preconditions,
-        WatchEvent, WatchParams,
+        Api, AttachParams, DeleteParams, DynamicObject, ListParams, LogParams, PostParams,
+        Preconditions, WatchEvent, WatchParams,
     },
     config::{KubeConfigOptions, Kubeconfig},
     core::ApiResource,
@@ -97,6 +100,37 @@ struct ResourceRequest {
     plural: String,
     namespaced: bool,
     namespace: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AccessReviewCheck {
+    key: String,
+    group: String,
+    version: String,
+    resource: String,
+    verb: String,
+    namespace: Option<String>,
+    name: Option<String>,
+    subresource: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AccessReviewRequest {
+    kubeconfig_path: Option<String>,
+    context: Option<String>,
+    checks: Vec<AccessReviewCheck>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccessReviewDecision {
+    key: String,
+    allowed: bool,
+    denied: bool,
+    reason: Option<String>,
+    evaluation_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1085,6 +1119,121 @@ fn api_resource(group: String, version: String, kind: String, plural: String) ->
         kind,
         plural,
     }
+}
+
+fn normalized_access_value(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let value = value.trim().to_string();
+        (!value.is_empty()).then_some(value)
+    })
+}
+
+async fn review_resource_access(client: Client, check: AccessReviewCheck) -> AccessReviewDecision {
+    let review = SelfSubjectAccessReview {
+        metadata: Default::default(),
+        spec: SelfSubjectAccessReviewSpec {
+            non_resource_attributes: None,
+            resource_attributes: Some(ResourceAttributes {
+                group: Some(check.group.clone()),
+                version: Some(check.version.clone()),
+                resource: Some(check.resource.clone()),
+                verb: Some(check.verb.clone()),
+                namespace: normalized_access_value(check.namespace.clone()),
+                name: normalized_access_value(check.name.clone()),
+                subresource: normalized_access_value(check.subresource.clone()),
+                ..Default::default()
+            }),
+        },
+        status: None,
+    };
+    match Api::<SelfSubjectAccessReview>::all(client)
+        .create(&PostParams::default(), &review)
+        .await
+    {
+        Ok(response) => match response.status {
+            Some(status) => AccessReviewDecision {
+                key: check.key,
+                allowed: status.allowed,
+                denied: status.denied.unwrap_or(false),
+                reason: status.reason,
+                evaluation_error: status.evaluation_error,
+            },
+            None => AccessReviewDecision {
+                key: check.key,
+                allowed: false,
+                denied: false,
+                reason: None,
+                evaluation_error: Some(
+                    "The Kubernetes API returned no authorization decision".to_string(),
+                ),
+            },
+        },
+        Err(error) => AccessReviewDecision {
+            key: check.key,
+            allowed: false,
+            denied: false,
+            reason: None,
+            evaluation_error: Some(error.to_string()),
+        },
+    }
+}
+
+fn access_denied_message(check: &AccessReviewCheck, decision: &AccessReviewDecision) -> String {
+    let target = check
+        .subresource
+        .as_ref()
+        .filter(|value| !value.is_empty())
+        .map(|subresource| format!("{}/{}", check.resource, subresource))
+        .unwrap_or_else(|| check.resource.clone());
+    let scope = check
+        .namespace
+        .as_ref()
+        .filter(|value| !value.is_empty())
+        .map(|namespace| format!(" in namespace {namespace}"))
+        .unwrap_or_default();
+    let detail = decision
+        .evaluation_error
+        .as_ref()
+        .or(decision.reason.as_ref())
+        .map(|detail| format!(": {detail}"))
+        .unwrap_or_default();
+    format!(
+        "Kubernetes authorization did not allow {} on {}{}{}",
+        check.verb, target, scope, detail
+    )
+}
+
+async fn ensure_resource_access(client: Client, check: AccessReviewCheck) -> Result<(), String> {
+    let decision = review_resource_access(client, check.clone()).await;
+    decision
+        .allowed
+        .then_some(())
+        .ok_or_else(|| access_denied_message(&check, &decision))
+}
+
+#[tauri::command]
+async fn check_resource_permissions(
+    request: AccessReviewRequest,
+) -> Result<Vec<AccessReviewDecision>, String> {
+    if request.checks.len() > 256 {
+        return Err("Permission reviews are limited to 256 actions per request".to_string());
+    }
+    if request.checks.iter().any(|check| {
+        check.key.trim().is_empty()
+            || check.resource.trim().is_empty()
+            || check.verb.trim().is_empty()
+    }) {
+        return Err("Every permission review needs a key, resource, and verb".to_string());
+    }
+    let client = client_for(request.kubeconfig_path, request.context).await?;
+    let decisions = futures_util::stream::iter(request.checks.into_iter().map(|check| {
+        let client = client.clone();
+        async move { review_resource_access(client, check).await }
+    }))
+    .buffer_unordered(16)
+    .collect::<Vec<_>>()
+    .await;
+    Ok(decisions)
 }
 
 fn workload_label_selector(manifest: &Value) -> Result<String, String> {
@@ -2326,6 +2475,20 @@ async fn get_resource_detail(request: ResourceObjectRequest) -> Result<ResourceD
 #[tauri::command]
 async fn delete_resource_object(request: ResourceObjectRequest) -> Result<(), String> {
     let client = client_for(request.kubeconfig_path, request.context).await?;
+    ensure_resource_access(
+        client.clone(),
+        AccessReviewCheck {
+            key: "delete".to_string(),
+            group: request.group.clone(),
+            version: request.version.clone(),
+            resource: request.plural.clone(),
+            verb: "delete".to_string(),
+            namespace: request.namespace.clone(),
+            name: Some(request.name.clone()),
+            subresource: None,
+        },
+    )
+    .await?;
     let resource = api_resource(request.group, request.version, request.kind, request.plural);
     let delete_params = if request.uid.is_some() || request.resource_version.is_some() {
         DeleteParams::default().preconditions(Preconditions {
@@ -2355,6 +2518,20 @@ async fn delete_resource_object(request: ResourceObjectRequest) -> Result<(), St
 #[tauri::command]
 async fn save_resource_detail(request: SaveResourceRequest) -> Result<(), String> {
     let client = client_for(request.kubeconfig_path, request.context).await?;
+    ensure_resource_access(
+        client.clone(),
+        AccessReviewCheck {
+            key: "update".to_string(),
+            group: request.group.clone(),
+            version: request.version.clone(),
+            resource: request.plural.clone(),
+            verb: "update".to_string(),
+            namespace: request.namespace.clone(),
+            name: Some(request.name.clone()),
+            subresource: None,
+        },
+    )
+    .await?;
     let resource = api_resource(request.group, request.version, request.kind, request.plural);
     let object: DynamicObject = serde_json::from_value(request.manifest)
         .map_err(|error| format!("Invalid resource data: {error}"))?;
@@ -2442,6 +2619,20 @@ async fn list_workload_pods(request: WorkloadPodRequest) -> Result<Vec<ResourceO
 #[tauri::command]
 async fn read_pod_logs(request: PodLogRequest) -> Result<PodLogResponse, String> {
     let client = client_for(request.kubeconfig_path, request.context).await?;
+    ensure_resource_access(
+        client.clone(),
+        AccessReviewCheck {
+            key: "pod-logs".to_string(),
+            group: String::new(),
+            version: "v1".to_string(),
+            resource: "pods".to_string(),
+            verb: "get".to_string(),
+            namespace: Some(request.namespace.clone()),
+            name: Some(request.pod.clone()),
+            subresource: Some("log".to_string()),
+        },
+    )
+    .await?;
     let pods = Api::<Pod>::namespaced(client, &request.namespace);
     let pod = pods
         .get(&request.pod)
@@ -2603,6 +2794,20 @@ async fn exec_pod_command(request: PodExecRequest) -> Result<PodExecResponse, St
         return Err("Enter a command to run in the selected container".to_string());
     }
     let client = client_for(request.kubeconfig_path, request.context).await?;
+    ensure_resource_access(
+        client.clone(),
+        AccessReviewCheck {
+            key: "pod-exec".to_string(),
+            group: String::new(),
+            version: "v1".to_string(),
+            resource: "pods".to_string(),
+            verb: "create".to_string(),
+            namespace: Some(request.namespace.clone()),
+            name: Some(request.pod.clone()),
+            subresource: Some("exec".to_string()),
+        },
+    )
+    .await?;
     let pods = Api::<Pod>::namespaced(client, &request.namespace);
     let selected_container = request
         .container
@@ -2899,6 +3104,20 @@ async fn start_port_forward(request: StartPortForwardRequest) -> Result<PortForw
     // leave a misleading listener behind.
     let context = request.context.clone();
     let client = client_for(request.kubeconfig_path, request.context).await?;
+    ensure_resource_access(
+        client.clone(),
+        AccessReviewCheck {
+            key: "pod-portforward".to_string(),
+            group: String::new(),
+            version: "v1".to_string(),
+            resource: "pods".to_string(),
+            verb: "create".to_string(),
+            namespace: Some(request.namespace.clone()),
+            name: Some(request.pod.clone()),
+            subresource: Some("portforward".to_string()),
+        },
+    )
+    .await?;
     let listener = TcpListener::bind(("127.0.0.1", requested_local_port))
         .await
         .map_err(|error| {
@@ -3059,6 +3278,42 @@ mod tests {
             .expect("clock is after the epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("kuberniva-{prefix}-{suffix}"))
+    }
+
+    #[test]
+    fn trims_optional_access_review_attributes() {
+        assert_eq!(
+            normalized_access_value(Some(" platform ".to_string())),
+            Some("platform".to_string())
+        );
+        assert_eq!(normalized_access_value(Some("   ".to_string())), None);
+        assert_eq!(normalized_access_value(None), None);
+    }
+
+    #[test]
+    fn formats_actionable_authorization_denials() {
+        let check = AccessReviewCheck {
+            key: "logs".to_string(),
+            group: String::new(),
+            version: "v1".to_string(),
+            resource: "pods".to_string(),
+            verb: "get".to_string(),
+            namespace: Some("platform".to_string()),
+            name: Some("api-0".to_string()),
+            subresource: Some("log".to_string()),
+        };
+        let decision = AccessReviewDecision {
+            key: "logs".to_string(),
+            allowed: false,
+            denied: true,
+            reason: Some("RBAC denied the request".to_string()),
+            evaluation_error: None,
+        };
+
+        assert_eq!(
+            access_denied_message(&check, &decision),
+            "Kubernetes authorization did not allow get on pods/log in namespace platform: RBAC denied the request"
+        );
     }
 
     #[test]
@@ -3569,6 +3824,7 @@ pub fn run() {
             read_cluster_events,
             start_resource_watch,
             stop_resource_watch,
+            check_resource_permissions,
             list_resource_objects,
             get_resource_detail,
             delete_resource_object,

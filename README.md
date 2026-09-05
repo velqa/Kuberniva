@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/onlysvijay-collab/Kuberniva/releases"><img src="https://img.shields.io/badge/version-0.3.8-1769aa?style=flat-square" alt="Version 0.3.8"></a>
+  <a href="https://github.com/onlysvijay-collab/Kuberniva/releases"><img src="https://img.shields.io/badge/version-0.3.18-1769aa?style=flat-square" alt="Version 0.3.18"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-2f855a?style=flat-square" alt="MIT license"></a>
   <img src="https://img.shields.io/badge/Svelte%205-ff3e00?style=flat-square&logo=svelte&logoColor=white" alt="Svelte 5">
   <img src="https://img.shields.io/badge/Tauri%202-24c8db?style=flat-square&logo=tauri&logoColor=white" alt="Tauri 2">
@@ -25,13 +25,14 @@ Kuberniva is an open-source, local-first Kubernetes desktop app. It keeps cluste
 | --- | --- |
 | 🗂️ **Clusters** | Add kubeconfig files or folders, merge contexts, switch clusters from the top selector, and connect lazily only when a cluster is opened. |
 | 🔐 **Authentication** | Use OIDC `exec`, OIDC auth-provider, bearer-token, and client-certificate kubeconfigs. |
+| 🛡️ **Authorization** | Respect Kubernetes RBAC per cluster, namespace, API, object, verb, and subresource; hide unavailable APIs and keep read-only identities free of mutation controls. |
 | ⭐ **Shortcuts** | Pin up to 10 clusters, rename their shortcuts, and keep them across restarts. |
 | 📊 **Overview** | See cluster-wide CPU, memory, and node storage totals first, then select any node for its full capacity, allocation, network, and live usage details. |
 | 🛎️ **Events** | Browse recent Kubernetes Events with warning/normal filters and search. |
-| 🧭 **Resources** | Discover built-in APIs and CRDs, including a dedicated Gateway APIs view for Gateways, HTTPRoutes, and related route types; inspect metadata, labels, endpoint addresses, ports, and properties. |
+| 🧭 **Resources** | Discover built-in configuration, access, network, Gateway API, storage, and cluster APIs; inspect metadata, labels, endpoint addresses, ports, and properties. Custom APIs have their own workspace. |
 | 📝 **Editors** | Edit ConfigMaps and Secrets as key/value data, reveal Secret values from base64 on demand, edit YAML, save, and view certificate expiry. |
 | 🚀 **Workloads** | Inspect Deployments, StatefulSets, DaemonSets, ReplicaSets, Jobs, CronJobs, Pods, and other discovered workload types. |
-| 📜 **Operations** | Keep workload types visible while switching sibling-pod logs, select containers, refresh every 30 seconds, preserve scroll position, open a Pod terminal, and start/stop port forwards. |
+| 📜 **Operations** | Keep workload types visible while switching sibling-pod logs, select containers, refresh every 30 seconds, preserve scroll position, inspect Pod diagnostics, and open terminals with the active cluster context and namespace. |
 | 🎨 **Workspace** | Use a full-window, light ivory/golden interface with a collapsible sidebar, persistent cluster context, loading states, confirmations, and actionable notifications. |
 
 ## 🏗️ Architecture
@@ -39,7 +40,7 @@ Kuberniva is an open-source, local-first Kubernetes desktop app. It keeps cluste
 Kuberniva has two small layers:
 
 - **Svelte 5 + TypeScript:** renders the workspace and owns navigation, selection, editors, sessions, and local preferences.
-- **Tauri 2 + Rust:** parses kubeconfigs, runs OIDC authentication, discovers APIs and CRDs, talks to Kubernetes, reads logs, executes commands, and manages port forwarding.
+- **Tauri 2 + Rust:** parses kubeconfigs, runs OIDC authentication, discovers APIs and CRDs, talks to Kubernetes, reads logs, and executes context-bound commands.
 
 ```mermaid
 flowchart LR
@@ -48,7 +49,7 @@ flowchart LR
     CONFIG --> CLIENT["Cached kube client"]
     CLIENT --> DISCOVERY["Discovery + CRDs"]
     CLIENT --> API["Kubernetes APIs"]
-    API --> FEATURES["Overview · Events · Resources · Workloads · Logs · Exec · Port forwarding"]
+    API --> FEATURES["Overview · Events · Resources · Custom APIs · Workloads · Logs · Terminal"]
     UI --> PREFS["Local workspace preferences"]
 ```
 
@@ -69,7 +70,7 @@ For a browser-only UI preview:
 npm run dev
 ~~~
 
-Live Kubernetes connections, OIDC execution, logs, terminal access, and port forwarding require the Tauri desktop host.
+Live Kubernetes connections, OIDC execution, logs, and terminal access require the Tauri desktop host.
 
 ## 📦 Build and install locally
 

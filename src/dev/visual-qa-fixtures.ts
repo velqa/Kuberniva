@@ -9,6 +9,13 @@ export const visualQaCluster = {
   kubeconfigPath: '/tmp/kuberniva-visual-qa.yaml',
 };
 
+export const visualQaFavoriteClusters = [
+  visualQaCluster,
+  { ...visualQaCluster, id: 'visual-qa-staging', name: 'payments-staging', status: 'Not connected', tone: 'gray', namespace: 'payments' },
+  { ...visualQaCluster, id: 'visual-qa-observability', name: 'observability-prod', status: 'Not connected', tone: 'gray' },
+  { ...visualQaCluster, id: 'visual-qa-sandbox', name: 'developer-sandbox', status: 'Not connected', tone: 'gray' },
+];
+
 export const visualQaResources = [
   { group: 'apps', version: 'v1', apiVersion: 'apps/v1', kind: 'Deployment', plural: 'deployments', namespaced: true, category: 'Workloads', custom: false, crd: false },
   { group: '', version: 'v1', apiVersion: 'v1', kind: 'Pod', plural: 'pods', namespaced: true, category: 'Workloads', custom: false, crd: false },
@@ -16,6 +23,8 @@ export const visualQaResources = [
   { group: '', version: 'v1', apiVersion: 'v1', kind: 'Secret', plural: 'secrets', namespaced: true, category: 'Configuration', custom: false, crd: false },
   { group: '', version: 'v1', apiVersion: 'v1', kind: 'Service', plural: 'services', namespaced: true, category: 'Network', custom: false, crd: false },
   { group: 'gateway.networking.k8s.io', version: 'v1', apiVersion: 'gateway.networking.k8s.io/v1', kind: 'HTTPRoute', plural: 'httproutes', namespaced: true, category: 'Gateway APIs', custom: true, crd: true },
+  { group: '', version: 'v1', apiVersion: 'v1', kind: 'Namespace', plural: 'namespaces', namespaced: false, category: 'Cluster', custom: false, crd: false },
+  { group: 'platform.example.io', version: 'v1beta1', apiVersion: 'platform.example.io/v1beta1', kind: 'TenantPolicy', plural: 'tenantpolicies', namespaced: true, category: 'Custom Resources', custom: true, crd: true },
 ];
 
 export const visualQaPods = [
@@ -115,6 +124,37 @@ spec:
             claimName: api-uploads
 `;
 
+export const visualQaPodManifest = {
+  apiVersion: 'v1',
+  kind: 'Pod',
+  metadata: { name: 'api-7d8496f6d9-2wkd8', namespace: 'platform', labels: { app: 'api' } },
+  spec: {
+    containers: [{ name: 'api', image: 'example.invalid/platform/api:3.8.2' }],
+  },
+  status: {
+    phase: 'Pending',
+    conditions: [
+      { type: 'Initialized', status: 'True', reason: 'PodCompleted' },
+      { type: 'PodScheduled', status: 'True' },
+      { type: 'ContainersReady', status: 'False', reason: 'ContainersNotReady', message: 'containers with unready status: [api]' },
+      { type: 'Ready', status: 'False', reason: 'ContainersNotReady' },
+    ],
+    containerStatuses: [{
+      name: 'api',
+      image: 'example.invalid/platform/api:3.8.2',
+      ready: false,
+      restartCount: 4,
+      state: { waiting: { reason: 'ImagePullBackOff', message: 'Back-off pulling image example.invalid/platform/api:3.8.2' } },
+    }],
+  },
+};
+
+export const visualQaPodEvents = [
+  { name: 'api-pull', namespace: 'platform', eventType: 'Normal', reason: 'Pulling', message: 'Pulling image "example.invalid/platform/api:3.8.2"', involvedKind: 'Pod', involvedName: 'api-7d8496f6d9-2wkd8', count: 1, lastObserved: new Date(Date.now() - 90_000).toISOString() },
+  { name: 'api-failed', namespace: 'platform', eventType: 'Warning', reason: 'Failed', message: 'Failed to pull image: manifest unknown', involvedKind: 'Pod', involvedName: 'api-7d8496f6d9-2wkd8', count: 4, lastObserved: new Date(Date.now() - 45_000).toISOString() },
+  { name: 'api-backoff', namespace: 'platform', eventType: 'Warning', reason: 'BackOff', message: 'Back-off pulling image "example.invalid/platform/api:3.8.2"', involvedKind: 'Pod', involvedName: 'api-7d8496f6d9-2wkd8', count: 4, lastObserved: new Date().toISOString() },
+];
+
 export const visualQaLogLines = [
   '2026-08-19T05:10:21.105Z INFO server listening on :8080',
   '2026-08-19T05:10:24.410Z INFO request completed method=GET path=/health status=200 duration=3ms',
@@ -139,11 +179,44 @@ export const visualQaConfigMaps = [
   createdAt: new Date(Date.now() - (index + 1) * 3_600_000).toISOString(),
 }));
 
+export const visualQaCustomObjects = ['payments-policy', 'platform-default', 'sandbox-policy'].map((name, index) => ({
+  name,
+  namespace: 'platform',
+  uid: `visual-policy-${index + 1}`,
+  resourceVersion: `${6100 + index}`,
+  createdAt: new Date(Date.now() - (index + 2) * 3_600_000).toISOString(),
+}));
+
 export const visualQaConfigValues = {
   'APP_MODE': 'production',
   'FEATURE_FLAGS': 'newNavigation=true\nbulkActions=true\ncompactOverview=true',
   'pod-template.yaml': 'apiVersion: v1\nkind: Pod\nmetadata:\n  labels:\n    app: worker\nspec:\n  serviceAccountName: platform-worker\n  containers:\n    - name: worker\n      image: example.invalid/worker:2.4.1',
   'retention.json': '{\n  "logs": "14d",\n  "events": "7d",\n  "snapshots": "30d"\n}',
+};
+
+export const visualQaLargeConfigValues = {
+  AIRFLOW_HOME: '/opt/airflow',
+  CCLOUD_S3_BUCKET_NAME: 'airflow-platform-archive',
+  CCLOUD_S3_ENDPOINT_URL: 'https://rgw.example.internal',
+  CCLOUD_S3_REGION: 'eu-de-2',
+  DEPLOYMENT: 'platform-production',
+  DOMAIN: 'project.example',
+  GITHUB_OAUTH_ACCESS_URL: 'https://github.example/login/oauth/access_token',
+  GITHUB_OAUTH_AUTHORIZE_URL: 'https://github.example/login/oauth/authorize',
+  LOG_LEVEL: 'INFO',
+  MAX_ACTIVE_RUNS: '24',
+  METRICS_ENABLED: 'true',
+  OTEL_EXPORTER_OTLP_ENDPOINT: 'http://telemetry-collector:4317',
+  PARALLELISM: '64',
+  POSTGRES_DATABASE: 'airflow',
+  POSTGRES_HOST: 'postgres-rw.platform.svc',
+  POSTGRES_PORT: '5432',
+  REDIS_HOST: 'redis-master.platform.svc',
+  REDIS_PORT: '6379',
+  SCHEDULER_HEARTBEAT_SEC: '5',
+  SMTP_HOST: 'mailrelay.platform.svc',
+  WEBSERVER_BASE_URL: 'https://airflow.example',
+  WORKER_CONCURRENCY: '16',
 };
 
 export const visualQaSecretValues = {
