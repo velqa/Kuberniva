@@ -2119,7 +2119,7 @@ dependencies = [
 
 [[package]]
 name = "kuberniva"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "base64 0.22.1",
  "chrono",

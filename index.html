@@ -5,6 +5,16 @@
     <link rel="icon" type="image/png" href="/kuberniva-mark.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Kuberniva</title>
+    <style>
+      /* First paint matches the saved theme before any script or stylesheet loads. */
+      html { background: #f5f4ee; color-scheme: light; }
+      html[data-theme="dark"] { background: #262624; color-scheme: dark; }
+    </style>
+    <script>
+      try {
+        if (localStorage.getItem('kuberniva.theme.v1') === 'dark') document.documentElement.dataset.theme = 'dark';
+      } catch {}
+    </script>
   </head>
   <body>
     <div id="app"></div>

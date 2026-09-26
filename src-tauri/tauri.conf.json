@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Kuberniva",
-  "version": "0.3.18",
+  "version": "0.3.19",
   "identifier": "com.kuberniva.desktop",
   "build": {
     "frontendDist": "../dist",
@@ -18,7 +18,9 @@
         "minWidth": 1080,
         "minHeight": 700,
         "resizable": true,
-        "fullscreen": false
+        "fullscreen": false,
+        "visible": false,
+        "backgroundColor": "#f5f4ee"
       }
     ],
     "security": {

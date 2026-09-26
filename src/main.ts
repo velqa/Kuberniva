@@ -1,4 +1,7 @@
 import { mount } from 'svelte'
+import '@fontsource-variable/dm-sans/opsz.css'
+import '@fontsource/dm-mono/400.css'
+import '@fontsource/dm-mono/500.css'
 import './app.css'
 import App from './App.svelte'
 

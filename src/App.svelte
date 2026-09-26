@@ -228,6 +228,10 @@
   let deletionConfirmButton: HTMLButtonElement;
   let deletionReturnFocus: HTMLElement | null = null;
   const catalogCache = new Map<string, ClusterCatalog>();
+  // API catalogs from earlier launches let a cluster open instantly while discovery
+  // revalidates in the background. Only the most recently used clusters are kept.
+  const catalogStorageKey = 'kuberniva.catalog-cache.v1';
+  const storedCatalogLimit = 8;
   const clusterSessionCache = new Map<string, ClusterSession>();
   const resourceObjectCache = new Map<string, ResourceObject[]>();
   const liveDataUpdatedAt = new Map<string, number>();
@@ -1590,6 +1594,7 @@
       if (requestClusterId !== activeClusterId) return false;
       catalog = response;
       catalogCache.set(requestClusterId, response);
+      storeCatalog(requestClusterId, response);
       await loadCatalogPermissions(true);
       updateCluster(requestClusterId, { status: 'Connected', tone: 'green' });
       return true;
@@ -1757,6 +1762,16 @@
     } catch {
       // A theme preference is optional and should never block the workspace.
     }
+  }
+
+  function revealWindow() {
+    if (!('__TAURI_INTERNALS__' in window)) return;
+    const fontsReady = Promise.race([document.fonts.ready, new Promise((resolve) => window.setTimeout(resolve, 300))]);
+    void fontsReady.then(() => requestAnimationFrame(() => {
+      void import('@tauri-apps/api/window')
+        .then(({ getCurrentWindow }) => getCurrentWindow().show())
+        .catch(() => undefined);
+    }));
   }
 
   function toggleTheme() {
@@ -3734,7 +3749,8 @@
 
   onMount(() => {
     applyTheme(loadThemePreference());
-    void applyUiScale(loadUiScalePreference(), false);
+    // The native window starts hidden; reveal it once the zoomed first frame is painted.
+    void applyUiScale(loadUiScalePreference(), false).finally(revealWindow);
     resourceNavigatorWidth = loadPaneSize(resourceNavigatorWidthStorageKey, 272, 220, 440);
     resourceObjectPaneWidth = loadPaneSize(resourceObjectPaneWidthStorageKey, 300, 180, 520);
     void restoreWorkspace();
@@ -3812,6 +3828,40 @@
     };
   });
 
+  function readStoredCatalogs(): Record<string, ClusterCatalog> {
+    try {
+      const parsed = JSON.parse(window.localStorage.getItem(catalogStorageKey) || '{}');
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function loadStoredCatalog(clusterId: string) {
+    const stored = readStoredCatalogs()[clusterId];
+    return stored && Array.isArray(stored.resources) && Array.isArray(stored.namespaces) ? stored : null;
+  }
+
+  function storeCatalog(clusterId: string, value: ClusterCatalog | null) {
+    const { [clusterId]: _previous, ...others } = readStoredCatalogs();
+    const entries = Object.entries(others).slice(-(storedCatalogLimit - 1));
+    if (value) entries.push([clusterId, value]);
+    try {
+      window.localStorage.setItem(catalogStorageKey, JSON.stringify(Object.fromEntries(entries)));
+    } catch {
+      // The cache only speeds up the next launch; live discovery remains authoritative.
+    }
+  }
+
+  function startClusterViewLoads() {
+    if (activeView === 'Overview') {
+      void loadClusterOverview();
+      startOverviewRefresh();
+    } else if (activeView === 'Events') {
+      void loadClusterEvents(true);
+    }
+  }
+
   async function loadCluster(cluster: Cluster, force = false) {
     // A Pod name belongs to exactly one cluster context. Never carry its stream across a switch.
     resourceRequestGeneration += 1;
@@ -3862,38 +3912,39 @@
       void loadCatalogPermissions();
       updateCluster(cluster.id, { status: 'Connected', tone: 'green' });
       notify(`Switched to ${cluster.name} · ${catalog.resources.length} resources`);
-      if (activeView === 'Overview') {
-        void loadClusterOverview();
-        startOverviewRefresh();
-      } else if (activeView === 'Events') {
-        void loadClusterEvents(true);
-      }
+      startClusterViewLoads();
       return;
     }
 
-    catalog = { context: cluster.name, namespaces: [], resources: [] };
-    loadingCatalog = true;
+    // Show the last known catalog immediately; discovery below confirms or replaces it.
+    const storedCatalog = force ? null : loadStoredCatalog(cluster.id);
+    catalog = storedCatalog || { context: cluster.name, namespaces: [], resources: [] };
+    loadingCatalog = !storedCatalog;
     updateCluster(cluster.id, { status: 'Connecting', tone: 'blue' });
+    if (storedCatalog) {
+      void loadCatalogPermissions();
+      startClusterViewLoads();
+    }
     try {
       const { invoke } = await import('@tauri-apps/api/core');
       const sourcePath = cluster.kubeconfigPath || kubeconfigPath || null;
-      catalog = await invoke<ClusterCatalog>('discover_cluster_catalog', { kubeconfigPath: sourcePath, context: cluster.name });
-      catalogCache.set(cluster.id, catalog);
-      void loadCatalogPermissions();
+      const discovered = await invoke<ClusterCatalog>('discover_cluster_catalog', { kubeconfigPath: sourcePath, context: cluster.name });
+      if (activeClusterId !== cluster.id) return;
+      catalogCache.set(cluster.id, discovered);
+      storeCatalog(cluster.id, discovered);
       updateCluster(cluster.id, { status: 'Connected', tone: 'green' });
+      if (storedCatalog && JSON.stringify(storedCatalog) === JSON.stringify(discovered)) return;
+      catalog = discovered;
+      void loadCatalogPermissions();
       notify(`Connected to ${cluster.name} · ${catalog.resources.length} resources discovered`);
-      if (activeView === 'Overview') {
-        void loadClusterOverview();
-        startOverviewRefresh();
-      } else if (activeView === 'Events') {
-        void loadClusterEvents(true);
-      }
+      if (!storedCatalog) startClusterViewLoads();
     } catch (error) {
+      if (activeClusterId !== cluster.id) return;
       catalogError = String(error);
       updateCluster(cluster.id, { status: 'Connection failed', tone: 'red' });
       notify(`Could not connect to ${cluster.name}: ${catalogError}`);
     } finally {
-      loadingCatalog = false;
+      if (activeClusterId === cluster.id) loadingCatalog = false;
     }
   }
 
@@ -4048,6 +4099,7 @@
       const wasActive = activeClusterId === cluster.id;
       clusters = clusters.filter((candidate) => candidate.id !== cluster.id);
       catalogCache.delete(cluster.id);
+      storeCatalog(cluster.id, null);
       clusterSessionCache.delete(cluster.id);
       const { [cluster.id]: _removedNamespace, ...remainingNamespaces } = persistedClusterNamespaces;
       persistedClusterNamespaces = remainingNamespaces;

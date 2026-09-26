@@ -1773,13 +1773,18 @@ async fn discover_cluster_catalog(
 
     // Aggregated discovery is two API calls on modern clusters. Older servers retain the
     // conventional discovery fallback, so the catalog remains complete across versions.
-    let discovery = match Discovery::new(client.clone()).run_aggregated().await {
-        Ok(discovery) => discovery,
-        Err(_) => Discovery::new(client.clone())
-            .run()
-            .await
-            .map_err(|error| error.to_string())?,
+    // Namespaces are listed concurrently so connecting costs one round trip, not two.
+    let discover = async {
+        match Discovery::new(client.clone()).run_aggregated().await {
+            Ok(discovery) => Ok(discovery),
+            Err(_) => Discovery::new(client.clone()).run().await,
+        }
     };
+    let namespace_api = Api::<Namespace>::all(client.clone());
+    let namespace_params = ListParams::default();
+    let (discovery, namespace_list) =
+        tokio::join!(discover, namespace_api.list(&namespace_params));
+    let discovery = discovery.map_err(|error| error.to_string())?;
 
     let mut resources = discovery
         .groups_alphabetical()
@@ -1807,10 +1812,7 @@ async fn discover_cluster_catalog(
             .then(left.kind.cmp(&right.kind))
     });
 
-    let namespaces: BTreeSet<String> = match Api::<Namespace>::all(client)
-        .list(&ListParams::default())
-        .await
-    {
+    let namespaces: BTreeSet<String> = match namespace_list {
         Ok(response) => response
             .items
             .into_iter()
@@ -3815,6 +3817,17 @@ pub fn run() {
         )
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
+        // The window starts hidden so it never shows an unstyled or unzoomed frame. The
+        // frontend reveals it after its first paint; this is only a safety net.
+        .on_page_load(|webview, payload| {
+            if payload.event() == tauri::webview::PageLoadEvent::Finished {
+                let window = webview.window();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+                    let _ = window.show();
+                });
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             import_pasted_kubeconfig,
             read_kubeconfig_contexts,
