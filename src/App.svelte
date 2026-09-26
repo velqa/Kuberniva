@@ -51,6 +51,7 @@
   type UpdateState = 'idle' | 'checking' | 'current' | 'available' | 'downloading' | 'ready' | 'error';
   type PendingUpdate = { version: string; body?: string; date?: string; downloadAndInstall: (onEvent?: (event: { event: string; data?: { contentLength?: number; chunkLength?: number } }) => void) => Promise<void> };
   type CliLine = { stream: 'stdout' | 'stderr' | 'prompt' | 'meta'; text: string };
+  type CliSession = { lines: CliLine[]; runId: string | null; running: boolean; startedAt: number; draft: string; open: boolean; expanded: boolean };
   type CliOutputEvent = { runId: string; chunks: { stream: 'stdout' | 'stderr'; text: string }[] };
   type CliExitEvent = { runId: string; exitCode?: number | null; success: boolean; cancelled: boolean; error?: string | null };
   type ResourceWatchSignal = { watchId: string; action: string; error?: string };
@@ -156,6 +157,9 @@
   let cliHistoryDraft = '';
   let cliListenersReady: Promise<void> | null = null;
   const cliHistoryStorageKey = 'kuberniva.cli-history.v1';
+  // Each cluster keeps its own terminal; the active one lives in the cli* variables.
+  const cliSessions = new Map<string, CliSession>();
+  let cliSessionClusterId = '';
   const cliMaxLines = 5000;
   const cliStarterCommands = ['kubectl get pods', 'kubectl get deploy', 'kubectl get events --sort-by=.lastTimestamp', 'kubectl top pods', 'helm list'];
   let cliOpen = false;
@@ -171,6 +175,7 @@
   let loadingEditor = false;
   let savingEditor = false;
   let revealSecret = false;
+  let configDiscardPrompt = false;
   let connectedKubeconfig = false;
   let toast = '';
   // Toasts are transient feedback. The bell is reserved for actionable items,
@@ -362,6 +367,13 @@
   $: workloadPermissionSet = resourcePermissionSet(workloadResource, editorResource?.category === 'Workloads' ? editorObject : null, accessDecisions);
   $: yamlPermissionSet = resourcePermissionSet(yamlResource, yamlObject, accessDecisions);
   $: selectedResourceCanOpen = selectedResource?.kind === 'Pod' ? selectedResourcePermissionSet.canViewLogs : selectedResourcePermissionSet.canGet;
+  // ConfigMaps and Secrets are edited in a focused dialog so the object table keeps its width.
+  $: configModalOpen = activeView === 'Resources' && Boolean(editorResource && (editorResource.kind === 'ConfigMap' || editorResource.kind === 'Secret') && (editorObject || loadingEditor));
+  $: configEditorDirty = Boolean(configModalOpen && editorManifest && !loadingEditor && editorEntriesSignature(editorEntries) !== editorDataSignature(editorManifest));
+  $: if (activeClusterId !== cliSessionClusterId) swapCliSession(activeClusterId);
+  $: workloadDetailOpen = (editorResource?.category === 'Workloads' && editorObject !== null) || (workloadDetailMode === 'logs' && logTarget !== null);
+  $: workloadColumns = buildWorkloadColumns(workloadResource?.kind === 'Pod', namespace === 'all namespaces', workloadDetailOpen);
+  $: workloadGridColumns = `${workloadColumns.map((column) => column.width).join(' ')} 18px`;
   $: visibleWorkloadObjects = workloadObjects.filter((workload) =>
     `${workload.name} ${workload.namespace || ''}`.toLowerCase().includes(workloadSearch.toLowerCase()),
   );
@@ -706,8 +718,9 @@
       : [...selectedResourceObjectKeys, key];
   }
 
-  function isResourceObjectSelected(object: ResourceObject) {
-    return selectedResourceObjectKeys.includes(resourceObjectSelectionKey(object));
+  // Templates pass the key list explicitly so Svelte re-renders rows when it changes.
+  function isResourceObjectSelected(object: ResourceObject, keys = selectedResourceObjectKeys) {
+    return keys.includes(resourceObjectSelectionKey(object));
   }
 
   function toggleAllResourceObjects() {
@@ -732,8 +745,8 @@
       : [...selectedWorkloadObjectKeys, key];
   }
 
-  function isWorkloadObjectSelected(object: ResourceObject) {
-    return selectedWorkloadObjectKeys.includes(resourceObjectSelectionKey(object));
+  function isWorkloadObjectSelected(object: ResourceObject, keys = selectedWorkloadObjectKeys) {
+    return keys.includes(resourceObjectSelectionKey(object));
   }
 
   function toggleAllWorkloadObjects() {
@@ -1470,11 +1483,6 @@
     return favoriteClusterNames[cluster.id] || cluster.name;
   }
 
-  function favoriteMonogram(cluster: Cluster) {
-    const words = favoriteLabel(cluster).split(/[^a-zA-Z0-9]+/).filter(Boolean);
-    return (words.length > 1 ? `${words[0][0]}${words[1][0]}` : words[0]?.slice(0, 2) || 'K').toUpperCase();
-  }
-
   function openFavoriteContextMenu(event: MouseEvent, cluster: Cluster) {
     event.preventDefault();
     const menuWidth = 190;
@@ -1998,22 +2006,61 @@
     return text.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
   }
 
+  function swapCliSession(nextClusterId: string) {
+    if (cliSessionClusterId) {
+      cliSessions.set(cliSessionClusterId, { lines: cliLines, runId: cliRunId, running: runningCli, startedAt: cliRunStartedAt, draft: cliCommand, open: cliOpen, expanded: cliExpanded });
+    }
+    const next = nextClusterId ? cliSessions.get(nextClusterId) : undefined;
+    cliLines = next?.lines ?? [];
+    cliRunId = next?.runId ?? null;
+    runningCli = next?.running ?? false;
+    cliRunStartedAt = next?.startedAt ?? 0;
+    cliCommand = next?.draft ?? '';
+    cliOpen = next?.open ?? false;
+    cliExpanded = next?.expanded ?? false;
+    cliHistoryIndex = -1;
+    cliSessionClusterId = nextClusterId;
+  }
+
+  function parkedCliSession(runId: string) {
+    for (const session of cliSessions.values()) if (session.runId === runId) return session;
+    return undefined;
+  }
+
+  function cliExitSummary(payload: CliExitEvent, startedAt: number): CliLine {
+    const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
+    const text = payload.cancelled
+      ? `^C stopped after ${seconds}s`
+      : payload.error
+        ? `Failed: ${payload.error}`
+        : payload.success ? `✓ done in ${seconds}s` : `✗ exited with code ${payload.exitCode ?? 'unknown'} after ${seconds}s`;
+    return { stream: payload.success || payload.cancelled ? 'meta' : 'stderr', text };
+  }
+
   function setupCliListeners() {
     cliListenersReady ??= (async () => {
       const { listen } = await import('@tauri-apps/api/event');
       await listen<CliOutputEvent>('kuberniva://cli-output', ({ payload }) => {
-        if (payload.runId !== cliRunId) return;
-        void appendCliLines(payload.chunks.map((chunk) => ({ stream: chunk.stream, text: stripAnsi(chunk.text.replace(/\r?\n$/, '')) })));
+        const lines = payload.chunks.map((chunk): CliLine => ({ stream: chunk.stream, text: stripAnsi(chunk.text.replace(/\r?\n$/, '')) }));
+        if (payload.runId === cliRunId) {
+          void appendCliLines(lines);
+          return;
+        }
+        // Commands keep running while their cluster's terminal is parked.
+        const parked = parkedCliSession(payload.runId);
+        if (parked) parked.lines = parked.lines.concat(lines).slice(-cliMaxLines);
       });
       await listen<CliExitEvent>('kuberniva://cli-exit', ({ payload }) => {
-        if (payload.runId !== cliRunId) return;
-        const seconds = ((Date.now() - cliRunStartedAt) / 1000).toFixed(1);
-        const summary = payload.cancelled
-          ? `^C stopped after ${seconds}s`
-          : payload.error
-            ? `Failed: ${payload.error}`
-            : payload.success ? `✓ done in ${seconds}s` : `✗ exited with code ${payload.exitCode ?? 'unknown'} after ${seconds}s`;
-        void appendCliLines([{ stream: payload.success || payload.cancelled ? 'meta' : 'stderr', text: summary }]);
+        if (payload.runId !== cliRunId) {
+          const parked = parkedCliSession(payload.runId);
+          if (parked) {
+            parked.lines = parked.lines.concat(cliExitSummary(payload, parked.startedAt)).slice(-cliMaxLines);
+            parked.runId = null;
+            parked.running = false;
+          }
+          return;
+        }
+        void appendCliLines([cliExitSummary(payload, cliRunStartedAt)]);
         cliRunId = null;
         runningCli = false;
         schedulePendingResumeRecovery();
@@ -2418,6 +2465,29 @@
   // Everyday kinds lead their section; everything else follows alphabetically.
   const commonResourceKinds = ['ConfigMap', 'Secret', 'Service', 'Ingress', 'PersistentVolumeClaim', 'ServiceAccount', 'Role', 'RoleBinding', 'NetworkPolicy', 'Gateway', 'HTTPRoute', 'StorageClass', 'PersistentVolume', 'Namespace', 'Node'];
   const recentResourcesStorageKey = 'kuberniva.recent-resources.v1';
+
+  type WorkloadColumnKey = 'name' | 'namespace' | 'node' | 'status' | 'ready' | 'restarts' | 'cpu' | 'memory' | 'age';
+
+  // Each fact gets its own aligned column. Namespace appears only when it varies (all
+  // namespaces); node and metrics step aside while the details pane is open.
+  function buildWorkloadColumns(pod: boolean, allNamespaces: boolean, detailOpen: boolean) {
+    const columns: { key: WorkloadColumnKey; label: string; width: string }[] = [{ key: 'name', label: 'Name', width: 'minmax(170px, 2fr)' }];
+    if (allNamespaces) columns.push({ key: 'namespace', label: 'Namespace', width: 'minmax(90px, .7fr)' });
+    if (pod && !detailOpen) columns.push({ key: 'node', label: 'Node', width: 'minmax(110px, 1.1fr)' });
+    columns.push({ key: 'status', label: 'Status', width: '96px' });
+    if (pod) {
+      columns.push({ key: 'ready', label: 'Ready', width: '52px' }, { key: 'restarts', label: 'Restarts', width: '64px' });
+      if (!detailOpen) columns.push({ key: 'cpu', label: 'CPU', width: '84px' }, { key: 'memory', label: 'Memory', width: '72px' });
+    }
+    columns.push({ key: 'age', label: 'Age', width: '44px' });
+    return columns;
+  }
+
+  const shortKindLabels: Record<string, string> = { HorizontalPodAutoscaler: 'HPAs', ReplicationController: 'RCs', PodDisruptionBudget: 'PDBs' };
+
+  function kindTabLabel(resource: ResourceDescriptor) {
+    return shortKindLabels[resource.kind] || kindLabel(resource);
+  }
 
   function kindLabel(resource: ResourceDescriptor) {
     const kind = resource.kind;
@@ -3383,6 +3453,7 @@
     editorEntrySearch = '';
     editorCertificate = undefined;
     revealSecret = false;
+    configDiscardPrompt = false;
     loadingEditor = true;
     if (resource.kind === 'Pod') void loadClusterEvents();
     try {
@@ -3417,6 +3488,29 @@
     }
   }
 
+  function editorEntriesSignature(entries: EditorEntry[]) {
+    return JSON.stringify(entries.map((entry) => [entry.key.trim(), entry.value]));
+  }
+
+  function editorDataSignature(manifest: Record<string, unknown>) {
+    const data = manifest.data;
+    return JSON.stringify(data && typeof data === 'object' && !Array.isArray(data) ? Object.entries(data).map(([key, value]) => [key, String(value)]) : []);
+  }
+
+  function requestCloseConfigEditor() {
+    if (savingEditor) return;
+    if (configEditorDirty) {
+      configDiscardPrompt = true;
+      return;
+    }
+    discardConfigEditor();
+  }
+
+  function discardConfigEditor() {
+    configDiscardPrompt = false;
+    closeEditor();
+  }
+
   async function saveEditor() {
     if (!editorResource || !editorObject || !editorManifest) return;
     const normalizedKeys = editorEntries.map((entry) => entry.key.trim());
@@ -3447,7 +3541,13 @@
           manifest,
         },
       });
-      notify(`${editorResource.kind} saved to ${activeCluster}`);
+      // Values are always stored base64-encoded; decoded Secret text never outlives a save.
+      const hidDecodedValues = editorResource.kind === 'Secret' && revealSecret;
+      revealSecret = false;
+      configDiscardPrompt = false;
+      notify(hidDecodedValues
+        ? `Secret saved to ${activeCluster} as base64 · decoded values hidden again`
+        : `${editorResource.kind} saved to ${activeCluster}`);
       editorManifest = manifest;
       editorEntries = editorEntries.map((entry, index) => ({ ...entry, key: normalizedKeys[index] }));
     } catch (error) {
@@ -3622,6 +3722,7 @@
       workloadDetailMode = 'overview';
     }
     resetWorkloadTerminal();
+    revealSecret = false;
     editorResource = null;
     editorObject = null;
     editorManifest = null;
@@ -4109,6 +4210,15 @@
         openCommandSearch();
         return;
       }
+      if ((event.metaKey || event.ctrlKey) && !event.shiftKey && !event.altKey && /^[1-9]$/.test(event.key)) {
+        const favorite = favoriteClusters[Number(event.key) - 1];
+        if (favorite) {
+          event.preventDefault();
+          favoriteContextMenu = null;
+          if (favorite.id !== activeClusterId) void selectCluster(favorite.id);
+          return;
+        }
+      }
       if (event.metaKey || event.ctrlKey) {
         if (event.key === '+' || event.key === '=') {
           event.preventDefault();
@@ -4127,6 +4237,14 @@
         }
       }
       if (event.key !== 'Escape') return;
+      if (favoriteContextMenu) {
+        favoriteContextMenu = null;
+        return;
+      }
+      if (configModalOpen && !commandOpen && !deletionTarget && !yamlResource) {
+        requestCloseConfigEditor();
+        return;
+      }
       if (commandOpen) {
         commandOpen = false;
         commandQuery = '';
@@ -4744,13 +4862,19 @@
 
     <section class="sidebar-favorites" aria-label="Favorite cluster shortcuts">
       <div class="sidebar-favorites-heading">
-        <button class:active={activeView === 'Favorites'} class="sidebar-favorites-title" on:click={() => navigateTo('Favorites')}>
-          <Star size={14} strokeWidth={1.9} fill={favoriteClusters.length ? 'currentColor' : 'none'} />
-          <span>Favorites</span>
-        </button>
-        <small>{favoriteClusters.length}/10</small>
+        <p class="eyebrow">Favorites</p>
+        <button class:active={activeView === 'Favorites'} class="sidebar-favorites-manage" type="button" title="Manage favorites" on:click={() => navigateTo('Favorites')}>{favoriteClusters.length}/10</button>
       </div>
-      {#if favoriteClusters.length}<div class="sidebar-favorite-grid">{#each favoriteClusters as cluster}<button class:favorite-shortcut-active={cluster.id === activeClusterId} class="favorite-shortcut-tile" aria-label={`Open ${favoriteLabel(cluster)}`} title={`${favoriteLabel(cluster)} · right-click to rename`} on:click={() => { favoriteContextMenu = null; void selectCluster(cluster.id); }} on:contextmenu={(event) => openFavoriteContextMenu(event, cluster)}><span class="favorite-shortcut-monogram">{favoriteMonogram(cluster)}</span><strong>{favoriteLabel(cluster)}</strong><i class="status-dot {cluster.tone}"></i></button>{/each}</div>{:else}<p class="favorite-shortcut-none">No favorites</p>{/if}
+      {#if favoriteClusters.length}
+        <div class="favorite-list" role="list">
+          {#each favoriteClusters as cluster, index}
+            <div class:favorite-row-active={cluster.id === activeClusterId} class="favorite-row" role="listitem">
+              <button class="favorite-shortcut" type="button" aria-current={cluster.id === activeClusterId ? 'true' : undefined} title={`${favoriteLabel(cluster)} · ${cluster.status}`} on:click={() => { favoriteContextMenu = null; void selectCluster(cluster.id); }} on:contextmenu={(event) => openFavoriteContextMenu(event, cluster)}><i class="status-dot {cluster.tone}"></i><span>{favoriteLabel(cluster)}</span>{#if index < 9}<kbd>⌘{index + 1}</kbd>{/if}</button>
+              <button class="favorite-row-menu" type="button" aria-label={`Rename or remove ${favoriteLabel(cluster)}`} title="Rename or remove" on:click={(event) => openFavoriteContextMenu(event, cluster)}>⋯</button>
+            </div>
+          {/each}
+        </div>
+      {:else}<p class="favorite-shortcut-none">Star clusters in the cluster manager to pin them here.</p>{/if}
       {#if favoriteRenameId}
         <form class="favorite-rename favorite-rename-grid" on:submit|preventDefault={saveFavoriteRename}><input bind:value={favoriteRenameValue} maxlength="80" aria-label="Rename favorite shortcut" /><button type="submit" aria-label="Save shortcut name" title="Save">✓</button><button type="button" aria-label="Cancel shortcut rename" title="Cancel" on:click={cancelFavoriteRename}>×</button></form>
       {/if}
@@ -4996,20 +5120,22 @@
                 {/each}
               </div>
             {:else}
-            <div class:resource-workbench-inspecting={Boolean(editorObject || loadingEditor)} class="resource-workbench-body resource-workbench-body-focused">
+            <div class:resource-workbench-inspecting={Boolean((editorObject || loadingEditor) && !configModalOpen)} class="resource-workbench-body resource-workbench-body-focused">
               <aside class="resource-object-browser" aria-label="Resource objects">
                 {#if selectedResource}
                   <div class="resource-object-heading resource-pane-heading"><button type="button" class="resource-directory-back" aria-label="Back to all resource types" title="All resource types" on:click={showResourceDirectory}>←</button><div><span class:custom={selectedResource.crd} class="resource-pane-icon">{selectedResource.crd ? '◇' : '○'}</span><div><strong>{selectedResource.kind} objects</strong><small>{selectedResource.apiVersion} · {selectedResource.namespaced ? (namespace === 'all namespaces' ? 'All namespaces' : namespace) : 'Cluster-wide'}</small></div></div><span class:live-status-loading={liveDataStatus === 'loading'} class:live-status-loaded={liveDataStatus === 'loaded'} class:live-status-stale={liveDataStatus === 'stale'} class:live-status-paused={liveDataStatus === 'paused'} class:live-status-unavailable={liveDataStatus === 'unavailable'} class="live-list-status resource-live-status" title={liveDataStatusTooltip} aria-label={liveDataStatusTooltip} aria-live="polite"><i></i></span><b>{resourceObjects.length}</b></div>
                   <div class="resource-object-columns" role="row" aria-label="Select loaded resource objects">{#if selectedResourcePermissionSet.canDelete}<label class:resource-select-all-partial={resourceObjectsSelectionPartial} class="resource-select-all"><input type="checkbox" checked={allResourceObjectsSelected} disabled={deletingResource || loadingObjects || !resourceObjects.length} aria-checked={resourceObjectsSelectionPartial ? 'mixed' : allResourceObjectsSelected ? 'true' : 'false'} aria-label={`Select all loaded ${selectedResource.plural}`} on:change={toggleAllResourceObjects} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}<span>Name</span><span>Namespace</span><span>Age</span><span>Action</span></div>
                   {#if selectedResourceObjects.length && selectedResourcePermissionSet.canDelete}<div class="resource-bulk-toolbar" role="region" aria-label="Bulk resource actions"><span><strong>{selectedResourceObjects.length}</strong> selected</span><button class="destructive" type="button" disabled={deletingResource || loadingEditor || savingEditor || loadingYaml || savingYaml} on:click={() => requestBulkResourceDeletion(selectedResource!)}>Delete {selectedResourceObjects.length}</button><button class="resource-bulk-clear" type="button" disabled={deletingResource} on:click={clearResourceObjectSelection}>Clear</button></div>{/if}
-                  {#if loadingObjects}<div class="drawer-state"><i></i>Listing {selectedResource.plural}…</div>{:else if resourceObjects.length === 0}<div class="resource-object-empty"><span>○</span><strong>No {selectedResource.plural} found</strong><p>Try another namespace or use Refresh in the top bar.</p></div>{:else}<div class="object-list">{#each resourceObjects as object}<div class:resource-object-row-selected={isResourceObjectSelected(object)} class="resource-object-row">{#if selectedResourcePermissionSet.canDelete}<label class="resource-object-select"><input type="checkbox" checked={isResourceObjectSelected(object)} disabled={deletingResource} aria-label={`Select ${selectedResource.kind} ${object.name}`} on:change={() => toggleResourceObjectSelection(object)} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}<button type="button" disabled={!selectedResourceCanOpen} aria-busy={selectedResource.kind === 'Pod' && isOpeningLogs('Pod', object)} class:object-selected={editorObject?.name === object.name && editorObject?.namespace === object.namespace} on:click={() => openObject(selectedResource!, object)}><div class="resource-object-primary"><strong>{object.name}</strong></div><span class="resource-object-namespace">{object.namespace || 'cluster scoped'}</span><small class="resource-object-age">{object.createdAt ? resourceAge(object.createdAt) : '—'}</small><span class="resource-object-action">{selectedResourceCanOpen ? (selectedResource.kind === 'Pod' ? (isOpeningLogs('Pod', object) ? 'Opening…' : 'Logs →') : 'Open →') : ''}</span></button></div>{/each}</div>{/if}
+                  {#if loadingObjects}<div class="drawer-state"><i></i>Listing {selectedResource.plural}…</div>{:else if resourceObjects.length === 0}<div class="resource-object-empty"><span>○</span><strong>No {selectedResource.plural} found</strong><p>Try another namespace or use Refresh in the top bar.</p></div>{:else}<div class="object-list">{#each resourceObjects as object}<div class:resource-object-row-selected={isResourceObjectSelected(object, selectedResourceObjectKeys)} class="resource-object-row">{#if selectedResourcePermissionSet.canDelete}<label class="resource-object-select"><input type="checkbox" checked={isResourceObjectSelected(object, selectedResourceObjectKeys)} disabled={deletingResource} aria-label={`Select ${selectedResource.kind} ${object.name}`} on:change={() => toggleResourceObjectSelection(object)} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}<button type="button" disabled={!selectedResourceCanOpen} aria-busy={selectedResource.kind === 'Pod' && isOpeningLogs('Pod', object)} class:object-selected={editorObject?.name === object.name && editorObject?.namespace === object.namespace} on:click={() => openObject(selectedResource!, object)}><div class="resource-object-primary"><strong>{object.name}</strong></div><span class="resource-object-namespace">{object.namespace || 'cluster scoped'}</span><small class="resource-object-age">{object.createdAt ? resourceAge(object.createdAt) : '—'}</small><span class="resource-object-action">{selectedResourceCanOpen ? (selectedResource.kind === 'Pod' ? (isOpeningLogs('Pod', object) ? 'Opening…' : 'Logs →') : 'Open →') : ''}</span></button></div>{/each}</div>{/if}
                 {:else}
                   <div class="resource-object-empty"><span>⌘</span><strong>Select a resource kind</strong><p>Choose a kind from the left. Kuberniva loads only that API.</p></div>
                 {/if}
               </aside>
               <div class="resource-pane-resizer" role="separator" aria-orientation="vertical" aria-label="Resize resource object list" on:pointerdown={startResourceObjectPaneResize}></div>
-              <aside class="resource-inspector" aria-label="Resource details">
+              {#if configModalOpen}<div class="config-modal-backdrop" role="presentation" on:click={requestCloseConfigEditor}></div>{/if}
+              <aside class:resource-inspector-modal={configModalOpen} class="resource-inspector" aria-label="Resource details" role={configModalOpen ? 'dialog' : undefined} aria-modal={configModalOpen ? 'true' : undefined}>
                 <div class="resource-inspector-surface">
+                {#if configModalOpen && editorResource && editorObject}<header class="config-modal-heading"><p class="eyebrow">{editorResource.kind}</p><h2 title={editorObject.name}>{editorObject.name}</h2><small>{editorObject.namespace || 'cluster scoped'} · {activeCluster}{#if configEditorDirty} · <b>unsaved changes</b>{/if}</small></header>{/if}
                 {#if !(editorResource && (editorResource.kind === 'Secret' || editorResource.kind === 'ConfigMap'))}<div class="resource-details-heading resource-pane-heading"><span>02</span><div><strong>Details</strong><small>Live properties and actions</small></div></div>{/if}
                 {#if editorResource && editorObject}
                   {#if editorResource.kind !== 'Secret' && editorResource.kind !== 'ConfigMap'}<div class="drawer-heading inspector-heading"><div><span class:custom={editorResource.custom}>⌁</span><div><h2>{editorObject.name}</h2><p>{editorResource.kind} · {editorObject.namespace || 'cluster scoped'}</p></div></div><div class="inspector-heading-actions">{#if editorPermissionSet.canGet}<button class="secondary" disabled={loadingEditor} on:click={() => openYamlEditor(editorResource!, editorObject!)}>YAML</button>{/if}<button aria-label="Back to resource objects" on:click={() => closeEditor()}>×</button></div></div>{/if}
@@ -5021,7 +5147,7 @@
                     {/if}
                     {#if editorResource.kind === 'Secret' || editorResource.kind === 'ConfigMap'}
                       <section class="configuration-values-editor">
-                        <div class="configuration-values-toolbar"><small>{editorEntries.length} {editorEntries.length === 1 ? 'key' : 'keys'}{editorEntrySearch ? ` · ${filteredEditorEntries.length} shown` : ''}{editorResource.kind === 'Secret' ? (revealSecret ? ' · decoded' : ' · base64') : ''}</small><div>{#if editorEntries.length > 8}<label class="configuration-key-search"><Search size={12} /><input bind:value={editorEntrySearch} placeholder="Filter keys" aria-label="Filter configuration keys" spellcheck="false" />{#if editorEntrySearch}<button type="button" aria-label="Clear key filter" on:click={() => (editorEntrySearch = '')}>×</button>{/if}</label>{/if}{#if editorResource.kind === 'Secret'}<button class="reveal-button" on:click={() => (revealSecret = !revealSecret)}>{revealSecret ? 'Hide decoded' : 'Reveal decoded'}</button>{/if}{#if editorPermissionSet.canUpdate}<button class="configuration-add-key" type="button" on:click={addEditorEntry}>＋ Add key</button>{/if}<button class="configuration-toolbar-button" type="button" disabled={loadingEditor} on:click={() => openYamlEditor(editorResource!, editorObject!)}>YAML</button><button class="configuration-toolbar-close" type="button" aria-label="Back to resource objects" on:click={() => closeEditor()}>×</button></div></div>
+                        <div class="configuration-values-toolbar"><small>{editorEntries.length} {editorEntries.length === 1 ? 'key' : 'keys'}{editorEntrySearch ? ` · ${filteredEditorEntries.length} shown` : ''}{editorResource.kind === 'Secret' ? (revealSecret ? ' · decoded' : ' · base64') : ''}</small><div>{#if editorEntries.length > 8}<label class="configuration-key-search"><Search size={12} /><input bind:value={editorEntrySearch} placeholder="Filter keys" aria-label="Filter configuration keys" spellcheck="false" />{#if editorEntrySearch}<button type="button" aria-label="Clear key filter" on:click={() => (editorEntrySearch = '')}>×</button>{/if}</label>{/if}{#if editorResource.kind === 'Secret'}<button class="reveal-button" on:click={() => (revealSecret = !revealSecret)}>{revealSecret ? 'Hide decoded' : 'Reveal decoded'}</button>{/if}{#if editorPermissionSet.canUpdate}<button class="configuration-add-key" type="button" on:click={addEditorEntry}>＋ Add key</button>{/if}<button class="configuration-toolbar-button" type="button" disabled={loadingEditor} on:click={() => openYamlEditor(editorResource!, editorObject!)}>YAML</button><button class="configuration-toolbar-close" type="button" aria-label="Back to resource objects" on:click={requestCloseConfigEditor}>×</button></div></div>
                         {#if editorEntries.length === 0}
                           <div class="configuration-values-empty">No values yet.{#if editorPermissionSet.canUpdate}<button type="button" on:click={addEditorEntry}>Add the first key</button>{/if}</div>
                         {:else}
@@ -5053,6 +5179,7 @@
                       </div>
                     {/if}
                   {/if}
+                  {#if configDiscardPrompt}<div class="config-discard-bar" role="alertdialog" aria-label="Unsaved changes"><span>Discard unsaved changes to {editorObject.name}?</span><button type="button" class="secondary" on:click={() => (configDiscardPrompt = false)}>Keep editing</button><button type="button" class="destructive" on:click={discardConfigEditor}>Discard</button></div>{/if}
                   <div class="drawer-footer drawer-footer-compact"><div class="editor-footer-actions">{#if editorPermissionSet.resolved && !editorPermissionSet.canUpdate && !editorPermissionSet.canDelete}<span class="permission-readonly-badge">Read only</span>{/if}{#if editorResource.kind !== 'Secret' && editorResource.kind !== 'ConfigMap' && editorPermissionSet.canGet}<button class="secondary" disabled={loadingEditor} on:click={() => openYamlEditor(editorResource!, editorObject!)}>YAML</button>{/if}{#if editorPermissionSet.canDelete}<button class="destructive" disabled={loadingEditor || savingEditor} on:click={() => requestResourceDeletion(editorResource!, editorObject!)}>Delete</button>{/if}{#if (editorResource.kind === 'Secret' || editorResource.kind === 'ConfigMap') && editorPermissionSet.canUpdate}<button class="primary" disabled={loadingEditor || savingEditor} on:click={saveEditor}>{savingEditor ? 'Saving…' : 'Save'}</button>{/if}</div></div>
                 {:else}
                   <div class="inspector-empty"><span>{selectedResource?.crd ? '◇' : '⌁'}</span><h3>{selectedResource ? `Choose a ${selectedResource.kind}` : 'Ready when you are'}</h3><p>{selectedResource ? 'Select an object from the list to view its live properties, edit supported data, or open YAML.' : 'Pick an API type to load its objects. Kuberniva does not fan out requests in the background.'}</p></div>
@@ -5069,7 +5196,7 @@
         {:else}
           <section class="workloads-page font-sans">
             {#if workloadResources.length > 1}
-              <nav class="kind-tabs" aria-label="Workload types">{#each workloadResources as resource}<button type="button" aria-pressed={workloadResource !== null && resourceKey(workloadResource) === resourceKey(resource)} class:kind-tab-active={workloadResource !== null && resourceKey(workloadResource) === resourceKey(resource)} on:click={() => selectWorkloadResource(resource)}>{kindLabel(resource)}</button>{/each}</nav>
+              <nav class="kind-tabs" aria-label="Workload types">{#each workloadResources as resource}<button type="button" aria-pressed={workloadResource !== null && resourceKey(workloadResource) === resourceKey(resource)} class:kind-tab-active={workloadResource !== null && resourceKey(workloadResource) === resourceKey(resource)} title={kindLabel(resource)} on:click={() => selectWorkloadResource(resource)}>{kindTabLabel(resource)}</button>{/each}</nav>
             {/if}
             <div class:workload-detail-open={(editorResource?.category === 'Workloads' && editorObject !== null) || (workloadDetailMode === 'logs' && logTarget !== null)} class:workload-logs-open={workloadDetailMode === 'logs' && logTarget !== null} class="workload-grid grid min-h-[560px]">
               <div class="workload-list-panel overflow-hidden rounded-2xl border border-white/10 bg-[#151924]/90 shadow-2xl shadow-black/10"><div class="workload-list-header flex items-center justify-between gap-4 border-b border-white/10 px-5 py-4"><div><div class="flex items-center gap-2"><Container size={18} class="text-cyan-300" /><h3 class="m-0 text-lg font-semibold text-white">{workloadResource?.kind || 'Select a type'}</h3></div><p class="mb-0 mt-1 text-xs text-slate-400">{namespace} · {workloadResource?.apiVersion || 'Kubernetes API'}{#if workloadResource?.kind === 'Pod'} · CPU/memory from Metrics API{/if}</p></div><span class:live-status-loading={liveDataStatus === 'loading'} class:live-status-loaded={liveDataStatus === 'loaded'} class:live-status-stale={liveDataStatus === 'stale'} class:live-status-paused={liveDataStatus === 'paused'} class:live-status-unavailable={liveDataStatus === 'unavailable'} class="live-list-status" title={liveDataStatusTooltip} aria-label={liveDataStatusTooltip} aria-live="polite"><i></i>{liveDataStatusText}</span><label class="flex h-10 w-72 items-center gap-2 rounded-lg border border-white/10 bg-black/20 px-3 text-slate-500 focus-within:border-indigo-400 focus-within:bg-black/30 focus-within:ring-2 focus-within:ring-indigo-500/20"><Search size={16} /><input class="min-w-0 flex-1 border-0 bg-transparent text-sm text-slate-100 outline-none placeholder:text-slate-500" bind:value={workloadSearch} placeholder={`Filter ${workloadResource?.plural || 'workloads'}`} /></label></div>
@@ -5079,15 +5206,15 @@
                   <div class="grid min-h-96 place-items-center px-6 text-center"><div><div class="mx-auto grid h-12 w-12 place-items-center rounded-2xl bg-indigo-500/15 text-cyan-300"><Boxes size={22} /></div><h4 class="mb-0 mt-4 text-base font-semibold text-slate-100">{workloadObjects.length ? 'No matching workloads' : `No ${workloadResource?.plural || 'workloads'} found`}</h4><p class="mb-0 mt-2 text-sm text-slate-400">{workloadObjects.length ? 'Try a different name or namespace filter.' : `Nothing was returned for ${namespace}.`}</p></div></div>
                 {:else}
                   <div class="workload-object-list" aria-label={`${workloadResource?.kind || 'Workload'} list`}>
-                    <div class:workload-pod-row={workloadResource?.kind === 'Pod'} class="workload-object-list-header workload-selection-header" aria-label="Workload columns">{#if workloadPermissionSet.canDelete}<label class:resource-select-all-partial={workloadObjectsSelectionPartial} class="resource-select-all"><input type="checkbox" checked={allWorkloadObjectsSelected} disabled={deletingResource || loadingWorkloads || !workloadObjects.length} aria-checked={workloadObjectsSelectionPartial ? 'mixed' : allWorkloadObjectsSelected ? 'true' : 'false'} aria-label={`Select all loaded ${workloadResource?.plural || 'workloads'}`} on:change={toggleAllWorkloadObjects} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}<span>Name</span><span>Status</span>{#if workloadResource?.kind === 'Pod'}<span>Ready</span><span>CPU</span><span>Memory</span>{/if}<span>Age</span><span></span></div>
+                    <div class:workload-pod-row={workloadResource?.kind === 'Pod'} class="workload-object-list-header workload-selection-header" style:--workload-columns={`28px ${workloadGridColumns}`} aria-label="Workload columns">{#if workloadPermissionSet.canDelete}<label class:resource-select-all-partial={workloadObjectsSelectionPartial} class="resource-select-all"><input type="checkbox" checked={allWorkloadObjectsSelected} disabled={deletingResource || loadingWorkloads || !workloadObjects.length} aria-checked={workloadObjectsSelectionPartial ? 'mixed' : allWorkloadObjectsSelected ? 'true' : 'false'} aria-label={`Select all loaded ${workloadResource?.plural || 'workloads'}`} on:change={toggleAllWorkloadObjects} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}{#each workloadColumns as column}<span>{column.label}</span>{/each}<span></span></div>
                     {#if selectedWorkloadObjects.length && workloadPermissionSet.canDelete}<div class="resource-bulk-toolbar workload-bulk-toolbar" role="region" aria-label="Bulk workload actions"><span><strong>{selectedWorkloadObjects.length}</strong> selected</span><button class="destructive" type="button" disabled={deletingResource || loadingEditor || savingEditor || loadingYaml || savingYaml} on:click={() => workloadResource && requestBulkResourceDeletion(workloadResource, selectedWorkloadObjects)}>Delete {selectedWorkloadObjects.length}</button><button class="resource-bulk-clear" type="button" disabled={deletingResource} on:click={clearWorkloadObjectSelection}>Clear</button></div>{/if}
                     {#each visibleWorkloadObjects as workload}
-                      <div class:workload-pod-row={workloadResource?.kind === 'Pod'} class:resource-object-row-selected={isWorkloadObjectSelected(workload)} class="resource-object-row workload-selection-row">
-                        {#if workloadPermissionSet.canDelete}<label class="resource-object-select"><input type="checkbox" checked={isWorkloadObjectSelected(workload)} disabled={deletingResource} aria-label={`Select ${workloadResource?.kind || 'workload'} ${workload.name}`} on:change={() => toggleWorkloadObjectSelection(workload)} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}
+                      <div class:workload-pod-row={workloadResource?.kind === 'Pod'} class:resource-object-row-selected={isWorkloadObjectSelected(workload, selectedWorkloadObjectKeys)} class="resource-object-row workload-selection-row">
+                        {#if workloadPermissionSet.canDelete}<label class="resource-object-select"><input type="checkbox" checked={isWorkloadObjectSelected(workload, selectedWorkloadObjectKeys)} disabled={deletingResource} aria-label={`Select ${workloadResource?.kind || 'workload'} ${workload.name}`} on:change={() => toggleWorkloadObjectSelection(workload)} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}
                         <button
                           class:workload-pod-row={workloadResource?.kind === 'Pod'}
                           class:workload-object-selected={Boolean(
-                            isWorkloadObjectSelected(workload)
+                            isWorkloadObjectSelected(workload, selectedWorkloadObjectKeys)
                             || (editorResource
                               && editorObject
                               && workloadResource
@@ -5096,13 +5223,21 @@
                               && editorObject.namespace === workload.namespace)
                           )}
                           class="workload-object-row group"
+                          style:--workload-columns={workloadGridColumns}
                           disabled={!workloadPermissionSet.canGet}
                           on:click={() => workloadResource && openObject(workloadResource, workload)}
                         >
-                          <div class="workload-object-name"><strong>{workload.name}</strong><small>{workload.namespace || 'cluster scope'}{#if workload.nodeName} · {workload.nodeName}{/if}</small></div>
-                          <div class="workload-row-fact"><b class={`workload-status-label ${workloadStatusTone(workload)}`} title={workloadStatusLabel(workload)}>{workloadStatusLabel(workload)}</b></div>
-                          {#if workloadResource?.kind === 'Pod'}<div class="workload-row-fact"><b>{podContainerSummary(workload)}{#if workload.restarts !== undefined && workload.restarts > 0}<small> · {workload.restarts} restarts</small>{/if}</b></div><div class="workload-row-fact"><b title={cpuMetricLabel(workload.cpuUsage)}>{cpuMetricLabel(workload.cpuUsage)}</b></div><div class="workload-row-fact"><b title={workload.memoryUsage || 'Metrics unavailable'}>{podMetricLabel(workload.memoryUsage)}</b></div>{/if}
-                          <div class="workload-row-fact workload-row-age"><b>{resourceAge(workload.createdAt)}</b></div>
+                          {#each workloadColumns as column}
+                            {#if column.key === 'name'}<div class="workload-object-name"><strong title={workload.name}>{workload.name}</strong></div>
+                            {:else if column.key === 'namespace'}<div class="workload-row-fact workload-row-muted"><b title={workload.namespace || 'Cluster scoped'}>{workload.namespace || '—'}</b></div>
+                            {:else if column.key === 'node'}<div class="workload-row-fact workload-row-muted workload-row-node"><b title={workload.nodeName || 'Not scheduled'}><bdi>{workload.nodeName || '—'}</bdi></b></div>
+                            {:else if column.key === 'status'}<div class="workload-row-fact"><b class={`workload-status-label ${workloadStatusTone(workload)}`} title={workloadStatusLabel(workload)}>{workloadStatusLabel(workload)}</b></div>
+                            {:else if column.key === 'ready'}<div class="workload-row-fact"><b>{podContainerSummary(workload)}</b></div>
+                            {:else if column.key === 'restarts'}<div class="workload-row-fact"><b class:workload-restarts-warn={(workload.restarts || 0) > 0}>{workload.restarts ?? 0}</b></div>
+                            {:else if column.key === 'cpu'}<div class="workload-row-fact"><b title={cpuMetricLabel(workload.cpuUsage)}>{cpuMetricLabel(workload.cpuUsage)}</b></div>
+                            {:else if column.key === 'memory'}<div class="workload-row-fact"><b title={workload.memoryUsage || 'Metrics unavailable'}>{podMetricLabel(workload.memoryUsage)}</b></div>
+                            {:else}<div class="workload-row-fact workload-row-age"><b>{resourceAge(workload.createdAt)}</b></div>{/if}
+                          {/each}
                           <ChevronRight size={17} class="workload-row-arrow" />
                         </button>
                       </div>
@@ -5124,7 +5259,7 @@
               {:else if editorResource && editorObject && editorResource.category === 'Workloads'}
                 <aside class="workload-inspector" aria-label="Workload details">
                   <div class="workload-inspector-heading workload-details-heading"><div><h3 title={editorObject.name}>{editorObject.name}</h3><p>{editorResource.kind} · {editorObject.namespace || 'cluster scoped'} <b class={`workload-status-label workload-details-status ${workloadStatusTone(editorObject)}`}>{workloadStatusLabel(editorObject)}</b>{#if editorPermissionSet.resolved && !editorPermissionSet.canUpdate && !editorPermissionSet.canDelete}<span class="permission-readonly-badge">Read only</span>{/if}</p></div><div class="workload-inspector-actions"><button aria-label="Close workload details" title="Close" on:click={() => closeEditor()}>×</button></div></div>
-                  {#if !loadingEditor && workloadDetailMode !== 'terminal'}<nav class="workload-details-toolbar" aria-label="Workload actions">{#if editorPermissionSet.canViewLogs}<button type="button" aria-busy={editorLogsOpening} disabled={Boolean(openingLogsTarget)} on:click={() => openWorkloadLogs(editorResource!, editorObject!)}>{#if editorLogsOpening}<RefreshCw size={13} class="animate-spin" />{:else}<ScrollText size={13} />{/if}{editorLogsOpening ? 'Opening…' : 'Logs'}</button>{/if}{#if editorPermissionSet.canExec}<button type="button" disabled={loadingTerminalPods || Boolean(openingLogsTarget)} on:click={() => openWorkloadTerminal(editorResource!, editorObject!)}><Terminal size={13} />Shell</button>{/if}{#if editorPermissionSet.canGet}<button type="button" on:click={() => openYamlEditor(editorResource!, editorObject!)}><Command size={13} />YAML</button>{/if}{#if editorPermissionSet.canDelete}<button type="button" class="workload-details-delete" on:click={() => requestResourceDeletion(editorResource!, editorObject!)}>Delete</button>{/if}</nav>{/if}
+                  {#if !loadingEditor && workloadDetailMode !== 'terminal'}<nav class="workload-details-toolbar" aria-label="Workload actions">{#if editorPermissionSet.canGet}<button type="button" on:click={() => openYamlEditor(editorResource!, editorObject!)}><Command size={13} />YAML</button>{/if}{#if editorPermissionSet.canDelete}<button type="button" class="workload-details-delete" on:click={() => requestResourceDeletion(editorResource!, editorObject!)}>Delete</button>{/if}</nav>{/if}
                   {#if loadingEditor}
                     <div class="drawer-state"><i></i>Loading live workload details…</div>
                   {:else if workloadDetailMode === 'terminal'}
@@ -5142,6 +5277,7 @@
                     </section>
                   {:else}
                     <div class="workload-inspector-body">
+                      {#if editorPermissionSet.canViewLogs || editorPermissionSet.canExec}<section class="workload-action-grid">{#if editorPermissionSet.canViewLogs}<button class:workload-action-loading={editorLogsOpening} class="workload-action-card workload-logs-action" disabled={Boolean(openingLogsTarget)} aria-busy={editorLogsOpening} on:click={() => openWorkloadLogs(editorResource!, editorObject!)}><span>{#if editorLogsOpening}<RefreshCw size={18} class="workload-action-spinner" />{:else}≡{/if}</span><div><strong>{editorLogsOpening ? 'Opening logs…' : 'View logs'}</strong><small>{editorLogsOpening ? `Preparing ${editorResource.kind} logs and the first live stream` : editorResource.kind === 'Pod' ? 'Keep workload types visible beside this Pod stream' : 'Choose a live Pod and stream its output without leaving Workloads'}</small></div><b>{editorLogsOpening ? '•••' : '→'}</b></button>{/if}{#if editorPermissionSet.canExec}<button class="workload-action-card workload-terminal-action" disabled={loadingTerminalPods || Boolean(openingLogsTarget)} on:click={() => openWorkloadTerminal(editorResource!, editorObject!)}><span>⌘</span><div><strong>Terminal</strong><small>Tunnel into a Pod container with Kubernetes exec</small></div><b>→</b></button>{/if}</section>{/if}
                       <dl class="workload-properties">
                         <dt>Status</dt><dd><b class={`workload-status-label ${workloadStatusTone(editorObject)}`}>{workloadStatusLabel(editorObject)}</b></dd>
                         {#if editorResource.kind === 'Pod'}
@@ -5199,7 +5335,7 @@
     {#if cliOpen}
       <section class:cli-drawer-expanded={cliExpanded} class="cli-drawer" aria-label="Cluster terminal">
         <header><div><Terminal size={15} /><strong>Terminal</strong><span>{activeCluster} · {namespace === 'all namespaces' ? 'kubeconfig default namespace' : namespace}</span>{#if runningCli}<em class="cli-running-badge">running</em>{/if}</div><div class="cli-drawer-actions"><button type="button" aria-label="Copy output" title="Copy output" disabled={!cliLines.length} on:click={copyClusterCliOutput}><Copy size={13} /></button><button type="button" aria-label="Clear output" title="Clear output · Ctrl+L" disabled={!cliLines.length} on:click={clearClusterCli}>⌫</button><button type="button" aria-label={cliExpanded ? 'Shrink terminal' : 'Expand terminal'} title={cliExpanded ? 'Shrink' : 'Expand'} on:click={() => (cliExpanded = !cliExpanded)}>{cliExpanded ? '▾' : '▴'}</button><button type="button" aria-label="Close terminal" title="Close" on:click={() => (cliOpen = false)}>×</button></div></header>
-        <pre bind:this={cliViewport} class="cli-drawer-output" aria-live="polite">{#if cliLines.length}{#each cliLines as line}<span class="cli-line cli-line-{line.stream}">{line.text}{'\n'}</span>{/each}{:else}<span class="cli-line cli-line-meta">Commands run against {activeCluster}{namespace === 'all namespaces' ? '' : ` in ${namespace}`}. kubectl and helm get the context automatically; add -n or -A to change namespace.{'\n'}↑/↓ history · Ctrl+C stop · Ctrl+L clear · Shift+Enter new line</span>{/if}</pre>
+        <pre bind:this={cliViewport} class="cli-drawer-output" aria-live="polite">{#if cliLines.length}{#each cliLines as line}<span class="cli-line cli-line-{line.stream}">{line.text}{'\n'}</span>{/each}{/if}</pre>
         {#if !cliLines.length}<div class="cli-starters" aria-label="Suggested commands">{#each cliStarterCommands as starter}<button type="button" on:click={() => runClusterCli(starter)}>{starter}</button>{/each}</div>{/if}
         <form class="cli-drawer-command" on:submit|preventDefault={() => runClusterCli()}><span>$</span><textarea id="cluster-cli-input" bind:this={cliInput} bind:value={cliCommand} use:autoSizeCliTextarea={cliCommand} rows="1" aria-label="Cluster terminal command" placeholder={runningCli ? 'Running… Ctrl+C to stop' : 'kubectl get pods'} spellcheck="false" autocapitalize="off" autocomplete="off" on:keydown={handleClusterCliKeydown}></textarea>{#if runningCli}<button type="button" class="cli-stop" aria-label="Stop command" title="Stop · Ctrl+C" on:click={cancelClusterCli}>■</button>{:else}<button type="submit" aria-label="Run command" title="Run · Shift+Enter adds a line">↵</button>{/if}</form>
       </section>

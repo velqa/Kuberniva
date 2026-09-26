@@ -7436,10 +7436,76 @@ main .workload-details-heading p { display: flex; flex-wrap: wrap; align-items: 
 main .workloads-page .workload-grid.workload-detail-open { grid-template-columns: minmax(330px, .82fr) minmax(420px, 1.18fr) !important; }
 main .workloads-page .workload-detail-open .workload-selection-header.workload-pod-row { --workload-columns: 28px minmax(0, 1fr) 72px 58px 40px 16px; }
 main .workloads-page .workload-detail-open .workload-selection-row > .workload-object-row.workload-pod-row { --workload-columns: minmax(0, 1fr) 72px 58px 40px 16px; }
-main .workloads-page .workload-detail-open .workload-selection-header.workload-pod-row > :nth-child(5),
-main .workloads-page .workload-detail-open .workload-selection-header.workload-pod-row > :nth-child(6),
-main .workloads-page .workload-detail-open .workload-object-row.workload-pod-row > :nth-child(4),
-main .workloads-page .workload-detail-open .workload-object-row.workload-pod-row > :nth-child(5),
-main .workloads-page .workload-detail-open .workload-object-name small { display: none !important; }
+
 main .workloads-page .workload-detail-open .workload-selection-row { min-width: 0 !important; }
 main .workloads-page .workload-detail-open .workload-selection-header { min-width: 0 !important; }
+
+/* Workload tables: one aligned column per fact, built from the column model. */
+main .workloads-page .workload-row-muted b { color: var(--ui-muted) !important; font-weight: 500 !important; }
+main .workloads-page .workload-row-fact b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Node names share long prefixes; truncate from the start so the unique suffix stays visible. */
+main .workloads-page .workload-row-node b { direction: rtl; text-align: left; }
+main .workloads-page .workload-restarts-warn { color: #c77a1f !important; }
+main.theme-dark .workloads-page .workload-restarts-warn { color: #e8a54b !important; }
+main .workloads-page .kind-tabs { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
+main .workloads-page .kind-tabs::-webkit-scrollbar { display: none; }
+main .workloads-page .kind-tabs button { flex: 0 0 auto; }
+
+/* ConfigMap/Secret editor dialog: centered, roomy, above the full-width table. */
+.config-modal-backdrop { position: fixed; inset: 0; z-index: 38; background: rgba(24, 23, 21, .42); animation: config-modal-fade .14s ease-out; }
+main .resource-workbench-body-focused > .resource-inspector.resource-inspector-modal {
+  position: fixed; top: 50%; left: 50%; z-index: 39;
+  width: min(940px, calc(100vw - 72px)); height: min(760px, calc(100dvh - 72px));
+  display: flex !important; flex-direction: column;
+  overflow: hidden; border: 1px solid var(--ui-border); border-radius: 16px;
+  background: var(--ui-surface); box-shadow: 0 30px 80px rgba(0, 0, 0, .28);
+  transform: translate(-50%, -50%); animation: config-modal-in .16s ease-out;
+}
+.resource-inspector-modal > .resource-inspector-surface { min-height: 0; flex: 1; display: flex; flex-direction: column; }
+.config-modal-heading { flex: 0 0 auto; padding: 18px 22px 12px; border-bottom: 1px solid var(--ui-border); }
+.config-modal-heading h2 { margin: 2px 0 3px; overflow: hidden; color: var(--ui-ink); font-size: 18px; text-overflow: ellipsis; white-space: nowrap; }
+.config-modal-heading small { color: var(--ui-muted); font-size: 11.5px; }
+.config-modal-heading small b { color: var(--ui-accent); font-weight: 600; }
+.config-discard-bar { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; padding: 10px 18px; border-top: 1px solid var(--ui-border); color: var(--ui-ink); background: var(--ui-accent-soft); font-size: 12.5px; }
+.config-discard-bar span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@keyframes config-modal-fade { from { opacity: 0; } }
+@keyframes config-modal-in { from { opacity: 0; transform: translate(-50%, calc(-50% + 8px)); } }
+@media (prefers-reduced-motion: reduce) { .config-modal-backdrop, main .resource-workbench-body-focused > .resource-inspector.resource-inspector-modal { animation: none; } }
+
+/* Object list heading: back · title on the left, live status and count on the right. */
+main .resource-object-browser > .resource-object-heading { display: flex !important; align-items: center; justify-content: flex-start !important; gap: 10px; }
+main .resource-object-browser > .resource-object-heading > div { min-width: 0; flex: 1 1 auto; justify-content: flex-start !important; justify-self: auto !important; text-align: left; }
+main .resource-object-browser > .resource-object-heading > .live-list-status { flex: 0 0 auto; margin-left: auto; }
+main .resource-object-browser > .resource-object-heading > b { order: 4; flex: 0 0 auto; grid-area: auto !important; }
+
+/* Favorites: a slim section in the navigation flow, not a pinned card. */
+main .sidebar .sidebar-favorites { max-height: none; margin: 18px 0 0 !important; padding: 0 !important; overflow: visible; border: 0 !important; border-radius: 0 !important; background: transparent !important; box-shadow: none !important; }
+main .sidebar .sidebar-favorites-heading { display: flex; align-items: center; justify-content: space-between; margin: 0 0 4px; padding: 0 10px; }
+main .sidebar .sidebar-favorites-heading .eyebrow { margin: 0; }
+main .sidebar .sidebar-favorites-manage { padding: 1px 7px; border-radius: 999px; color: var(--ui-muted); background: transparent; font-family: "DM Mono", monospace; font-size: 10px; }
+main .sidebar .sidebar-favorites-manage:hover,
+main .sidebar .sidebar-favorites-manage.active { color: var(--ui-ink); background: var(--ui-surface-strong); }
+.favorite-list { display: grid; gap: 1px; max-height: min(300px, calc(100dvh - 430px)); overflow-y: auto; }
+.favorite-row { position: relative; display: flex; align-items: center; border-radius: 8px; }
+.favorite-row:hover { background: var(--ui-surface-strong); }
+.favorite-row.favorite-row-active { background: var(--ui-surface); box-shadow: inset 2px 0 var(--ui-accent), 0 1px 2px rgba(0, 0, 0, .04); }
+main .sidebar .favorite-shortcut { min-width: 0; height: 30px; flex: 1; display: flex; align-items: center; gap: 9px; padding: 0 8px 0 12px; border-radius: 8px; color: var(--ui-copy); background: transparent; font-size: 12.5px; font-weight: 500; text-align: left; }
+.favorite-shortcut span { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.favorite-row-active .favorite-shortcut { color: var(--ui-ink); font-weight: 650; }
+.favorite-shortcut .status-dot { width: 7px; height: 7px; flex: 0 0 7px; }
+.favorite-shortcut kbd { color: var(--ui-muted); font-family: "DM Mono", monospace; font-size: 10px; opacity: .7; }
+main .sidebar .favorite-row-menu { width: 24px; height: 24px; flex: 0 0 24px; margin-right: 3px; display: none; place-items: center; border-radius: 6px; color: var(--ui-muted); background: transparent; font-size: 14px; }
+.favorite-row:hover .favorite-row-menu,
+.favorite-row:focus-within .favorite-row-menu { display: grid; }
+.favorite-row:hover .favorite-shortcut kbd,
+.favorite-row:focus-within .favorite-shortcut kbd { display: none; }
+main .sidebar .favorite-row-menu:hover { color: var(--ui-ink); background: var(--ui-border); }
+.favorite-shortcut-none { margin: 2px 10px 0; color: var(--ui-muted); font-size: 11.5px; line-height: 1.45; }
+/* Favorite menus open across the sidebar edge; lift the sidebar above its resize handle while one is open. */
+main .sidebar:has(.favorite-context-menu) { z-index: 8; }
+main .favorite-context-menu { min-width: 190px; padding: 5px; border: 1px solid var(--ui-border) !important; border-radius: 10px; color: var(--ui-ink) !important; background: var(--ui-surface) !important; box-shadow: 0 12px 30px rgba(0, 0, 0, .18) !important; }
+main .favorite-context-menu strong { display: block; padding: 6px 9px 5px; overflow: hidden; color: var(--ui-muted) !important; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+main .favorite-context-menu button { width: 100%; display: block; padding: 7px 9px; border-radius: 7px; color: var(--ui-ink) !important; background: transparent !important; font-size: 12.5px; text-align: left; }
+main .favorite-context-menu button:hover { background: var(--ui-surface-strong) !important; }
+main .favorite-context-menu button:last-child { color: #c2413a !important; }
+main.theme-dark .favorite-context-menu button:last-child { color: #f08a80 !important; }
