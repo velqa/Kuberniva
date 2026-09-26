@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Kuberniva",
-  "version": "0.3.19",
+  "version": "0.3.20",
   "identifier": "com.kuberniva.desktop",
   "build": {
     "frontendDist": "../dist",
@@ -39,6 +39,18 @@
     ],
     "android": {
       "debugApplicationIdSuffix": ".debug"
+    },
+    "createUpdaterArtifacts": true,
+    "macOS": {
+      "signingIdentity": "-"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDJBQzM4QzE1OUEwODM2NDMKUldSRE5naWFGWXpES3REdUZpL2cxV3cvZmxjbDNJUmRCWnhXMVV2MkM3enlLQ1hQMXg0akZUUlQK",
+      "endpoints": [
+        "https://github.com/velqa/Kuberniva/releases/latest/download/latest.json"
+      ]
     }
   }
 }

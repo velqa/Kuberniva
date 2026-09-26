@@ -4111,6 +4111,8 @@ pub fn run() {
         )
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         // The window starts hidden so it never shows an unstyled or unzoomed frame. The
         // frontend reveals it after its first paint; this is only a safety net.
         .on_page_load(|webview, payload| {
