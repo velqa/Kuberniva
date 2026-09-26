@@ -31,10 +31,10 @@ use std::{
 };
 use tauri::{Emitter, Manager};
 use tokio::{
-    io::{copy_bidirectional, AsyncReadExt},
+    io::{copy_bidirectional, AsyncBufReadExt, AsyncReadExt, BufReader},
     net::TcpListener,
     process::Command as TokioCommand,
-    sync::oneshot,
+    sync::{mpsc, oneshot},
 };
 use x509_parser::{parse_x509_certificate, pem::parse_x509_pem};
 
@@ -46,6 +46,7 @@ static RESOURCE_WATCH_REGISTRY: OnceLock<Mutex<HashMap<String, oneshot::Sender<(
 static KUBECONFIG_IMPORT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static NEXT_PORT_FORWARD_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_RESOURCE_WATCH_ID: AtomicU64 = AtomicU64::new(1);
+static CLI_RUN_REGISTRY: OnceLock<Mutex<HashMap<String, oneshot::Sender<()>>>> = OnceLock::new();
 const MAX_PASTED_KUBECONFIG_BYTES: usize = 5 * 1024 * 1024;
 const MAX_LOG_EXPORT_BYTES: usize = 20 * 1024 * 1024;
 
@@ -305,6 +306,30 @@ struct PodExecRequest {
 struct PodExecResponse {
     stdout: String,
     stderr: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CliChunk {
+    stream: &'static str,
+    text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CliOutputEvent {
+    run_id: String,
+    chunks: Vec<CliChunk>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CliExitEvent {
+    run_id: String,
+    exit_code: Option<i32>,
+    success: bool,
+    cancelled: bool,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2928,12 +2953,10 @@ fn command_has_context_flag(tokens: &[String]) -> bool {
     tokens.iter().any(|token| {
         matches!(
             token.as_str(),
-            "--context" | "--kube-context" | "--kubeconfig" | "--namespace" | "-n"
+            "--context" | "--kube-context" | "--kubeconfig"
         ) || token.starts_with("--context=")
             || token.starts_with("--kube-context=")
             || token.starts_with("--kubeconfig=")
-            || token.starts_with("--namespace=")
-            || token.starts_with("-n=")
     })
 }
 
@@ -2977,8 +3000,9 @@ fn cluster_shell_command(command: &str, request: &KubeCliRequest) -> String {
     )
 }
 
-#[tauri::command]
-async fn run_cluster_command(request: KubeCliRequest) -> Result<KubeCliResponse, String> {
+/// Builds the process for a CLI command, scoped to the active kubeconfig, context, and
+/// namespace. Returns the process and the tool name used in error messages.
+fn prepare_cluster_process(request: &KubeCliRequest) -> Result<(TokioCommand, String), String> {
     let command = request.command.trim();
     if command.is_empty() {
         return Err("Enter a command, for example: kubectl get pods or helm list".to_string());
@@ -3015,11 +3039,17 @@ async fn run_cluster_command(request: KubeCliRequest) -> Result<KubeCliResponse,
     let tool_is_helm = command_is(&tool, "helm");
     if request.shell && (tool_is_kubectl || tool_is_helm) && command_has_context_flag(&tokens[1..])
     {
-        return Err("Kuberniva supplies the active kubeconfig, context, and namespace automatically, including shell mode. Remove --context/--kube-context/--kubeconfig/--namespace from the command.".to_string());
+        return Err("Kuberniva supplies the active kubeconfig and context automatically, including shell mode. Remove --context/--kube-context/--kubeconfig from the command; -n and -A still work.".to_string());
     }
     let mut process;
     if request.shell {
-        let shell_command = cluster_shell_command(command, &request);
+        // Shell mode runs the text as typed, so apply the `get pods` shorthand there too.
+        let shell_input = if !first_token_is_tool && is_kubectl_shorthand(&cli_tokens(command)?[0]) {
+            format!("kubectl {command}")
+        } else {
+            command.to_string()
+        };
+        let shell_command = cluster_shell_command(&shell_input, request);
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         process = TokioCommand::new(shell);
         process.args(["-lc", &shell_command]);
@@ -3027,7 +3057,7 @@ async fn run_cluster_command(request: KubeCliRequest) -> Result<KubeCliResponse,
         let mut args = tokens[1..].to_vec();
         if tool_is_kubectl || tool_is_helm {
             if command_has_context_flag(&args) {
-                return Err("Kuberniva supplies the active kubeconfig, context, and namespace automatically. Remove --context/--kube-context/--kubeconfig/--namespace from the command.".to_string());
+                return Err("Kuberniva supplies the active kubeconfig and context automatically. Remove --context/--kube-context/--kubeconfig from the command; -n and -A still work.".to_string());
             }
             let mut injected = Vec::with_capacity(args.len() + 7);
             if let Some(path) = request
@@ -3075,6 +3105,160 @@ async fn run_cluster_command(request: KubeCliRequest) -> Result<KubeCliResponse,
         request.namespace.as_deref().unwrap_or(""),
     );
 
+    Ok((process, tool))
+}
+
+fn cli_run_registry() -> &'static Mutex<HashMap<String, oneshot::Sender<()>>> {
+    CLI_RUN_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Forwards each line of a CLI pipe to the batching channel.
+fn forward_cli_stream<R>(reader: R, stream: &'static str, sender: mpsc::UnboundedSender<CliChunk>)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tauri::async_runtime::spawn(async move {
+        let mut reader = BufReader::new(reader);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let text = String::from_utf8_lossy(&line).into_owned();
+                    if sender.send(CliChunk { stream, text }).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Starts a CLI command and streams its output as `kuberniva://cli-output` events, so
+/// long-running commands such as `logs -f` or `get -w` show output immediately and can
+/// be cancelled. Completion is reported once as `kuberniva://cli-exit`.
+#[tauri::command]
+async fn start_cluster_command<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    request: KubeCliRequest,
+    run_id: String,
+) -> Result<String, String> {
+    // The frontend chooses the run id so it can match output that arrives before this
+    // call returns.
+    let run_id = run_id.trim().to_string();
+    if run_id.is_empty() || run_id.len() > 128 {
+        return Err("A valid CLI run id is required".to_string());
+    }
+    let (mut process, tool) = prepare_cluster_process(&request)?;
+    process
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    // A dedicated process group lets Cancel stop the shell and everything it started.
+    #[cfg(unix)]
+    process.process_group(0);
+    let mut child = process.spawn().map_err(|error| {
+        format!("Could not start `{tool}`: {error}. Make sure the command is installed and available on PATH.")
+    })?;
+    let (cancel_sender, cancel_receiver) = oneshot::channel();
+    cli_run_registry()
+        .lock()
+        .map_err(|_| "The CLI registry is unavailable".to_string())?
+        .insert(run_id.clone(), cancel_sender);
+
+    let (chunk_sender, mut chunk_receiver) = mpsc::unbounded_channel::<CliChunk>();
+    if let Some(stdout) = child.stdout.take() {
+        forward_cli_stream(stdout, "stdout", chunk_sender.clone());
+    }
+    if let Some(stderr) = child.stderr.take() {
+        forward_cli_stream(stderr, "stderr", chunk_sender.clone());
+    }
+    drop(chunk_sender);
+
+    // Batch lines every 50 ms so fast output does not flood the webview with events.
+    let pump_app = app.clone();
+    let pump_run_id = run_id.clone();
+    let pump = tauri::async_runtime::spawn(async move {
+        let mut batch = Vec::new();
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(50));
+        loop {
+            tokio::select! {
+                chunk = chunk_receiver.recv() => match chunk {
+                    Some(chunk) => {
+                        batch.push(chunk);
+                        if batch.len() >= 500 {
+                            let _ = pump_app.emit("kuberniva://cli-output", CliOutputEvent { run_id: pump_run_id.clone(), chunks: std::mem::take(&mut batch) });
+                        }
+                    }
+                    None => break,
+                },
+                _ = interval.tick() => {
+                    if !batch.is_empty() {
+                        let _ = pump_app.emit("kuberniva://cli-output", CliOutputEvent { run_id: pump_run_id.clone(), chunks: std::mem::take(&mut batch) });
+                    }
+                }
+            }
+        }
+        if !batch.is_empty() {
+            let _ = pump_app.emit("kuberniva://cli-output", CliOutputEvent { run_id: pump_run_id, chunks: batch });
+        }
+    });
+
+    let exit_run_id = run_id.clone();
+    tauri::async_runtime::spawn(async move {
+        let pid = child.id();
+        let (status, cancelled) = tokio::select! {
+            status = child.wait() => (Some(status), false),
+            _ = cancel_receiver => {
+                #[cfg(unix)]
+                if let Some(pid) = pid {
+                    let _ = std::process::Command::new("kill").args(["-TERM", &format!("-{pid}")]).status();
+                }
+                let status = match tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await {
+                    Ok(status) => status,
+                    Err(_) => {
+                        let _ = child.kill().await;
+                        child.wait().await
+                    }
+                };
+                (Some(status), true)
+            }
+        };
+        // Output from the final moments is flushed before the exit event.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), pump).await;
+        if let Ok(mut registry) = cli_run_registry().lock() {
+            registry.remove(&exit_run_id);
+        }
+        let (exit_code, success, error) = match status {
+            Some(Ok(status)) => (status.code(), status.success() && !cancelled, None),
+            Some(Err(error)) => (None, false, Some(error.to_string())),
+            None => (None, false, None),
+        };
+        let _ = app.emit(
+            "kuberniva://cli-exit",
+            CliExitEvent { run_id: exit_run_id, exit_code, success, cancelled, error },
+        );
+    });
+    Ok(run_id)
+}
+
+#[tauri::command]
+fn cancel_cluster_command(run_id: String) -> Result<(), String> {
+    let sender = cli_run_registry()
+        .lock()
+        .map_err(|_| "The CLI registry is unavailable".to_string())?
+        .remove(&run_id);
+    if let Some(sender) = sender {
+        let _ = sender.send(());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn run_cluster_command(request: KubeCliRequest) -> Result<KubeCliResponse, String> {
+    let (mut process, tool) = prepare_cluster_process(&request)?;
     let output = tokio::time::timeout(std::time::Duration::from_secs(120), process.output())
     .await
     .map_err(|_| "The command did not finish within 120 seconds".to_string())?
@@ -3251,6 +3435,115 @@ async fn stop_port_forward(request: StopPortForwardRequest) -> Result<PortForwar
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn cli_request(kubeconfig_path: &Path, namespace: &str, command: &str) -> KubeCliRequest {
+        KubeCliRequest {
+            kubeconfig_path: Some(kubeconfig_path.to_string_lossy().into_owned()),
+            context: "cli".to_string(),
+            namespace: Some(namespace.to_string()),
+            command: command.to_string(),
+            shell: true,
+        }
+    }
+
+    fn cli_kubeconfig_file() -> Option<PathBuf> {
+        configure_desktop_exec_path();
+        if std::process::Command::new("kubectl").arg("version").arg("--client").output().is_err() {
+            return None; // kubectl is not installed on this machine.
+        }
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = env::temp_dir().join(format!("kuberniva-cli-test-{nanos}.yaml"));
+        fs::write(&path, kubeconfig("cli")).unwrap();
+        Some(path)
+    }
+
+    #[tokio::test]
+    async fn cli_shorthand_runs_kubectl_in_the_selected_namespace() {
+        let Some(path) = cli_kubeconfig_file() else { return };
+        let response = run_cluster_command(cli_request(
+            &path,
+            "team-a",
+            "create configmap probe --dry-run=client -o jsonpath={.metadata.namespace}",
+        ))
+        .await
+        .unwrap();
+        let _ = fs::remove_file(&path);
+        assert!(response.success, "{}", response.stderr);
+        assert_eq!(response.stdout.trim(), "team-a");
+    }
+
+    #[tokio::test]
+    async fn cli_namespace_flag_overrides_the_selected_namespace() {
+        let Some(path) = cli_kubeconfig_file() else { return };
+        let response = run_cluster_command(cli_request(
+            &path,
+            "team-a",
+            "kubectl create configmap probe -n team-b --dry-run=client -o jsonpath={.metadata.namespace}",
+        ))
+        .await
+        .unwrap();
+        let _ = fs::remove_file(&path);
+        assert!(response.success, "{}", response.stderr);
+        assert_eq!(response.stdout.trim(), "team-b");
+    }
+
+    #[tokio::test]
+    async fn cli_streams_output_before_exit_and_can_be_cancelled() {
+        use tauri::Listener;
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<(bool, String)>();
+        let output_sender = sender.clone();
+        handle.listen_any("kuberniva://cli-output", move |event| {
+            let _ = output_sender.send((false, event.payload().to_string()));
+        });
+        handle.listen_any("kuberniva://cli-exit", move |event| {
+            let _ = sender.send((true, event.payload().to_string()));
+        });
+        let request = KubeCliRequest {
+            kubeconfig_path: None,
+            context: "cli".to_string(),
+            namespace: None,
+            command: "echo first-line; sleep 30; echo never-printed".to_string(),
+            shell: true,
+        };
+        let started = std::time::Instant::now();
+        start_cluster_command(handle.clone(), request, "run-stream".to_string())
+            .await
+            .unwrap();
+
+        let wait = std::time::Duration::from_secs(10);
+        let (is_exit, first) = tokio::time::timeout(wait, receiver.recv()).await.unwrap().unwrap();
+        assert!(!is_exit, "output should stream before the command exits: {first}");
+        assert!(first.contains("first-line"), "{first}");
+
+        cancel_cluster_command("run-stream".to_string()).unwrap();
+        let exit = tokio::time::timeout(wait, async {
+            loop {
+                let (is_exit, payload) = receiver.recv().await.unwrap();
+                assert!(!payload.contains("never-printed"));
+                if is_exit {
+                    return payload;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(exit.contains("\"cancelled\":true"), "{exit}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(15));
+    }
+
+    #[test]
+    fn cli_rejects_switching_the_context() {
+        let request = KubeCliRequest {
+            kubeconfig_path: None,
+            context: "cli".to_string(),
+            namespace: None,
+            command: "kubectl get pods --context other".to_string(),
+            shell: true,
+        };
+        assert!(prepare_cluster_process(&request).is_err());
+    }
 
     fn kubeconfig(name: &str) -> String {
         format!(
@@ -3719,7 +4012,8 @@ mod tests {
             "--context=other".to_string(),
             "get".to_string(),
         ]));
-        assert!(command_has_context_flag(&[
+        // Namespace flags are allowed: they override the selected namespace.
+        assert!(!command_has_context_flag(&[
             "-n".to_string(),
             "other".to_string()
         ]));
@@ -3850,6 +4144,8 @@ pub fn run() {
             exec_pod_command,
             run_cluster_command,
             run_kubectl_command,
+            start_cluster_command,
+            cancel_cluster_command,
             start_port_forward,
             list_port_forwards,
             stop_port_forward

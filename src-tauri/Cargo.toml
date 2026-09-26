@@ -41,3 +41,6 @@ codegen-units = 1
 lto = true
 opt-level = 3
 strip = true
+
+[dev-dependencies]
+tauri = { version = "2.11.3", features = ["test"] }

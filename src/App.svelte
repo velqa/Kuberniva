@@ -48,7 +48,9 @@
   type KubeconfigInputMode = 'file' | 'folder' | 'paste';
   type Cluster = { id: string; name: string; provider: string; status: string; tone: string; authMethod?: string; namespace?: string; kubeconfigPath?: string; sourceId?: string };
   type GlobalSearchResult = { type: 'resource' | 'object'; resource: ResourceDescriptor; object?: ResourceObject; title: string; detail: string };
-  type KubeCliResponse = { stdout: string; stderr: string; exitCode?: number; success: boolean };
+  type CliLine = { stream: 'stdout' | 'stderr' | 'prompt' | 'meta'; text: string };
+  type CliOutputEvent = { runId: string; chunks: { stream: 'stdout' | 'stderr'; text: string }[] };
+  type CliExitEvent = { runId: string; exitCode?: number | null; success: boolean; cancelled: boolean; error?: string | null };
   type ResourceWatchSignal = { watchId: string; action: string; error?: string };
   type ResourceWatchStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'error';
   type LiveDataStatus = 'loading' | 'live' | 'loaded' | 'stale' | 'paused' | 'unavailable';
@@ -82,6 +84,8 @@
   let sidebarResourceMenuOpen = false;
   let sidebarTypeActivePanel: 'workload' | 'resource' = 'workload';
   let sidebarResourceSearch = '';
+  let resourceDirectorySearch = '';
+  let recentResourceKeys: string[] = [];
   let sidebarResourceCategory: ResourceCategory | 'All resources' = 'All resources';
   let theme: ThemeMode = 'light';
   let uiScale = 0.9;
@@ -130,10 +134,21 @@
   let loadingTerminalRuntime = false;
   let runningTerminalCommand = false;
   let cliCommand = '';
-  let cliOutput = '';
+  let cliLines: CliLine[] = [];
   let runningCli = false;
+  let cliRunId: string | null = null;
+  let cliRunStartedAt = 0;
+  let cliExpanded = false;
+  let cliHistory: string[] = [];
+  let cliHistoryIndex = -1;
+  let cliHistoryDraft = '';
+  let cliListenersReady: Promise<void> | null = null;
+  const cliHistoryStorageKey = 'kuberniva.cli-history.v1';
+  const cliMaxLines = 5000;
+  const cliStarterCommands = ['kubectl get pods', 'kubectl get deploy', 'kubectl get events --sort-by=.lastTimestamp', 'kubectl top pods', 'helm list'];
   let cliOpen = false;
   let cliViewport: HTMLPreElement;
+  let cliInput: HTMLTextAreaElement;
   let editorResource: ResourceDescriptor | null = null;
   let editorObject: ResourceObject | null = null;
   let editorManifest: Record<string, unknown> | null = null;
@@ -293,6 +308,10 @@
             : liveDataStatus === 'unavailable' ? 'Live data is unavailable. Kuberniva will preserve this workspace until it can refresh safely.' : '';
   $: categoryCounts = Object.fromEntries(resourceCategories.map((category) => [category, resourceWorkspaceResources.filter((resource) => resource.category === category).length]));
   $: customApiWorkspace = activeView === 'Resources' && selectedCategory === 'Custom Resources';
+  $: resourceDirectorySections = buildResourceDirectory(activeResourceCatalog, resourceDirectorySearch, customApiWorkspace);
+  $: recentDirectoryResources = resourceDirectorySearch.trim()
+    ? []
+    : recentResourceKeys.map((key) => activeResourceCatalog.find((resource) => resourceKey(resource) === key)).filter((resource): resource is ResourceDescriptor => Boolean(resource)).slice(0, 6);
   $: activeViewTitle = customApiWorkspace ? 'Custom APIs' : activeView;
   $: resourceNavigatorLabel = customApiWorkspace ? 'Custom APIs' : 'Resources';
   $: showClusterWorkspaceControls = Boolean(activeClusterId) && ['Overview', 'Events', 'Resources', 'Workloads', 'Logs'].includes(activeView);
@@ -831,7 +850,7 @@
       || loadingLogs
       || downloadingLogs
     );
-    return modalOpen || connectionWorkflow || resourceWorkflow || workloadWorkflow || runningCli;
+    return modalOpen || connectionWorkflow || resourceWorkflow || workloadWorkflow;
   }
 
   function hasPreservedLiveState() {
@@ -1860,17 +1879,127 @@
       return;
     }
     cliOpen = !cliOpen;
-    if (cliOpen) void tick().then(() => document.getElementById('cluster-cli-input')?.focus());
+    if (cliOpen) void tick().then(() => cliInput?.focus());
+  }
+
+  function loadCliHistory() {
+    try {
+      const parsed = JSON.parse(window.localStorage.getItem(cliHistoryStorageKey) || '[]');
+      return Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === 'string').slice(0, 100) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function rememberCliCommand(command: string) {
+    cliHistory = [command, ...cliHistory.filter((entry) => entry !== command)].slice(0, 100);
+    cliHistoryIndex = -1;
+    try {
+      window.localStorage.setItem(cliHistoryStorageKey, JSON.stringify(cliHistory));
+    } catch {
+      // History is a convenience only.
+    }
+  }
+
+  async function appendCliLines(lines: CliLine[]) {
+    const nearBottom = !cliViewport || cliViewport.scrollHeight - cliViewport.scrollTop - cliViewport.clientHeight < 48;
+    const merged = cliLines.concat(lines);
+    cliLines = merged.length > cliMaxLines ? merged.slice(merged.length - cliMaxLines) : merged;
+    await tick();
+    if (nearBottom && cliViewport) cliViewport.scrollTop = cliViewport.scrollHeight;
+  }
+
+  function stripAnsi(text: string) {
+    // eslint-disable-next-line no-control-regex
+    return text.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
+  }
+
+  function setupCliListeners() {
+    cliListenersReady ??= (async () => {
+      const { listen } = await import('@tauri-apps/api/event');
+      await listen<CliOutputEvent>('kuberniva://cli-output', ({ payload }) => {
+        if (payload.runId !== cliRunId) return;
+        void appendCliLines(payload.chunks.map((chunk) => ({ stream: chunk.stream, text: stripAnsi(chunk.text.replace(/\r?\n$/, '')) })));
+      });
+      await listen<CliExitEvent>('kuberniva://cli-exit', ({ payload }) => {
+        if (payload.runId !== cliRunId) return;
+        const seconds = ((Date.now() - cliRunStartedAt) / 1000).toFixed(1);
+        const summary = payload.cancelled
+          ? `^C stopped after ${seconds}s`
+          : payload.error
+            ? `Failed: ${payload.error}`
+            : payload.success ? `✓ done in ${seconds}s` : `✗ exited with code ${payload.exitCode ?? 'unknown'} after ${seconds}s`;
+        void appendCliLines([{ stream: payload.success || payload.cancelled ? 'meta' : 'stderr', text: summary }]);
+        cliRunId = null;
+        runningCli = false;
+        schedulePendingResumeRecovery();
+        void tick().then(() => cliInput?.focus());
+      });
+    })();
+    return cliListenersReady;
+  }
+
+  function recallCliHistory(direction: 1 | -1) {
+    if (!cliHistory.length) return;
+    if (cliHistoryIndex === -1) cliHistoryDraft = cliCommand;
+    const nextIndex = Math.min(cliHistory.length - 1, Math.max(-1, cliHistoryIndex + direction));
+    cliHistoryIndex = nextIndex;
+    cliCommand = nextIndex === -1 ? cliHistoryDraft : cliHistory[nextIndex];
+    void tick().then(() => cliInput?.setSelectionRange(cliCommand.length, cliCommand.length));
   }
 
   function handleClusterCliKeydown(event: KeyboardEvent) {
-    if (event.key !== 'Enter' || event.shiftKey) return;
-    event.preventDefault();
-    void runClusterCli();
+    const input = event.currentTarget as HTMLTextAreaElement;
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      void runClusterCli();
+      return;
+    }
+    if (event.ctrlKey && event.key.toLowerCase() === 'c' && runningCli && input.selectionStart === input.selectionEnd) {
+      event.preventDefault();
+      void cancelClusterCli();
+      return;
+    }
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'l') {
+      event.preventDefault();
+      clearClusterCli();
+      return;
+    }
+    const onFirstLine = !input.value.slice(0, input.selectionStart ?? 0).includes('\n');
+    const onLastLine = !input.value.slice(input.selectionEnd ?? 0).includes('\n');
+    if (event.key === 'ArrowUp' && onFirstLine) {
+      event.preventDefault();
+      recallCliHistory(1);
+    } else if (event.key === 'ArrowDown' && onLastLine && cliHistoryIndex !== -1) {
+      event.preventDefault();
+      recallCliHistory(-1);
+    }
   }
 
-  async function runClusterCli() {
-    const command = cliCommand.trim();
+  function clearClusterCli() {
+    cliLines = [];
+  }
+
+  async function copyClusterCliOutput() {
+    const text = cliLines.map((line) => line.text).join('\n');
+    if (!text) return;
+    try {
+      const { writeText } = await import('@tauri-apps/plugin-clipboard-manager');
+      await writeText(text, { label: 'Kuberniva CLI output' });
+    } catch {
+      await navigator.clipboard.writeText(text).catch(() => undefined);
+    }
+    notify('CLI output copied.');
+  }
+
+  async function cancelClusterCli() {
+    if (!cliRunId) return;
+    const { invoke } = await import('@tauri-apps/api/core');
+    await invoke('cancel_cluster_command', { runId: cliRunId }).catch(() => undefined);
+  }
+
+  async function runClusterCli(preset?: string) {
+    const command = (preset ?? cliCommand).trim();
     if (!activeClusterId) {
       notify('Select a cluster before opening the CLI.');
       return;
@@ -1879,12 +2008,28 @@
       notify('Enter a command, for example: kubectl get pods or helm list');
       return;
     }
-    runningCli = true;
+    if (runningCli) {
+      notify('A command is still running. Press Ctrl+C or Stop to end it first.');
+      return;
+    }
+    if (command === 'clear') {
+      clearClusterCli();
+      cliCommand = '';
+      return;
+    }
     const promptScope = namespace === 'all namespaces' ? activeCluster : `${activeCluster}/${namespace}`;
-    cliOutput = `${cliOutput ? `${cliOutput}\n\n` : ''}${promptScope} $ ${command}\n`;
+    rememberCliCommand(command);
+    cliCommand = '';
+    const runId = typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : `cli-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    cliRunId = runId;
+    cliRunStartedAt = Date.now();
+    runningCli = true;
+    await appendCliLines([{ stream: 'prompt', text: `${promptScope} $ ${command}` }]);
     try {
+      await setupCliListeners();
       const { invoke } = await import('@tauri-apps/api/core');
-      const response = await invoke<KubeCliResponse>('run_cluster_command', {
+      await invoke<string>('start_cluster_command', {
+        runId,
         request: {
           kubeconfigPath: activeKubeconfigPath || kubeconfigPath || null,
           context: activeCluster,
@@ -1893,16 +2038,12 @@
           shell: true,
         },
       });
-      cliOutput += response.stdout || response.stderr || `(kubectl exited with code ${response.exitCode ?? 0})`;
-      if (response.stderr && response.stdout) cliOutput += `\n${response.stderr}`;
     } catch (error) {
-      cliOutput += `\n${String(error)}`;
-    } finally {
-      runningCli = false;
-      cliCommand = '';
-      await tick();
-      if (cliViewport) cliViewport.scrollTop = cliViewport.scrollHeight;
-      schedulePendingResumeRecovery();
+      if (cliRunId === runId) {
+        cliRunId = null;
+        runningCli = false;
+        await appendCliLines([{ stream: 'stderr', text: String(error) }]);
+      }
     }
   }
 
@@ -2188,6 +2329,77 @@
 
   function objectNamespace(object: ResourceObject) {
     return object.namespace || (namespace === 'all namespaces' ? '' : namespace);
+  }
+
+  // Everyday kinds lead their section; everything else follows alphabetically.
+  const commonResourceKinds = ['ConfigMap', 'Secret', 'Service', 'Ingress', 'PersistentVolumeClaim', 'ServiceAccount', 'Role', 'RoleBinding', 'NetworkPolicy', 'Gateway', 'HTTPRoute', 'StorageClass', 'PersistentVolume', 'Namespace', 'Node'];
+  const recentResourcesStorageKey = 'kuberniva.recent-resources.v1';
+
+  function kindLabel(resource: ResourceDescriptor) {
+    const kind = resource.kind;
+    if (resource.plural.toLowerCase() === kind.toLowerCase()) return kind;
+    if (/(s|x|ch|sh)$/i.test(kind)) return `${kind}es`;
+    if (/[^aeiou]y$/i.test(kind)) return `${kind.slice(0, -1)}ies`;
+    return `${kind}s`;
+  }
+
+  function sortResourcesForBrowsing(resources: ResourceDescriptor[]) {
+    const rank = (resource: ResourceDescriptor) => {
+      const index = commonResourceKinds.indexOf(resource.kind);
+      return index === -1 ? commonResourceKinds.length : index;
+    };
+    return [...resources].sort((left, right) => rank(left) - rank(right) || left.kind.localeCompare(right.kind));
+  }
+
+  function buildResourceDirectory(resources: ResourceDescriptor[], search: string, custom: boolean) {
+    const query = search.trim().toLowerCase();
+    const matches = query
+      ? resources.filter((resource) => [resource.kind, resource.plural, resource.group, resource.apiVersion].some((value) => value.toLowerCase().includes(query)))
+      : resources;
+    const sections = new Map<string, ResourceDescriptor[]>();
+    for (const resource of matches) {
+      // Custom APIs read best by owning API group; built-ins by operational area.
+      const section = custom ? resource.group || 'core' : resource.category === 'Gateway APIs' ? 'Network' : resource.category;
+      sections.set(section, [...(sections.get(section) || []), resource]);
+    }
+    const order = custom ? [...sections.keys()].sort() : resourceTreeCategories.filter((category) => sections.has(category));
+    return order.map((title) => ({ title, resources: sortResourcesForBrowsing(sections.get(title) || []) }));
+  }
+
+  function loadRecentResourceKeys() {
+    try {
+      const parsed = JSON.parse(window.localStorage.getItem(recentResourcesStorageKey) || '[]');
+      return Array.isArray(parsed) ? parsed.filter((key): key is string => typeof key === 'string').slice(0, 12) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function rememberRecentResource(resource: ResourceDescriptor) {
+    const key = resourceKey(resource);
+    recentResourceKeys = [key, ...recentResourceKeys.filter((candidate) => candidate !== key)].slice(0, 12);
+    try {
+      window.localStorage.setItem(recentResourcesStorageKey, JSON.stringify(recentResourceKeys));
+    } catch {
+      // Recent types are a convenience only.
+    }
+  }
+
+  async function openDirectoryResource(resource: ResourceDescriptor) {
+    selectedCategory = resource.category;
+    sidebarResourceCategory = resource.category;
+    await openResource(resource);
+  }
+
+  function showResourceDirectory() {
+    resourceRequestGeneration += 1;
+    stopLiveObjectRefresh();
+    clearResourceObjectSelection();
+    closeEditor();
+    closeYamlEditor();
+    selectedResource = null;
+    resourceObjects = [];
+    loadingObjects = false;
   }
 
   function resourceKey(resource: ResourceDescriptor) {
@@ -3751,6 +3963,8 @@
     applyTheme(loadThemePreference());
     // The native window starts hidden; reveal it once the zoomed first frame is painted.
     void applyUiScale(loadUiScalePreference(), false).finally(revealWindow);
+    recentResourceKeys = loadRecentResourceKeys();
+    cliHistory = loadCliHistory();
     resourceNavigatorWidth = loadPaneSize(resourceNavigatorWidthStorageKey, 272, 220, 440);
     resourceObjectPaneWidth = loadPaneSize(resourceObjectPaneWidthStorageKey, 300, 180, 520);
     void restoreWorkspace();
@@ -4272,6 +4486,7 @@
       clearResourceObjectSelection();
     }
     if (!silent) {
+      rememberRecentResource(resource);
       closeEditor();
       closeYamlEditor();
     }
@@ -4459,7 +4674,7 @@
                 {#each resourceTreeCategories as category}
                   {@const categoryResources = sidebarVisibleResources.filter((resource) => resource.category === category)}
                   {@const gatewayResources = category === 'Network' ? sidebarVisibleResources.filter((resource) => resource.category === 'Gateway APIs') : []}
-                  {#if categoryResources.length || gatewayResources.length}<details class="workspace-resource-tree"><summary><span>{category}</span><b>{categoryResources.length + gatewayResources.length}</b></summary><div>{#each categoryResources as resource}<button type="button" role="option" aria-selected={selectedResource !== null && resourceKey(selectedResource) === resourceKey(resource)} class:sidebar-type-selected={selectedResource !== null && resourceKey(selectedResource) === resourceKey(resource)} on:click={() => selectSidebarResourceType(resource)}><span class:custom={resource.crd} class="sidebar-type-icon">{resource.crd ? '◇' : '○'}</span><span><strong>{resource.kind}</strong><small>{resource.apiVersion} · {resource.namespaced ? 'Namespaced' : 'Cluster-wide'}</small></span><b>{selectedResource !== null && resourceKey(selectedResource) === resourceKey(resource) ? '✓' : ''}</b></button>{/each}{#if gatewayResources.length}<section class="workspace-resource-subtree"><header><span>Gateway APIs</span><b>{gatewayResources.length}</b></header>{#each gatewayResources as resource}<button type="button" role="option" aria-selected={selectedResource !== null && resourceKey(selectedResource) === resourceKey(resource)} class:sidebar-type-selected={selectedResource !== null && resourceKey(selectedResource) === resourceKey(resource)} on:click={() => selectSidebarResourceType(resource)}><span class:custom={resource.crd} class="sidebar-type-icon">{resource.crd ? '◇' : '○'}</span><span><strong>{resource.kind}</strong><small>{resource.apiVersion} · {resource.namespaced ? 'Namespaced' : 'Cluster-wide'}</small></span><b>{selectedResource !== null && resourceKey(selectedResource) === resourceKey(resource) ? '✓' : ''}</b></button>{/each}</section>{/if}</div></details>{/if}
+                  {#if categoryResources.length || gatewayResources.length}<details class="workspace-resource-tree" open={Boolean(sidebarResourceSearch.trim()) || [...categoryResources, ...gatewayResources].some((resource) => selectedResource !== null && resourceKey(selectedResource) === resourceKey(resource)) || sidebarVisibleResources.length <= 12}><summary><span>{category}</span><b>{categoryResources.length + gatewayResources.length}</b></summary><div>{#each categoryResources as resource}<button type="button" role="option" aria-selected={selectedResource !== null && resourceKey(selectedResource) === resourceKey(resource)} class:sidebar-type-selected={selectedResource !== null && resourceKey(selectedResource) === resourceKey(resource)} on:click={() => selectSidebarResourceType(resource)}><span class:custom={resource.crd} class="sidebar-type-icon">{resource.crd ? '◇' : '○'}</span><span><strong>{resource.kind}</strong><small>{resource.apiVersion} · {resource.namespaced ? 'Namespaced' : 'Cluster-wide'}</small></span><b>{selectedResource !== null && resourceKey(selectedResource) === resourceKey(resource) ? '✓' : ''}</b></button>{/each}{#if gatewayResources.length}<section class="workspace-resource-subtree"><header><span>Gateway APIs</span><b>{gatewayResources.length}</b></header>{#each gatewayResources as resource}<button type="button" role="option" aria-selected={selectedResource !== null && resourceKey(selectedResource) === resourceKey(resource)} class:sidebar-type-selected={selectedResource !== null && resourceKey(selectedResource) === resourceKey(resource)} on:click={() => selectSidebarResourceType(resource)}><span class:custom={resource.crd} class="sidebar-type-icon">{resource.crd ? '◇' : '○'}</span><span><strong>{resource.kind}</strong><small>{resource.apiVersion} · {resource.namespaced ? 'Namespaced' : 'Cluster-wide'}</small></span><b>{selectedResource !== null && resourceKey(selectedResource) === resourceKey(resource) ? '✓' : ''}</b></button>{/each}</section>{/if}</div></details>{/if}
                 {/each}
               {/if}
             {:else}<div class="sidebar-type-empty"><strong>No matching APIs</strong><small>Change the category or search term.</small></div>{/if}
@@ -4667,11 +4882,26 @@
           {:else if loadingCatalog}
             <div class="connection-error"><strong>Connecting to {activeCluster}…</strong><p>Reading the live API catalog and namespaces.</p></div>
           {:else}
-            {#if !selectedResource}<div class="resource-focus-heading"><div class="resource-focus-title"><span>⌁</span><div><p class="eyebrow">{customApiWorkspace ? 'Custom APIs' : 'Resources'}</p><h2>Choose a resource</h2></div></div></div>{/if}
+            {#if !selectedResource}
+              <div class="resource-directory">
+                <header class="resource-directory-header">
+                  <div><p class="eyebrow">{customApiWorkspace ? 'Custom APIs' : 'Resources'}</p><h2>{customApiWorkspace ? 'Browse custom APIs' : 'Browse resources'}</h2><p>{activeResourceCatalog.length} API types in {activeCluster}. Pick one to load its objects.</p></div>
+                  <label class="resource-directory-search"><Search size={15} /><input bind:value={resourceDirectorySearch} placeholder="Find a kind, group, or version" aria-label="Find a resource type" spellcheck="false" /></label>
+                </header>
+                {#if recentDirectoryResources.length}
+                  <section class="resource-directory-section"><h3>Recently opened</h3><div class="resource-directory-grid">{#each recentDirectoryResources as resource}<button type="button" class="resource-directory-card resource-directory-card-recent" on:click={() => openDirectoryResource(resource)}><strong>{kindLabel(resource)}</strong><small>{resource.apiVersion}</small><span>{resource.namespaced ? 'Namespaced' : 'Cluster-wide'}</span></button>{/each}</div></section>
+                {/if}
+                {#each resourceDirectorySections as section}
+                  <section class="resource-directory-section"><h3>{section.title}<b>{section.resources.length}</b></h3><div class="resource-directory-grid">{#each section.resources as resource}<button type="button" class="resource-directory-card" on:click={() => openDirectoryResource(resource)}><strong>{kindLabel(resource)}</strong><small>{resource.apiVersion}</small><span>{resource.namespaced ? 'Namespaced' : 'Cluster-wide'}</span></button>{/each}</div></section>
+                {:else}
+                  <div class="resource-object-empty"><span>⌕</span><strong>{resourceDirectorySearch.trim() ? 'No matching API types' : 'No API types available'}</strong><p>{resourceDirectorySearch.trim() ? 'Try a different kind, group, or version.' : 'Your identity cannot list any resource types in this scope.'}</p></div>
+                {/each}
+              </div>
+            {:else}
             <div class="resource-workbench-body resource-workbench-body-focused">
               <aside class="resource-object-browser" aria-label="Resource objects">
                 {#if selectedResource}
-                  <div class="resource-object-heading resource-pane-heading"><span class="resource-pane-step">01</span><div><span class:custom={selectedResource.crd} class="resource-pane-icon">{selectedResource.crd ? '◇' : '○'}</span><div><strong>{selectedResource.kind} objects</strong><small>{selectedResource.apiVersion} · {selectedResource.namespaced ? (namespace === 'all namespaces' ? 'All namespaces' : namespace) : 'Cluster-wide'}</small></div></div><span class:live-status-loading={liveDataStatus === 'loading'} class:live-status-loaded={liveDataStatus === 'loaded'} class:live-status-stale={liveDataStatus === 'stale'} class:live-status-paused={liveDataStatus === 'paused'} class:live-status-unavailable={liveDataStatus === 'unavailable'} class="live-list-status resource-live-status" title={liveDataStatusTooltip} aria-label={liveDataStatusTooltip} aria-live="polite"><i></i></span><b>{resourceObjects.length}</b></div>
+                  <div class="resource-object-heading resource-pane-heading"><button type="button" class="resource-directory-back" aria-label="Back to all resource types" title="All resource types" on:click={showResourceDirectory}>←</button><div><span class:custom={selectedResource.crd} class="resource-pane-icon">{selectedResource.crd ? '◇' : '○'}</span><div><strong>{selectedResource.kind} objects</strong><small>{selectedResource.apiVersion} · {selectedResource.namespaced ? (namespace === 'all namespaces' ? 'All namespaces' : namespace) : 'Cluster-wide'}</small></div></div><span class:live-status-loading={liveDataStatus === 'loading'} class:live-status-loaded={liveDataStatus === 'loaded'} class:live-status-stale={liveDataStatus === 'stale'} class:live-status-paused={liveDataStatus === 'paused'} class:live-status-unavailable={liveDataStatus === 'unavailable'} class="live-list-status resource-live-status" title={liveDataStatusTooltip} aria-label={liveDataStatusTooltip} aria-live="polite"><i></i></span><b>{resourceObjects.length}</b></div>
                   <div class="resource-object-columns" role="row" aria-label="Select loaded resource objects">{#if selectedResourcePermissionSet.canDelete}<label class:resource-select-all-partial={resourceObjectsSelectionPartial} class="resource-select-all"><input type="checkbox" checked={allResourceObjectsSelected} disabled={deletingResource || loadingObjects || !resourceObjects.length} aria-checked={resourceObjectsSelectionPartial ? 'mixed' : allResourceObjectsSelected ? 'true' : 'false'} aria-label={`Select all loaded ${selectedResource.plural}`} on:change={toggleAllResourceObjects} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}<span>Name</span><span>Namespace</span><span>Age</span><span>Action</span></div>
                   {#if selectedResourceObjects.length && selectedResourcePermissionSet.canDelete}<div class="resource-bulk-toolbar" role="region" aria-label="Bulk resource actions"><span><strong>{selectedResourceObjects.length}</strong> selected</span><button class="destructive" type="button" disabled={deletingResource || loadingEditor || savingEditor || loadingYaml || savingYaml} on:click={() => requestBulkResourceDeletion(selectedResource!)}>Delete {selectedResourceObjects.length}</button><button class="resource-bulk-clear" type="button" disabled={deletingResource} on:click={clearResourceObjectSelection}>Clear</button></div>{/if}
                   {#if loadingObjects}<div class="drawer-state"><i></i>Listing {selectedResource.plural}…</div>{:else if resourceObjects.length === 0}<div class="resource-object-empty"><span>○</span><strong>No {selectedResource.plural} found</strong><p>Try another namespace or use Refresh in the top bar.</p></div>{:else}<div class="object-list">{#each resourceObjects as object}<div class:resource-object-row-selected={isResourceObjectSelected(object)} class="resource-object-row">{#if selectedResourcePermissionSet.canDelete}<label class="resource-object-select"><input type="checkbox" checked={isResourceObjectSelected(object)} disabled={deletingResource} aria-label={`Select ${selectedResource.kind} ${object.name}`} on:change={() => toggleResourceObjectSelection(object)} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}<button type="button" disabled={!selectedResourceCanOpen} aria-busy={selectedResource.kind === 'Pod' && isOpeningLogs('Pod', object)} class:object-selected={editorObject?.name === object.name && editorObject?.namespace === object.namespace} on:click={() => openObject(selectedResource!, object)}><div class="resource-object-primary"><strong>{object.name}</strong></div><span class="resource-object-namespace">{object.namespace || 'cluster scoped'}</span><small class="resource-object-age">{object.createdAt ? resourceAge(object.createdAt) : '—'}</small><span class="resource-object-action">{selectedResourceCanOpen ? (selectedResource.kind === 'Pod' ? (isOpeningLogs('Pod', object) ? 'Opening…' : 'Logs →') : 'Open →') : ''}</span></button></div>{/each}</div>{/if}
@@ -4732,6 +4962,7 @@
               </div>
             </aside>
             </div>
+            {/if}
           {/if}
         </section>
       {:else if activeView === 'Workloads'}
@@ -4739,6 +4970,9 @@
           <section class="empty-view"><div class="explore-orbit"><i></i><i></i><b>▦</b></div><h2>Select a cluster first</h2><p>Workload inventory is loaded only for the cluster and namespace you choose.</p></section>
         {:else}
           <section class="workloads-page font-sans">
+            {#if workloadResources.length > 1}
+              <nav class="kind-tabs" aria-label="Workload types">{#each workloadResources as resource}<button type="button" aria-pressed={workloadResource !== null && resourceKey(workloadResource) === resourceKey(resource)} class:kind-tab-active={workloadResource !== null && resourceKey(workloadResource) === resourceKey(resource)} on:click={() => selectWorkloadResource(resource)}>{kindLabel(resource)}</button>{/each}</nav>
+            {/if}
             <div class:workload-detail-open={(editorResource?.category === 'Workloads' && editorObject !== null) || (workloadDetailMode === 'logs' && logTarget !== null)} class:workload-logs-open={workloadDetailMode === 'logs' && logTarget !== null} class="workload-grid grid min-h-[560px]">
               <div class="workload-list-panel overflow-hidden rounded-2xl border border-white/10 bg-[#151924]/90 shadow-2xl shadow-black/10"><div class="workload-list-header flex items-center justify-between gap-4 border-b border-white/10 px-5 py-4"><div><div class="flex items-center gap-2"><Container size={18} class="text-cyan-300" /><h3 class="m-0 text-lg font-semibold text-white">{workloadResource?.kind || 'Select a type'}</h3></div><p class="mb-0 mt-1 text-xs text-slate-400">{namespace} · {workloadResource?.apiVersion || 'Kubernetes API'}{#if workloadResource?.kind === 'Pod'} · CPU/memory from Metrics API{/if}</p></div><span class:live-status-loading={liveDataStatus === 'loading'} class:live-status-loaded={liveDataStatus === 'loaded'} class:live-status-stale={liveDataStatus === 'stale'} class:live-status-paused={liveDataStatus === 'paused'} class:live-status-unavailable={liveDataStatus === 'unavailable'} class="live-list-status" title={liveDataStatusTooltip} aria-label={liveDataStatusTooltip} aria-live="polite"><i></i>{liveDataStatusText}</span><label class="flex h-10 w-72 items-center gap-2 rounded-lg border border-white/10 bg-black/20 px-3 text-slate-500 focus-within:border-indigo-400 focus-within:bg-black/30 focus-within:ring-2 focus-within:ring-indigo-500/20"><Search size={16} /><input class="min-w-0 flex-1 border-0 bg-transparent text-sm text-slate-100 outline-none placeholder:text-slate-500" bind:value={workloadSearch} placeholder={`Filter ${workloadResource?.plural || 'workloads'}`} /></label></div>
                 {#if loadingWorkloads}
@@ -4847,10 +5081,11 @@
       {/if}
     </div>
     {#if cliOpen}
-      <section class="cli-drawer" aria-label="Cluster terminal">
-        <header><div><Terminal size={15} /><strong>Terminal</strong><span>{activeCluster} · {namespace === 'all namespaces' ? 'all namespaces' : namespace}</span></div><button type="button" aria-label="Close terminal" on:click={() => (cliOpen = false)}>×</button></header>
-        <pre bind:this={cliViewport} class="cli-drawer-output" aria-live="polite">{cliOutput}</pre>
-        <form class="cli-drawer-command" on:submit|preventDefault={runClusterCli}><span>$</span><textarea id="cluster-cli-input" bind:value={cliCommand} use:autoSizeCliTextarea={cliCommand} rows="1" aria-label="Cluster terminal command" placeholder="kubectl get pods" spellcheck="false" on:keydown={handleClusterCliKeydown}></textarea><button type="submit" disabled={runningCli} aria-label="Run command" title="Run · Shift+Enter adds a line">{runningCli ? '…' : '↵'}</button></form>
+      <section class:cli-drawer-expanded={cliExpanded} class="cli-drawer" aria-label="Cluster terminal">
+        <header><div><Terminal size={15} /><strong>Terminal</strong><span>{activeCluster} · {namespace === 'all namespaces' ? 'kubeconfig default namespace' : namespace}</span>{#if runningCli}<em class="cli-running-badge">running</em>{/if}</div><div class="cli-drawer-actions"><button type="button" aria-label="Copy output" title="Copy output" disabled={!cliLines.length} on:click={copyClusterCliOutput}><Copy size={13} /></button><button type="button" aria-label="Clear output" title="Clear output · Ctrl+L" disabled={!cliLines.length} on:click={clearClusterCli}>⌫</button><button type="button" aria-label={cliExpanded ? 'Shrink terminal' : 'Expand terminal'} title={cliExpanded ? 'Shrink' : 'Expand'} on:click={() => (cliExpanded = !cliExpanded)}>{cliExpanded ? '▾' : '▴'}</button><button type="button" aria-label="Close terminal" title="Close" on:click={() => (cliOpen = false)}>×</button></div></header>
+        <pre bind:this={cliViewport} class="cli-drawer-output" aria-live="polite">{#if cliLines.length}{#each cliLines as line}<span class="cli-line cli-line-{line.stream}">{line.text}{'\n'}</span>{/each}{:else}<span class="cli-line cli-line-meta">Commands run against {activeCluster}{namespace === 'all namespaces' ? '' : ` in ${namespace}`}. kubectl and helm get the context automatically; add -n or -A to change namespace.{'\n'}↑/↓ history · Ctrl+C stop · Ctrl+L clear · Shift+Enter new line</span>{/if}</pre>
+        {#if !cliLines.length}<div class="cli-starters" aria-label="Suggested commands">{#each cliStarterCommands as starter}<button type="button" on:click={() => runClusterCli(starter)}>{starter}</button>{/each}</div>{/if}
+        <form class="cli-drawer-command" on:submit|preventDefault={() => runClusterCli()}><span>$</span><textarea id="cluster-cli-input" bind:this={cliInput} bind:value={cliCommand} use:autoSizeCliTextarea={cliCommand} rows="1" aria-label="Cluster terminal command" placeholder={runningCli ? 'Running… Ctrl+C to stop' : 'kubectl get pods'} spellcheck="false" autocapitalize="off" autocomplete="off" on:keydown={handleClusterCliKeydown}></textarea>{#if runningCli}<button type="button" class="cli-stop" aria-label="Stop command" title="Stop · Ctrl+C" on:click={cancelClusterCli}>■</button>{:else}<button type="submit" aria-label="Run command" title="Run · Shift+Enter adds a line">↵</button>{/if}</form>
       </section>
     {/if}
     <footer class="workspace-statusbar"><button class:workspace-cli-active={cliOpen} type="button" disabled={!activeClusterId} title={activeClusterId ? `Open terminal for ${activeCluster}` : 'Select a cluster first'} on:click={toggleClusterCli}><Terminal size={14} /><span>CLI</span></button>{#if activeClusterId}<small>{activeCluster} · {namespace === 'all namespaces' ? 'all namespaces' : namespace}</small>{/if}<div class="workspace-zoom-controls" role="group" aria-label="Interface size"><button type="button" disabled={uiScale <= 0.8} aria-label="Decrease interface size" title="Decrease interface size" on:click={() => adjustUiScale(-0.05)}>−</button><output aria-live="polite">{Math.round(uiScale * 100)}%</output><button type="button" disabled={uiScale >= 1.25} aria-label="Increase interface size" title="Increase interface size" on:click={() => adjustUiScale(0.05)}>+</button></div></footer>
