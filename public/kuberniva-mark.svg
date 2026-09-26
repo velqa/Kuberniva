@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="100 100 824 824" width="824" height="824">
+  <title>Kuberniva</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#34332f"/>
+      <stop offset="1" stop-color="#1c1b1a"/>
+    </linearGradient>
+    <linearGradient id="ivory" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#fcfbf7"/>
+      <stop offset="1" stop-color="#e4dfd2"/>
+    </linearGradient>
+    <linearGradient id="clay" x1="1" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ec9772"/>
+      <stop offset="1" stop-color="#c25738"/>
+    </linearGradient>
+    <linearGradient id="sand" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f3c3a3"/>
+      <stop offset="1" stop-color="#df9a74"/>
+    </linearGradient>
+    <linearGradient id="fold" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#000" stop-opacity=".30"/>
+      <stop offset="1" stop-color="#000" stop-opacity="0"/>
+    </linearGradient>
+    <clipPath id="lower-arm"><polygon points="412,500 552,500 712,724 572,724"/></clipPath>
+  </defs>
+  <!-- In-app mark: the icon tile without the Dock margin and shadow -->
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#bg)"/>
+  <rect x="101.5" y="101.5" width="821" height="821" rx="184.5" fill="none" stroke="#fff" stroke-opacity=".07" stroke-width="3"/>
+  <g stroke-linejoin="round" stroke-width="16">
+    <!-- Lower arm (light clay) -->
+    <polygon points="412,500 552,500 712,724 572,724" fill="url(#sand)" stroke="url(#sand)"/>
+    <!-- Fold shadow cast by the upper arm onto the lower arm -->
+    <polygon points="400,500 600,500 660,600 400,600" fill="url(#fold)" stroke="none" clip-path="url(#lower-arm)"/>
+    <!-- Upper arm (terracotta) -->
+    <polygon points="562,300 702,300 552,520 412,520" fill="url(#clay)" stroke="url(#clay)"/>
+    <!-- Stem (ivory) -->
+    <polygon points="312,300 432,300 432,724 312,724" fill="url(#ivory)" stroke="url(#ivory)"/>
+  </g>
+</svg>

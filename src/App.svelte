@@ -4365,7 +4365,7 @@
 <main class:sidebar-collapsed={sidebarHidden} class:theme-dark={theme === 'dark'} style:--sidebar-width={`${sidebarHidden ? 0 : sidebarWidth}px`} style:--navigator-width={`${resourceNavigatorWidth}px`} style:--resource-object-width={`${resourceObjectPaneWidth}px`}>
   <aside class:sidebar-hidden={sidebarHidden} class:sidebar-flyout-open={sidebarWorkloadMenuOpen || sidebarResourceMenuOpen} class="sidebar" style:width={`${sidebarWidth}px`} style:flex-basis={`${sidebarWidth}px`}>
     <div class="brand">
-      <img class="brand-mark" src="/kuberniva-mark.png" alt="" />
+      <img class="brand-mark" src="/kuberniva-mark.svg" alt="" />
       <span class="brand-wordmark"><strong>Kube</strong><span>rniva</span></span>
     </div>
 
@@ -4602,7 +4602,7 @@
         {:else if clusterOverview}
           <section class="cluster-overview-dashboard">
           <section class="cluster-hero">
-            <div class="cluster-hero-mark"><img class="brand-mark" src="/kuberniva-mark.png" alt="" /></div>
+            <div class="cluster-hero-mark"><img class="brand-mark" src="/kuberniva-mark.svg" alt="" /></div>
             <div class="cluster-hero-copy"><p class="eyebrow">Cluster overview</p><h2>{activeCluster}</h2></div>
             <div class="overview-summary"><div><strong>{clusterOverview.nodes.length}</strong><span>Nodes</span></div><div><strong>{readyNodeCount}</strong><span>Ready</span></div><div><strong>{clusterOverview.metricsAvailable ? `${clusterOverview.totals.metricNodes}/${clusterOverview.nodes.length}` : '—'}</strong><span>Metrics nodes</span></div></div>
           </section>
