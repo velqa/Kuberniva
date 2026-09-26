@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/velqa/Kuberniva/releases"><img src="https://img.shields.io/badge/version-0.3.19-c96442?style=flat-square" alt="Version 0.3.19"></a>
+  <a href="https://github.com/velqa/Kuberniva/releases/latest"><img src="https://img.shields.io/github/v/release/velqa/Kuberniva?style=flat-square&color=c96442&label=version" alt="Latest version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-2f855a?style=flat-square" alt="MIT license"></a>
   <img src="https://img.shields.io/badge/Svelte%205-ff3e00?style=flat-square&logo=svelte&logoColor=white" alt="Svelte 5">
   <img src="https://img.shields.io/badge/Tauri%202-24c8db?style=flat-square&logo=tauri&logoColor=white" alt="Tauri 2">
@@ -30,12 +30,14 @@ Kuberniva is an open-source, local-first Kubernetes desktop app. It opens instan
 | ⭐ **Shortcuts** | Pin up to 10 clusters, rename their shortcuts, and keep them across restarts. |
 | 📊 **Overview** | See cluster-wide CPU, memory, and node storage totals first, then select any node for its capacity, allocation, network, and live usage. |
 | 🛎️ **Events** | Browse recent Kubernetes Events with warning/normal filters and search. |
-| 🧭 **Resources** | Start from a searchable directory of every API type, grouped by Configuration, Access Control, Network, Storage, and Cluster, with your recently opened types on top. Custom APIs have their own directory, grouped by API group. |
-| 🚀 **Workloads** | Switch between Deployments, StatefulSets, DaemonSets, Jobs, CronJobs, Pods, and other workload types with one click. Compact, single-line tables show status, readiness, restarts, CPU, and memory at a glance. |
+| 🧭 **Resources** | Browse API types Lens-style: Resources and Custom APIs expand into trees right in the sidebar, grouped by Configuration, Access Control, Network, Storage, and Cluster. Or start from a searchable directory with your recently opened types on top. Tables use the full width until you open an object. |
+| 🚀 **Workloads** | Switch between Deployments, StatefulSets, DaemonSets, Jobs, CronJobs, Pods, and other workload types from the tabs on top. Compact, single-line tables show status, readiness, restarts, CPU, and memory at a glance. |
+| 🔎 **Details** | Open any workload for a compact Logs / Shell / YAML / Delete toolbar, an ordered Properties list, diagnostics, containers, and configuration. Empty sections stay hidden. |
 | 📝 **Editors** | Edit ConfigMaps and Secrets as key/value data, reveal Secret values on demand, edit YAML, and view certificate expiry. |
 | 📜 **Logs & exec** | Switch between sibling Pods' logs, pick containers, search, copy, or download output, and open a shell in any container. |
 | ⌨️ **CLI** | A built-in terminal bound to the active cluster and namespace, with live streaming output. See the CLI section below. |
-| 🎨 **Workspace** | Warm ivory light theme and charcoal dark theme, a collapsible sidebar, adjustable interface size, and persistent cluster context. |
+| 🎨 **Workspace** | Warm ivory light theme and neutral charcoal dark theme, a collapsible sidebar, adjustable interface size, and persistent cluster context. |
+| 🔄 **Updates** | **Settings → Check for updates** downloads signed updates in the background and applies them on restart. Kuberniva also checks quietly at launch. |
 
 ## ⌨️ CLI
 
@@ -63,6 +65,12 @@ xattr -cr /Applications/Kuberniva.app
 </details>
 
 Each user adds their own kubeconfig sources after installation.
+
+### Updating
+
+From 0.3.20 on, open **Settings → Check for updates**, then choose **Download and install** and **Restart now**. Kuberniva also checks at launch and marks **Settings** with a dot when an update is waiting. Every update is signed, and Kuberniva verifies the signature before installing it.
+
+Versions 0.3.19 and earlier have no updater; install the latest `.dmg` once by hand.
 
 ## 🏗️ Architecture
 
@@ -111,6 +119,17 @@ npm run tauri build -- --bundles app,dmg
 
 Output lands in `src-tauri/target/release/bundle/` (`macos/Kuberniva.app` and `dmg/`). Developer ID signing and notarization are required for a public distribution that opens without the first-launch step.
 
+### Releasing an update
+
+1. Bump the version in `package.json`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml`, then commit.
+2. Build and publish:
+
+~~~bash
+scripts/release.sh --publish notes.md
+~~~
+
+The script builds the DMG, a signed update archive, and `latest.json` into `release/v<version>/`, then creates the GitHub release that installed copies check. Run it without `--publish` to build only. Signing uses the private key at `~/.tauri/kuberniva-updater.key` (override with `KUBERNIVA_UPDATER_KEY`). Keep a backup of that key: without it, installed copies cannot accept new updates.
+
 ## 🧪 Checks
 
 ~~~bash
@@ -126,6 +145,7 @@ public/                    # In-app logo and static assets
 src/App.svelte             # Main Svelte workspace
 src/app.css                # UI and responsive design system
 src-tauri/src/lib.rs       # Rust/Tauri and Kubernetes integration
+scripts/release.sh         # Build and publish a signed release
 src-tauri/icons/           # Native app icons (generated)
 src-tauri/icons/source/    # Editable master logo (SVG)
 docs/brand/                # README logo and social preview image
