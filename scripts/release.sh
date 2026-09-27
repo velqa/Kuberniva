@@ -3,7 +3,8 @@
 # to GitHub so installed copies find it through "Check for updates".
 #
 #   scripts/release.sh                     # build into release/v<version>/
-#   scripts/release.sh --publish notes.md  # build, then publish a GitHub release
+#   scripts/release.sh --publish notes.md  # build, publish a GitHub release, and update
+#                                          # the Homebrew cask in velqa/homebrew-tap
 #
 # The version comes from src-tauri/tauri.conf.json; bump it there (and in
 # package.json and src-tauri/Cargo.toml) before releasing.
@@ -15,6 +16,7 @@
 set -euo pipefail
 
 REPO="velqa/Kuberniva"
+TAP_REPO="velqa/homebrew-tap"
 KEY_PATH="${KUBERNIVA_UPDATER_KEY:-$HOME/.tauri/kuberniva-updater.key}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -123,4 +125,18 @@ if $publish; then
     --title "Kuberniva $version" \
     "${notes_args[@]}" \
     --latest
+
+  # Point the Homebrew cask at the new DMG so `brew upgrade` and new installs get it.
+  dmg_sha256="$(shasum -a 256 "$out/$dmg" | cut -d' ' -f1)"
+  tap_dir="$(mktemp -d)"
+  trap 'rm -rf "$tap_dir"' EXIT
+  gh repo clone "$TAP_REPO" "$tap_dir" -- --quiet
+  cask="$tap_dir/Casks/kuberniva.rb"
+  sed -i '' -E \
+    -e "s/^  version \".*\"/  version \"$version\"/" \
+    -e "s/^  sha256 \".*\"/  sha256 \"$dmg_sha256\"/" \
+    "$cask"
+  git -C "$tap_dir" commit --quiet --all --message "Update kuberniva to $version"
+  git -C "$tap_dir" push --quiet origin HEAD
+  echo "Updated $TAP_REPO: kuberniva $version"
 fi

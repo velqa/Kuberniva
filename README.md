@@ -51,7 +51,13 @@ Open the terminal from **CLI** in the status bar. `kubectl` and `helm` automatic
 
 ## 📦 Install
 
-Download the latest `.dmg` from [Releases](https://github.com/velqa/Kuberniva/releases), open it, and drag **Kuberniva** into **Applications**. Builds target Apple Silicon Macs.
+With [Homebrew](https://brew.sh):
+
+~~~bash
+brew install --cask velqa/tap/kuberniva
+~~~
+
+Or download the latest `.dmg` from [Releases](https://github.com/velqa/Kuberniva/releases), open it, and drag **Kuberniva** into **Applications**. Builds target Apple Silicon Macs.
 
 From 0.4.1, Kuberniva is signed with an Apple Developer ID and notarized by Apple, so it opens without security warnings.
 
@@ -126,7 +132,7 @@ Output lands in `src-tauri/target/release/bundle/` (`macos/Kuberniva.app` and `d
 scripts/release.sh --publish notes.md
 ~~~
 
-The script builds the DMG, a signed update archive, and `latest.json` into `release/v<version>/`, then creates the GitHub release that installed copies check. Run it without `--publish` to build only. Signing uses the private key at `~/.tauri/kuberniva-updater.key` (override with `KUBERNIVA_UPDATER_KEY`). Keep a backup of that key: without it, installed copies cannot accept new updates.
+The script builds the DMG, a signed update archive, and `latest.json` into `release/v<version>/`, then creates the GitHub release that installed copies check and updates the Homebrew cask in [velqa/homebrew-tap](https://github.com/velqa/homebrew-tap). Run it without `--publish` to build only. Signing uses the private key at `~/.tauri/kuberniva-updater.key` (override with `KUBERNIVA_UPDATER_KEY`). Keep a backup of that key: without it, installed copies cannot accept new updates.
 
 **Apple signing and notarization.** When `~/.config/kuberniva/release.env` exists, the script signs the app and DMG with your Developer ID, notarizes both with Apple, staples the approvals, and checks them with Gatekeeper. It needs:
 
