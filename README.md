@@ -57,7 +57,7 @@ With [Homebrew](https://brew.sh):
 brew install --cask velqa/tap/kuberniva
 ~~~
 
-Or download the latest `.dmg` from [Releases](https://github.com/velqa/Kuberniva/releases), open it, and drag **Kuberniva** into **Applications**. Builds target Apple Silicon Macs.
+Or download the latest `.dmg` from [Releases](https://github.com/velqa/Kuberniva/releases), open it, and drag **Kuberniva** into **Applications**. Kuberniva runs natively on both Apple Silicon and Intel Macs.
 
 From 0.4.1, Kuberniva is signed with an Apple Developer ID and notarized by Apple, so it opens without security warnings.
 
@@ -115,7 +115,7 @@ Live Kubernetes connections, OIDC execution, logs, and the CLI require the Tauri
 
 ## 🔨 Build
 
-Build the Apple Silicon app and disk image:
+Build the app and disk image for this Mac's architecture:
 
 ~~~bash
 npm run tauri build -- --bundles app,dmg

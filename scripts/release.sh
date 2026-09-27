@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds a signed Kuberniva release for Apple Silicon and, with --publish, uploads it
+# Builds a signed, universal (Apple Silicon + Intel) Kuberniva release and, with --publish, uploads it
 # to GitHub so installed copies find it through "Check for updates".
 #
 #   scripts/release.sh                     # build into release/v<version>/
@@ -61,23 +61,33 @@ fi
 version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
 tag="v$version"
 out="release/$tag"
-bundle="src-tauri/target/release/bundle"
+target="universal-apple-darwin"
+bundle="src-tauri/target/$target/release/bundle"
 
 if $apple_signed; then
   echo "Building Kuberniva $version, signed and notarized as: $APPLE_SIGNING_IDENTITY"
 else
   echo "Building Kuberniva $version with ad-hoc signing (no Apple Developer ID settings found)"
 fi
-# Pass the key's path, not its contents, so the key never appears in the process list.
-TAURI_SIGNING_PRIVATE_KEY_PATH="$KEY_PATH" \
+# The build reads the key's contents from the environment. Run the Tauri CLI directly
+# rather than through npx: npm rewrites its process title, which on macOS can expose
+# environment variables in the process list.
+TAURI_SIGNING_PRIVATE_KEY="$(cat "$KEY_PATH")" \
 TAURI_SIGNING_PRIVATE_KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" \
-  npx tauri build --bundles app,dmg
+  ./node_modules/.bin/tauri build --target "$target" --bundles app,dmg
+
+# One app runs natively on both Mac architectures; refuse to ship if either is missing.
+archs="$(lipo -archs "$bundle/macos/Kuberniva.app/Contents/MacOS/kuberniva")"
+if [[ "$archs" != *arm64* || "$archs" != *x86_64* ]]; then
+  echo "Expected a universal app (arm64 + x86_64) but found: $archs" >&2
+  exit 1
+fi
 
 rm -rf "$out"
 mkdir -p "$out"
-dmg="Kuberniva_${version}_aarch64.dmg"
-archive="Kuberniva_${version}_aarch64.app.tar.gz"
-cp "$bundle/dmg/Kuberniva_${version}_aarch64.dmg" "$out/$dmg"
+dmg="Kuberniva_${version}_universal.dmg"
+archive="Kuberniva_${version}_universal.app.tar.gz"
+cp "$bundle/dmg/$dmg" "$out/$dmg"
 cp "$bundle/macos/Kuberniva.app.tar.gz" "$out/$archive"
 cp "$bundle/macos/Kuberniva.app.tar.gz.sig" "$out/$archive.sig"
 
@@ -99,16 +109,13 @@ if [[ -n "$notes_file" ]]; then notes="$(cat "$notes_file")"; fi
 NOTES="$notes" VERSION="$version" TAG="$tag" ARCHIVE="$archive" REPO="$REPO" \
 SIGNATURE="$(cat "$out/$archive.sig")" node -e '
   const { NOTES, VERSION, TAG, ARCHIVE, REPO, SIGNATURE } = process.env;
+  // The universal archive serves both Apple Silicon and Intel installs.
+  const update = { signature: SIGNATURE, url: `https://github.com/${REPO}/releases/download/${TAG}/${ARCHIVE}` };
   const manifest = {
     version: VERSION,
     notes: NOTES,
     pub_date: new Date().toISOString(),
-    platforms: {
-      "darwin-aarch64": {
-        signature: SIGNATURE,
-        url: `https://github.com/${REPO}/releases/download/${TAG}/${ARCHIVE}`,
-      },
-    },
+    platforms: { "darwin-aarch64": update, "darwin-x86_64": update },
   };
   require("fs").writeFileSync(process.argv[1], JSON.stringify(manifest, null, 2) + "\n");
 ' "$out/latest.json"
@@ -135,6 +142,8 @@ if $publish; then
   sed -i '' -E \
     -e "s/^  version \".*\"/  version \"$version\"/" \
     -e "s/^  sha256 \".*\"/  sha256 \"$dmg_sha256\"/" \
+    -e 's/_aarch64\.dmg"/_universal.dmg"/' \
+    -e '/^  depends_on arch: :arm64$/d' \
     "$cask"
   git -C "$tap_dir" commit --quiet --all --message "Update kuberniva to $version"
   git -C "$tap_dir" push --quiet origin HEAD
