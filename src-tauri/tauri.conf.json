@@ -43,7 +43,12 @@
     "createUpdaterArtifacts": true,
     "macOS": {
       "signingIdentity": "-"
-    }
+    },
+    "publisher": "Vijay Kumar Sevakula",
+    "copyright": "Copyright \u00a9 2026 Vijay Kumar Sevakula. Released under the MIT License.",
+    "category": "DeveloperTool",
+    "shortDescription": "Native desktop workspace for Kubernetes clusters",
+    "licenseFile": "../LICENSE"
   },
   "plugins": {
     "updater": {

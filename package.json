@@ -2,6 +2,17 @@
   "name": "kuberniva",
   "private": true,
   "version": "0.4.1",
+  "description": "A fast, native desktop workspace for people who operate many Kubernetes clusters.",
+  "license": "MIT",
+  "author": "Vijay Kumar Sevakula",
+  "homepage": "https://github.com/velqa/Kuberniva",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/velqa/Kuberniva.git"
+  },
+  "bugs": {
+    "url": "https://github.com/velqa/Kuberniva/issues"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",
