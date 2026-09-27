@@ -53,14 +53,12 @@ Open the terminal from **CLI** in the status bar. `kubectl` and `helm` automatic
 
 Download the latest `.dmg` from [Releases](https://github.com/velqa/Kuberniva/releases), open it, and drag **Kuberniva** into **Applications**. Builds target Apple Silicon Macs.
 
+From 0.4.1, Kuberniva is signed with an Apple Developer ID and notarized by Apple, so it opens without security warnings.
+
 <details>
-<summary>macOS blocks the first launch?</summary>
+<summary>macOS blocks an older version?</summary>
 
-Current builds are not yet notarized by Apple. Open the app once, then go to **System Settings → Privacy & Security** and choose **Open Anyway**. Alternatively:
-
-~~~bash
-xattr -cr /Applications/Kuberniva.app
-~~~
+Versions 0.4.0 and earlier are not notarized. Open the app once, then go to **System Settings → Privacy & Security** and choose **Open Anyway**, or install the latest release instead.
 
 </details>
 
@@ -117,7 +115,7 @@ Build the Apple Silicon app and disk image:
 npm run tauri build -- --bundles app,dmg
 ~~~
 
-Output lands in `src-tauri/target/release/bundle/` (`macos/Kuberniva.app` and `dmg/`). Developer ID signing and notarization are required for a public distribution that opens without the first-launch step.
+Output lands in `src-tauri/target/release/bundle/` (`macos/Kuberniva.app` and `dmg/`). Local builds are ad-hoc signed; releases are signed and notarized as described below.
 
 ### Releasing an update
 
@@ -129,6 +127,18 @@ scripts/release.sh --publish notes.md
 ~~~
 
 The script builds the DMG, a signed update archive, and `latest.json` into `release/v<version>/`, then creates the GitHub release that installed copies check. Run it without `--publish` to build only. Signing uses the private key at `~/.tauri/kuberniva-updater.key` (override with `KUBERNIVA_UPDATER_KEY`). Keep a backup of that key: without it, installed copies cannot accept new updates.
+
+**Apple signing and notarization.** When `~/.config/kuberniva/release.env` exists, the script signs the app and DMG with your Developer ID, notarizes both with Apple, staples the approvals, and checks them with Gatekeeper. It needs:
+
+~~~bash
+APPLE_SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)"
+APPLE_API_KEY="<App Store Connect API key ID>"
+APPLE_API_ISSUER="<App Store Connect issuer ID>"
+APPLE_API_KEY_PATH="$HOME/.appstoreconnect/private_keys/AuthKey_<KEYID>.p8"
+NOTARY_PROFILE="kuberniva-notary"   # from: xcrun notarytool store-credentials
+~~~
+
+Without that file, releases are ad-hoc signed and need the first-launch override. Keep your Mac unlocked while a release runs; notarization reads the keychain.
 
 ## 🧪 Checks
 
