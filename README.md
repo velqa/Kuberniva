@@ -76,6 +76,28 @@ From 0.3.20 on, open **Settings → Check for updates**, then choose **Download 
 
 Versions 0.3.19 and earlier have no updater; install the latest `.dmg` once by hand.
 
+If you installed with Homebrew, the in-app updater works the same way. Kuberniva updates itself, so a plain `brew upgrade` skips it; to upgrade through Homebrew instead:
+
+~~~bash
+brew upgrade --cask --greedy kuberniva
+~~~
+
+### Uninstalling
+
+Installed with Homebrew:
+
+~~~bash
+brew uninstall --cask kuberniva
+~~~
+
+This removes the app and keeps your clusters and settings. To also delete Kuberniva's caches, logs, and saved workspace data:
+
+~~~bash
+brew uninstall --cask --zap kuberniva
+~~~
+
+Installed from the `.dmg`: quit Kuberniva and move **Kuberniva** from **Applications** to the Trash.
+
 ## 🏗️ Architecture
 
 Kuberniva has two small layers:
