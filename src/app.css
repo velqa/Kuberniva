@@ -7594,3 +7594,5 @@ main .directory-index-group li button:hover { color: var(--ui-ink); background: 
 .directory-index-group li button i { color: var(--ui-muted); font-size: 10.5px; font-style: normal; }
 /* Custom API groups are domains: keep their natural lowercase. */
 .directory-index-domain h3 { font-family: "DM Mono", monospace; font-size: 11.5px; letter-spacing: 0; text-transform: none; }
+/* The page is a fixed-height workspace: the tile grid is what scrolls. */
+.clusters-landing .cluster-tiles { flex: 1; min-height: 0; overflow-y: auto; align-content: start; grid-auto-rows: max-content; padding: 4px 4px 24px 0; }

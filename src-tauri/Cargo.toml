@@ -1,6 +1,6 @@
 [package]
 name = "kuberniva"
-version = "0.4.3"
+version = "0.4.4"
 description = "A focused Kubernetes control surface"
 authors = ["Vijay Kumar Sevakula"]
 license = "MIT"
