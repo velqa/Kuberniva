@@ -7291,17 +7291,6 @@ html[data-theme="dark"] body { background: #262624; }
 .resource-directory-search { width: min(340px, 42%); height: 38px; display: flex; align-items: center; gap: 8px; padding: 0 12px; border: 1px solid var(--ui-border); border-radius: 10px; color: var(--ui-muted); background: var(--ui-surface); }
 .resource-directory-search:focus-within { border-color: var(--ui-accent); box-shadow: 0 0 0 3px var(--ui-accent-soft); }
 .resource-directory-search input { min-width: 0; flex: 1; border: 0; outline: 0; color: var(--ui-ink); background: transparent; font-size: 13px; }
-.resource-directory-section { margin-top: 18px; }
-.resource-directory-section h3 { display: flex; align-items: center; gap: 8px; margin: 0 0 9px; color: var(--ui-copy); font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
-.resource-directory-section h3 b { padding: 1px 7px; border-radius: 999px; color: var(--ui-muted); background: var(--ui-surface-strong); font-size: 10px; letter-spacing: 0; }
-.resource-directory-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 8px; }
-.resource-directory .resource-directory-card { min-width: 0; display: grid; gap: 3px; padding: 12px 13px; border: 1px solid var(--ui-border); border-radius: 11px; color: var(--ui-ink); background: var(--ui-surface); text-align: left; transition: border-color .12s ease, background .12s ease, transform .12s ease; }
-.resource-directory .resource-directory-card:hover { border-color: var(--ui-accent); background: var(--ui-surface-muted); transform: translateY(-1px); }
-.resource-directory .resource-directory-card:focus-visible { outline: 2px solid var(--ui-accent); outline-offset: 2px; }
-.resource-directory-card strong { overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
-.resource-directory-card small { overflow: hidden; color: var(--ui-muted); font-family: "DM Mono", monospace; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
-.resource-directory-card span { justify-self: start; margin-top: 4px; padding: 1px 7px; border-radius: 999px; color: var(--ui-copy); background: var(--ui-surface-strong); font-size: 10px; font-weight: 600; }
-.resource-directory .resource-directory-card-recent { border-color: color-mix(in srgb, var(--ui-accent) 35%, var(--ui-border)); }
 .resource-directory-back { width: 30px; height: 30px; flex: 0 0 30px; display: grid; place-items: center; border: 1px solid var(--ui-border); border-radius: 8px; color: var(--ui-copy); background: var(--ui-surface); font-size: 15px; }
 .resource-directory-back:hover { color: var(--ui-accent); border-color: var(--ui-accent); }
 
@@ -7337,7 +7326,7 @@ html[data-theme="dark"] body { background: #262624; }
 /* Density pass: lists read like a table (one line per object, ~34px rows)
    so far more objects fit on screen, similar to Lens and k9s. */
 main .workloads-page .workload-object-list { gap: 0 !important; padding: 0 !important; }
-main .workloads-page .workload-selection-row { margin: 0 !important; border-bottom: 1px solid var(--ui-border); }
+main .workloads-page .workload-selection-row { margin: 0 !important; }
 main .workloads-page .workload-selection-row > .resource-object-select { border-radius: 0 !important; }
 main .workloads-page .workload-object-row,
 main.theme-dark .workloads-page .workload-object-row { min-height: 34px !important; padding: 0 10px !important; gap: 10px !important; border-radius: 0 !important; box-shadow: none !important; }
@@ -7509,3 +7498,99 @@ main .favorite-context-menu button { width: 100%; display: block; padding: 7px 9
 main .favorite-context-menu button:hover { background: var(--ui-surface-strong) !important; }
 main .favorite-context-menu button:last-child { color: #c2413a !important; }
 main.theme-dark .favorite-context-menu button:last-child { color: #f08a80 !important; }
+
+/* Cluster manager: identifiable tiles instead of rows. */
+.cluster-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 14px; padding: 4px 0 24px; }
+.cluster-tile { position: relative; display: flex; flex-direction: column; min-width: 0; border: 1px solid var(--ui-border); border-radius: 14px; background: var(--ui-surface); transition: border-color .14s ease, box-shadow .14s ease, transform .14s ease; }
+.cluster-tile:hover { border-color: hsl(var(--tile-hue) 45% 55% / .7); box-shadow: 0 10px 26px rgba(0, 0, 0, .08); transform: translateY(-1px); }
+.cluster-tile.cluster-tile-active { border-color: var(--ui-accent); box-shadow: 0 0 0 1px var(--ui-accent); }
+main .cluster-tile-open { min-width: 0; display: flex; flex-direction: column; gap: 4px; padding: 16px 16px 12px; border-radius: 14px 14px 0 0; color: var(--ui-ink); background: transparent; text-align: left; }
+.cluster-tile-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.cluster-tile-monogram { width: 42px; height: 42px; display: grid; place-items: center; flex: 0 0 42px; border-radius: 11px; color: hsl(var(--tile-hue) 45% 28%); background: hsl(var(--tile-hue) 55% 90%); font-size: 15px; font-weight: 700; letter-spacing: .02em; }
+main.theme-dark .cluster-tile-monogram { color: hsl(var(--tile-hue) 60% 82%); background: hsl(var(--tile-hue) 25% 26%); }
+.cluster-tile-badges { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px; }
+.cluster-tile-badges b { padding: 2px 8px; border-radius: 999px; font-size: 10.5px; font-weight: 650; }
+.cluster-tile-current { color: #fff; background: var(--ui-accent); }
+.cluster-tile-env-prod { color: #9b2c2c; background: #fbe4e1; }
+.cluster-tile-env-staging { color: #8a5a10; background: #f8ecd2; }
+.cluster-tile-env-test { color: #33607f; background: #e0edf6; }
+.cluster-tile-env-dev { color: #2f6b47; background: #e0f0e6; }
+main.theme-dark .cluster-tile-env-prod { color: #f4a9a0; background: rgba(214, 90, 74, .18); }
+main.theme-dark .cluster-tile-env-staging { color: #edc27a; background: rgba(214, 160, 60, .16); }
+main.theme-dark .cluster-tile-env-test { color: #9cc7e6; background: rgba(90, 150, 200, .16); }
+main.theme-dark .cluster-tile-env-dev { color: #9fd9b4; background: rgba(80, 170, 110, .16); }
+.cluster-tile-name { overflow: hidden; font-size: 16px; font-weight: 700; letter-spacing: -.2px; text-overflow: ellipsis; white-space: nowrap; }
+.cluster-tile-provider { overflow: hidden; color: var(--ui-muted); font-size: 11.5px; text-overflow: ellipsis; white-space: nowrap; }
+.cluster-tile-facts { display: grid; gap: 4px; margin-top: 10px; color: var(--ui-copy); font-size: 12px; }
+.cluster-tile-facts span { display: flex; align-items: center; gap: 7px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cluster-tile-facts .status-dot { width: 7px; height: 7px; flex: 0 0 7px; }
+.cluster-tile-cta { margin-top: 12px; color: var(--ui-accent); font-size: 12px; font-weight: 650; opacity: 0; transition: opacity .14s ease; }
+.cluster-tile:hover .cluster-tile-cta,
+.cluster-tile-open:focus-visible .cluster-tile-cta { opacity: 1; }
+.cluster-tile-actions { display: flex; align-items: center; justify-content: space-between; margin-top: auto; padding: 8px 12px 10px 16px; border-top: 1px solid var(--ui-border); }
+main .cluster-tile-actions .favorite-toggle { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 8px; color: var(--ui-muted); background: transparent; }
+main .cluster-tile-actions .favorite-toggle.favorite-toggle-active { color: #d49a1c; }
+main .cluster-tile-actions .favorite-toggle:hover { background: var(--ui-surface-strong); }
+main .cluster-tile-remove { padding: 5px 10px; border-radius: 7px; color: var(--ui-muted); background: transparent; font-size: 12px; font-weight: 600; }
+main .cluster-tile-remove:hover { color: #c2413a; background: var(--ui-surface-strong); }
+@media (prefers-reduced-motion: reduce) { .cluster-tile { transition: none; } .cluster-tile:hover { transform: none; } }
+
+/* Workload tables read as one surface: no divider lines, a soft hover highlight instead. */
+main .workloads-page .workload-selection-row,
+main .workloads-page .workload-selection-row > .workload-object-row,
+main .workloads-page .workload-selection-row > .resource-object-select { border-top: 0 !important; border-bottom: 0 !important; box-shadow: none !important; }
+main .workloads-page .workload-selection-row:hover { background: var(--ui-surface-muted); }
+main .workloads-page .workload-object-list { padding: 4px 0 !important; }
+
+/* Object tables: the name gets the room; namespace only when it varies (all namespaces). */
+main .resource-workbench .resource-object-browser .resource-object-columns { grid-template-columns: 28px minmax(0, 1fr) minmax(110px, 200px) 64px 76px !important; }
+main .resource-workbench .resource-object-browser .object-list .resource-object-row > button { grid-template-columns: minmax(0, 1fr) minmax(110px, 200px) 64px 76px !important; }
+main .resource-workbench .resource-objects-single-namespace .resource-object-columns { grid-template-columns: 28px minmax(0, 1fr) 64px 76px !important; }
+main .resource-workbench .resource-objects-single-namespace .object-list .resource-object-row > button { grid-template-columns: minmax(0, 1fr) 64px 76px !important; }
+main .resource-workbench .resource-objects-single-namespace .resource-object-columns > :nth-child(3),
+main .resource-workbench .resource-objects-single-namespace .resource-object-namespace { display: none !important; }
+main .resource-workbench .resource-object-columns > :nth-last-child(-n+2),
+main .resource-workbench .resource-object-age,
+main .resource-workbench .resource-object-action { text-align: right; justify-self: end; }
+/* Same calm rows as workloads: no divider lines. */
+main .resource-workbench .object-list .resource-object-row { border-top: 0 !important; border-bottom: 0 !important; box-shadow: none !important; }
+main .resource-workbench .object-list .resource-object-row:hover { background: var(--ui-surface-muted); }
+
+/* Dialog close controls: a clear × in the header and Cancel beside Save. */
+.config-modal-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.config-modal-heading > div { min-width: 0; }
+main .config-modal-close { width: 34px; height: 34px; flex: 0 0 34px; display: grid; place-items: center; border-radius: 9px; color: var(--ui-copy); background: var(--ui-surface-strong); font-size: 20px; line-height: 1; }
+main .config-modal-close:hover:not(:disabled) { color: var(--ui-ink); background: var(--ui-border); }
+.resource-inspector-modal .configuration-toolbar-close { display: none !important; }
+
+/* Center the dialog in the content area (right of the sidebar, between the top bar and
+   the status bar) rather than in the whole window. */
+main .resource-workbench-body-focused > .resource-inspector.resource-inspector-modal {
+  top: calc(50% + 23px);
+  left: calc(var(--sidebar-width, 0px) + (100vw - var(--sidebar-width, 0px)) / 2);
+  width: min(940px, calc(100vw - var(--sidebar-width, 0px) - 64px));
+  height: min(760px, calc(100dvh - 158px));
+}
+main .config-modal-backdrop { left: var(--sidebar-width, 0px); }
+
+/* Resource directory, calm edition: fewer boxes, plain lists, one clear focus. */
+.directory-essentials { margin-top: 6px; }
+.directory-essentials h3,
+.directory-index-group h3 { display: flex; align-items: center; gap: 8px; margin: 0 0 10px; color: var(--ui-muted); font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.directory-essentials > div { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+@media (max-width: 1000px) { .directory-essentials > div { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+main .directory-essential-card { min-width: 0; display: grid; gap: 4px; padding: 14px 16px; border: 1px solid var(--ui-border); border-radius: 12px; color: var(--ui-ink); background: var(--ui-surface); text-align: left; transition: border-color .12s ease, box-shadow .12s ease; }
+main .directory-essential-card:hover { border-color: var(--ui-accent); box-shadow: 0 6px 18px rgba(0, 0, 0, .06); }
+.directory-essential-card strong { font-size: 14px; }
+.directory-essential-card small { overflow: hidden; color: var(--ui-muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.directory-index { columns: 3 240px; column-gap: 18px; margin-top: 22px; }
+.directory-index-group { break-inside: avoid; margin: 0 0 18px; padding: 12px 8px 8px; border-radius: 12px; background: var(--ui-surface-muted); }
+.directory-index-group h3 { margin: 0 8px 6px; }
+.directory-index-group h3 b { color: var(--ui-muted); font-weight: 600; letter-spacing: 0; }
+.directory-index-group ul { margin: 0; padding: 0; list-style: none; }
+main .directory-index-group li button { width: 100%; display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 7px; color: var(--ui-copy); background: transparent; font-size: 13px; font-weight: 500; text-align: left; }
+main .directory-index-group li button:hover { color: var(--ui-ink); background: var(--ui-surface); }
+.directory-index-group li button span { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.directory-index-group li button i { color: var(--ui-muted); font-size: 10.5px; font-style: normal; }
+/* Custom API groups are domains: keep their natural lowercase. */
+.directory-index-domain h3 { font-family: "DM Mono", monospace; font-size: 11.5px; letter-spacing: 0; text-transform: none; }

@@ -328,6 +328,9 @@
   $: resourceTreeSections = buildResourceDirectory(resourceWorkspaceResources, '', false);
   $: customTreeSections = buildResourceDirectory(customApiResources, '', true);
   $: resourceDirectorySections = buildResourceDirectory(activeResourceCatalog, resourceDirectorySearch, customApiWorkspace);
+  $: directoryEssentials = recentDirectoryResources.length
+    ? recentDirectoryResources.slice(0, 6)
+    : sortResourcesForBrowsing(activeResourceCatalog).filter((resource) => commonResourceKinds.includes(resource.kind)).slice(0, 6);
   $: recentDirectoryResources = resourceDirectorySearch.trim()
     ? []
     : recentResourceKeys.map((key) => activeResourceCatalog.find((resource) => resourceKey(resource) === key)).filter((resource): resource is ResourceDescriptor => Boolean(resource)).slice(0, 6);
@@ -967,10 +970,11 @@
   async function restoreVisualQaScenario() {
     if (!import.meta.env.DEV) return false;
     const scenario = new URLSearchParams(window.location.search).get('visual-qa');
-    if (!scenario || !['overview', 'workloads', 'workloads-first-open', 'workload-details', 'pod-details', 'workload-logs', 'workload-yaml', 'resources', 'custom-apis', 'configuration', 'configuration-many', 'secret', 'permissions-readonly'].includes(scenario)) return false;
+    if (!scenario || !['overview', 'workloads', 'workloads-first-open', 'workload-details', 'pod-details', 'workload-logs', 'workload-yaml', 'resources', 'custom-apis', 'resources-directory', 'custom-directory', 'configuration', 'configuration-many', 'secret', 'permissions-readonly'].includes(scenario)) return false;
     const fixtures = await import('./dev/visual-qa-fixtures');
     const qaCluster = fixtures.visualQaCluster as Cluster;
-    const qaResources = fixtures.visualQaResources as ResourceDescriptor[];
+    const directoryScenario = scenario === 'resources-directory' || scenario === 'custom-directory';
+    const qaResources = (directoryScenario ? [...fixtures.visualQaResources, ...fixtures.visualQaLargeCatalog] : fixtures.visualQaResources) as ResourceDescriptor[];
     clusters = fixtures.visualQaFavoriteClusters as Cluster[];
     favoriteClusterIds = clusters.map((cluster) => cluster.id);
     favoriteClusterNames = { [qaCluster.id]: 'Production West' };
@@ -1062,8 +1066,8 @@
     } else {
       activeView = 'Resources';
       const selectedKind = scenario === 'secret' ? 'Secret' : scenario === 'custom-apis' ? 'TenantPolicy' : 'ConfigMap';
-      selectedResource = qaResources.find((resource) => resource.kind === selectedKind) || null;
-      selectedCategory = scenario === 'custom-apis' ? 'Custom Resources' : 'Configuration';
+      selectedResource = directoryScenario ? null : qaResources.find((resource) => resource.kind === selectedKind) || null;
+      selectedCategory = scenario === 'custom-apis' || scenario === 'custom-directory' ? 'Custom Resources' : 'Configuration';
       sidebarResourceCategory = selectedCategory;
       resourceObjects = (scenario === 'custom-apis' ? fixtures.visualQaCustomObjects : fixtures.visualQaConfigMaps) as ResourceObject[];
       loadingObjects = false;
@@ -2487,6 +2491,76 @@
 
   function kindTabLabel(resource: ResourceDescriptor) {
     return shortKindLabels[resource.kind] || kindLabel(resource);
+  }
+
+  // Cluster tiles: a stable color and monogram per cluster, plus an environment tag
+  // inferred from its name, make similar context names easy to tell apart.
+  function clusterHue(name: string) {
+    let hash = 0;
+    for (const character of name) hash = (hash * 31 + character.charCodeAt(0)) >>> 0;
+    return hash % 360;
+  }
+
+  function clusterMonogram(name: string) {
+    const words = name.split(/[^a-zA-Z0-9]+/).filter(Boolean);
+    return (words.length > 1 ? `${words[0][0]}${words[1][0]}` : (words[0] || 'K').slice(0, 2)).toUpperCase();
+  }
+
+  function clusterEnvironment(name: string): { label: string; tone: string } | null {
+    const lower = name.toLowerCase();
+    if (/(^|[^a-z])(prod|production|prd)([^a-z]|$)/.test(lower)) return { label: 'Production', tone: 'prod' };
+    if (/(^|[^a-z])(stag|staging|stg|uat|preprod)([^a-z]|$)/.test(lower)) return { label: 'Staging', tone: 'staging' };
+    if (/(^|[^a-z])(test|qa|tst)([^a-z]|$)/.test(lower)) return { label: 'Test', tone: 'test' };
+    if (/(^|[^a-z])(dev|development|sandbox|local|kind|minikube)([^a-z]|$)/.test(lower)) return { label: 'Dev', tone: 'dev' };
+    return null;
+  }
+
+  const kindDescriptions: Record<string, string> = {
+    ConfigMap: 'Non-secret configuration for workloads',
+    Secret: 'Credentials, tokens, and keys',
+    Service: 'Stable network address for Pods',
+    Ingress: 'HTTP routing into the cluster',
+    IngressClass: 'Available ingress controllers',
+    NetworkPolicy: 'Allowed traffic between Pods',
+    Endpoints: 'Backend addresses behind Services',
+    EndpointSlice: 'Scalable backend addresses for Services',
+    Gateway: 'Entry point for Gateway API traffic',
+    GatewayClass: 'Available gateway controllers',
+    HTTPRoute: 'HTTP routing rules for Gateways',
+    GRPCRoute: 'gRPC routing rules for Gateways',
+    ReferenceGrant: 'Cross-namespace references for routes',
+    PersistentVolumeClaim: 'Storage requested by workloads',
+    PersistentVolume: 'Provisioned storage volumes',
+    StorageClass: 'Kinds of storage you can request',
+    VolumeAttachment: 'Volumes attached to nodes',
+    VolumeSnapshot: 'Point-in-time volume snapshots',
+    CSIDriver: 'Installed storage drivers',
+    CSINode: 'Storage drivers on each node',
+    ServiceAccount: 'Identities used by workloads',
+    Role: 'Permissions within a namespace',
+    RoleBinding: 'Grants a Role in a namespace',
+    ClusterRole: 'Permissions across the cluster',
+    ClusterRoleBinding: 'Grants a ClusterRole cluster-wide',
+    Lease: 'Leader election and heartbeats',
+    LimitRange: 'Default and maximum resource limits',
+    ResourceQuota: 'Resource budgets per namespace',
+    PriorityClass: 'Scheduling priority for Pods',
+    RuntimeClass: 'Container runtime choices',
+    PodDisruptionBudget: 'Limits voluntary disruptions',
+    Namespace: 'Isolated groups of resources',
+    Node: 'Machines that run your workloads',
+    Event: 'Recent activity in the cluster',
+    CustomResourceDefinition: 'Custom API types installed in the cluster',
+    MutatingWebhookConfiguration: 'Admission webhooks that modify requests',
+    ValidatingWebhookConfiguration: 'Admission webhooks that validate requests',
+    APIService: 'Aggregated API servers',
+    CertificateSigningRequest: 'Certificate requests awaiting approval',
+    FlowSchema: 'API request classification',
+    PriorityLevelConfiguration: 'API request fairness levels',
+  };
+
+  function kindDescription(resource: ResourceDescriptor) {
+    return kindDescriptions[resource.kind] || resource.apiVersion;
   }
 
   function kindLabel(resource: ResourceDescriptor) {
@@ -4955,16 +5029,29 @@
         <section class="clusters-landing">
           <div class="clusters-landing-heading"><div><p class="eyebrow">Cluster manager</p><h2>{clusters.length} available cluster{clusters.length === 1 ? '' : 's'}</h2></div><button class="secondary" on:click={() => (kubeconfigOpen = true)}>+ Add kubeconfig</button></div>
           {#if clusters.length}
-            <div class="cluster-list" role="list" aria-label="Tracked clusters">
-              <div class="cluster-list-header" aria-hidden="true"><span>Cluster</span><span>Authentication</span><span>Source</span><span>Status</span><span>Favorite</span><span></span></div>
+            <div class="cluster-tiles" role="list" aria-label="Tracked clusters">
               {#each clusters as cluster}
-                <article class:cluster-list-active={cluster.id === activeClusterId} class="cluster-list-row" role="listitem">
-                  <button class="cluster-list-open" on:click={() => selectCluster(cluster.id)} title={`Open ${cluster.name}`}><span class="cluster-list-mark"><i class="status-dot {cluster.tone}"></i></span><span class="cluster-list-name"><strong>{cluster.name}</strong><small>{cluster.provider}</small></span><span class="cluster-list-arrow">Open overview →</span></button>
-                  <span class="cluster-list-auth">{cluster.authMethod || 'Credentials unavailable'}</span>
-                  <small class="cluster-list-source" title={cluster.kubeconfigPath || ''}>{cluster.kubeconfigPath || 'Source path unavailable'}</small>
-                  <span class="cluster-list-status"><i class="status-dot {cluster.tone}"></i>{cluster.status}</span>
-                  <button class:favorite-toggle-active={isFavoriteCluster(cluster.id)} class="favorite-toggle" aria-pressed={isFavoriteCluster(cluster.id)} aria-label={`${isFavoriteCluster(cluster.id) ? 'Remove' : 'Add'} ${cluster.name} ${isFavoriteCluster(cluster.id) ? 'from' : 'to'} Favorites`} title={isFavoriteCluster(cluster.id) ? 'Remove from Favorites' : 'Add to Favorites'} on:click|stopPropagation={() => toggleFavoriteCluster(cluster)}><Star size={16} fill={isFavoriteCluster(cluster.id) ? 'currentColor' : 'none'} /></button>
-                  <button class="remove-cluster-list" title={`Remove ${cluster.name} from Kuberniva only`} on:click={() => removeCluster(cluster.id)}>Remove</button>
+                {@const environment = clusterEnvironment(cluster.name)}
+                {@const favorite = isFavoriteCluster(cluster.id)}
+                <article class:cluster-tile-active={cluster.id === activeClusterId} class="cluster-tile" role="listitem" style:--tile-hue={clusterHue(cluster.name)}>
+                  <button class="cluster-tile-open" type="button" title={`Open ${cluster.name}`} on:click={() => selectCluster(cluster.id)}>
+                    <span class="cluster-tile-top">
+                      <span class="cluster-tile-monogram" aria-hidden="true">{clusterMonogram(cluster.name)}</span>
+                      <span class="cluster-tile-badges">{#if cluster.id === activeClusterId}<b class="cluster-tile-current">Current</b>{/if}{#if environment}<b class="cluster-tile-env cluster-tile-env-{environment.tone}">{environment.label}</b>{/if}</span>
+                    </span>
+                    <strong class="cluster-tile-name">{cluster.name}</strong>
+                    <small class="cluster-tile-provider" title={cluster.provider}>{cluster.provider}</small>
+                    <span class="cluster-tile-facts">
+                      <span><i class="status-dot {cluster.tone}"></i>{cluster.status}</span>
+                      <span title={cluster.authMethod || 'Credentials unavailable'}>{cluster.authMethod || 'Credentials unavailable'}</span>
+                      <span title={cluster.kubeconfigPath || 'Source path unavailable'}>{cluster.kubeconfigPath ? cluster.kubeconfigPath.split('/').pop() : 'Source unavailable'}</span>
+                    </span>
+                    <span class="cluster-tile-cta">Open overview →</span>
+                  </button>
+                  <div class="cluster-tile-actions">
+                    <button class:favorite-toggle-active={favorite} class="favorite-toggle" type="button" aria-pressed={favorite} aria-label={`${favorite ? 'Remove' : 'Add'} ${cluster.name} ${favorite ? 'from' : 'to'} Favorites`} title={favorite ? 'Remove from Favorites' : 'Add to Favorites'} on:click|stopPropagation={() => toggleFavoriteCluster(cluster)}><Star size={15} fill={favorite ? 'currentColor' : 'none'} /></button>
+                    <button class="cluster-tile-remove" type="button" title={`Remove ${cluster.name} from Kuberniva only`} on:click|stopPropagation={() => removeCluster(cluster.id)}>Remove</button>
+                  </div>
                 </article>
               {/each}
             </div>
@@ -5110,18 +5197,28 @@
                   <div><p class="eyebrow">{customApiWorkspace ? 'Custom APIs' : 'Resources'}</p><h2>{customApiWorkspace ? 'Browse custom APIs' : 'Browse resources'}</h2><p>{activeResourceCatalog.length} API types in {activeCluster}. Pick one to load its objects.</p></div>
                   <label class="resource-directory-search"><Search size={15} /><input bind:value={resourceDirectorySearch} placeholder="Find a kind, group, or version" aria-label="Find a resource type" spellcheck="false" /></label>
                 </header>
-                {#if recentDirectoryResources.length}
-                  <section class="resource-directory-section"><h3>Recently opened</h3><div class="resource-directory-grid">{#each recentDirectoryResources as resource}<button type="button" class="resource-directory-card resource-directory-card-recent" on:click={() => openDirectoryResource(resource)}><strong>{kindLabel(resource)}</strong><small>{resource.apiVersion}</small><span>{resource.namespaced ? 'Namespaced' : 'Cluster-wide'}</span></button>{/each}</div></section>
-                {/if}
-                {#each resourceDirectorySections as section}
-                  <section class="resource-directory-section"><h3>{section.title}<b>{section.resources.length}</b></h3><div class="resource-directory-grid">{#each section.resources as resource}<button type="button" class="resource-directory-card" on:click={() => openDirectoryResource(resource)}><strong>{kindLabel(resource)}</strong><small>{resource.apiVersion}</small><span>{resource.namespaced ? 'Namespaced' : 'Cluster-wide'}</span></button>{/each}</div></section>
-                {:else}
+                {#if !resourceDirectorySections.length}
                   <div class="resource-object-empty"><span>⌕</span><strong>{resourceDirectorySearch.trim() ? 'No matching API types' : 'No API types available'}</strong><p>{resourceDirectorySearch.trim() ? 'Try a different kind, group, or version.' : 'Your identity cannot list any resource types in this scope.'}</p></div>
-                {/each}
+                {:else}
+                  {#if directoryEssentials.length && !resourceDirectorySearch.trim()}
+                    <section class="directory-essentials" aria-label={recentDirectoryResources.length ? 'Recently opened' : 'Start here'}>
+                      <h3>{recentDirectoryResources.length ? 'Recently opened' : 'Start here'}</h3>
+                      <div>{#each directoryEssentials as resource}<button type="button" class="directory-essential-card" title={`${resource.kind} · ${resource.apiVersion}`} on:click={() => openDirectoryResource(resource)}><strong>{kindLabel(resource)}</strong><small>{kindDescription(resource)}</small></button>{/each}</div>
+                    </section>
+                  {/if}
+                  <div class="directory-index">
+                    {#each resourceDirectorySections as section}
+                      <section class:directory-index-domain={customApiWorkspace} class="directory-index-group" aria-label={section.title}>
+                        <h3>{section.title}<b>{section.resources.length}</b></h3>
+                        <ul>{#each section.resources as resource}<li><button type="button" title={`${resource.kind} · ${resource.apiVersion}${resource.namespaced ? '' : ' · cluster-wide'}`} on:click={() => openDirectoryResource(resource)}><span>{kindLabel(resource)}</span>{#if !resource.namespaced}<i>cluster</i>{/if}</button></li>{/each}</ul>
+                      </section>
+                    {/each}
+                  </div>
+                {/if}
               </div>
             {:else}
             <div class:resource-workbench-inspecting={Boolean((editorObject || loadingEditor) && !configModalOpen)} class="resource-workbench-body resource-workbench-body-focused">
-              <aside class="resource-object-browser" aria-label="Resource objects">
+              <aside class:resource-objects-single-namespace={Boolean(selectedResource && (namespace !== 'all namespaces' || !selectedResource.namespaced))} class="resource-object-browser" aria-label="Resource objects">
                 {#if selectedResource}
                   <div class="resource-object-heading resource-pane-heading"><button type="button" class="resource-directory-back" aria-label="Back to all resource types" title="All resource types" on:click={showResourceDirectory}>←</button><div><span class:custom={selectedResource.crd} class="resource-pane-icon">{selectedResource.crd ? '◇' : '○'}</span><div><strong>{selectedResource.kind} objects</strong><small>{selectedResource.apiVersion} · {selectedResource.namespaced ? (namespace === 'all namespaces' ? 'All namespaces' : namespace) : 'Cluster-wide'}</small></div></div><span class:live-status-loading={liveDataStatus === 'loading'} class:live-status-loaded={liveDataStatus === 'loaded'} class:live-status-stale={liveDataStatus === 'stale'} class:live-status-paused={liveDataStatus === 'paused'} class:live-status-unavailable={liveDataStatus === 'unavailable'} class="live-list-status resource-live-status" title={liveDataStatusTooltip} aria-label={liveDataStatusTooltip} aria-live="polite"><i></i></span><b>{resourceObjects.length}</b></div>
                   <div class="resource-object-columns" role="row" aria-label="Select loaded resource objects">{#if selectedResourcePermissionSet.canDelete}<label class:resource-select-all-partial={resourceObjectsSelectionPartial} class="resource-select-all"><input type="checkbox" checked={allResourceObjectsSelected} disabled={deletingResource || loadingObjects || !resourceObjects.length} aria-checked={resourceObjectsSelectionPartial ? 'mixed' : allResourceObjectsSelected ? 'true' : 'false'} aria-label={`Select all loaded ${selectedResource.plural}`} on:change={toggleAllResourceObjects} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}<span>Name</span><span>Namespace</span><span>Age</span><span>Action</span></div>
@@ -5135,7 +5232,7 @@
               {#if configModalOpen}<div class="config-modal-backdrop" role="presentation" on:click={requestCloseConfigEditor}></div>{/if}
               <aside class:resource-inspector-modal={configModalOpen} class="resource-inspector" aria-label="Resource details" role={configModalOpen ? 'dialog' : undefined} aria-modal={configModalOpen ? 'true' : undefined}>
                 <div class="resource-inspector-surface">
-                {#if configModalOpen && editorResource && editorObject}<header class="config-modal-heading"><p class="eyebrow">{editorResource.kind}</p><h2 title={editorObject.name}>{editorObject.name}</h2><small>{editorObject.namespace || 'cluster scoped'} · {activeCluster}{#if configEditorDirty} · <b>unsaved changes</b>{/if}</small></header>{/if}
+                {#if configModalOpen && editorResource && editorObject}<header class="config-modal-heading"><div><p class="eyebrow">{editorResource.kind}</p><h2 title={editorObject.name}>{editorObject.name}</h2><small>{editorObject.namespace || 'cluster scoped'} · {activeCluster}{#if configEditorDirty} · <b>unsaved changes</b>{/if}</small></div><button class="config-modal-close" type="button" aria-label={`Close ${editorObject.name}`} title="Close · Esc" disabled={savingEditor} on:click={requestCloseConfigEditor}>×</button></header>{/if}
                 {#if !(editorResource && (editorResource.kind === 'Secret' || editorResource.kind === 'ConfigMap'))}<div class="resource-details-heading resource-pane-heading"><span>02</span><div><strong>Details</strong><small>Live properties and actions</small></div></div>{/if}
                 {#if editorResource && editorObject}
                   {#if editorResource.kind !== 'Secret' && editorResource.kind !== 'ConfigMap'}<div class="drawer-heading inspector-heading"><div><span class:custom={editorResource.custom}>⌁</span><div><h2>{editorObject.name}</h2><p>{editorResource.kind} · {editorObject.namespace || 'cluster scoped'}</p></div></div><div class="inspector-heading-actions">{#if editorPermissionSet.canGet}<button class="secondary" disabled={loadingEditor} on:click={() => openYamlEditor(editorResource!, editorObject!)}>YAML</button>{/if}<button aria-label="Back to resource objects" on:click={() => closeEditor()}>×</button></div></div>{/if}
@@ -5180,7 +5277,7 @@
                     {/if}
                   {/if}
                   {#if configDiscardPrompt}<div class="config-discard-bar" role="alertdialog" aria-label="Unsaved changes"><span>Discard unsaved changes to {editorObject.name}?</span><button type="button" class="secondary" on:click={() => (configDiscardPrompt = false)}>Keep editing</button><button type="button" class="destructive" on:click={discardConfigEditor}>Discard</button></div>{/if}
-                  <div class="drawer-footer drawer-footer-compact"><div class="editor-footer-actions">{#if editorPermissionSet.resolved && !editorPermissionSet.canUpdate && !editorPermissionSet.canDelete}<span class="permission-readonly-badge">Read only</span>{/if}{#if editorResource.kind !== 'Secret' && editorResource.kind !== 'ConfigMap' && editorPermissionSet.canGet}<button class="secondary" disabled={loadingEditor} on:click={() => openYamlEditor(editorResource!, editorObject!)}>YAML</button>{/if}{#if editorPermissionSet.canDelete}<button class="destructive" disabled={loadingEditor || savingEditor} on:click={() => requestResourceDeletion(editorResource!, editorObject!)}>Delete</button>{/if}{#if (editorResource.kind === 'Secret' || editorResource.kind === 'ConfigMap') && editorPermissionSet.canUpdate}<button class="primary" disabled={loadingEditor || savingEditor} on:click={saveEditor}>{savingEditor ? 'Saving…' : 'Save'}</button>{/if}</div></div>
+                  <div class="drawer-footer drawer-footer-compact"><div class="editor-footer-actions">{#if editorPermissionSet.resolved && !editorPermissionSet.canUpdate && !editorPermissionSet.canDelete}<span class="permission-readonly-badge">Read only</span>{/if}{#if editorResource.kind !== 'Secret' && editorResource.kind !== 'ConfigMap' && editorPermissionSet.canGet}<button class="secondary" disabled={loadingEditor} on:click={() => openYamlEditor(editorResource!, editorObject!)}>YAML</button>{/if}{#if editorPermissionSet.canDelete}<button class="destructive" disabled={loadingEditor || savingEditor} on:click={() => requestResourceDeletion(editorResource!, editorObject!)}>Delete</button>{/if}{#if configModalOpen}<button class="secondary" type="button" disabled={savingEditor} on:click={requestCloseConfigEditor}>Cancel</button>{/if}{#if (editorResource.kind === 'Secret' || editorResource.kind === 'ConfigMap') && editorPermissionSet.canUpdate}<button class="primary" disabled={loadingEditor || savingEditor} on:click={saveEditor}>{savingEditor ? 'Saving…' : 'Save'}</button>{/if}</div></div>
                 {:else}
                   <div class="inspector-empty"><span>{selectedResource?.crd ? '◇' : '⌁'}</span><h3>{selectedResource ? `Choose a ${selectedResource.kind}` : 'Ready when you are'}</h3><p>{selectedResource ? 'Select an object from the list to view its live properties, edit supported data, or open YAML.' : 'Pick an API type to load its objects. Kuberniva does not fan out requests in the background.'}</p></div>
                 {/if}
