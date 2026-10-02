@@ -299,6 +299,50 @@ struct PodExecRequest {
     pod: String,
     container: Option<String>,
     command: String,
+    /// "shell" (default) runs through `shell -c`; "direct" executes argv with no shell,
+    /// for distroless images that only ship their own binaries.
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    shell: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ContainerShellRequest {
+    kubeconfig_path: Option<String>,
+    context: Option<String>,
+    namespace: String,
+    pod: String,
+    container: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DebugContainerInfo {
+    name: String,
+    image: String,
+    target: Option<String>,
+    running: bool,
+    waiting_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContainerShellInfo {
+    shell: Option<String>,
+    debug_containers: Vec<DebugContainerInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DebugContainerRequest {
+    kubeconfig_path: Option<String>,
+    context: Option<String>,
+    namespace: String,
+    pod: String,
+    target_container: Option<String>,
+    image: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -306,6 +350,7 @@ struct PodExecRequest {
 struct PodExecResponse {
     stdout: String,
     stderr: String,
+    exit_code: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2274,50 +2319,87 @@ async fn read_cluster_events_inner(
         .map_err(|error| error.to_string())?
         .items
         .into_iter()
-        .filter_map(|event| {
-            let name = event.metadata.name.clone()?;
-            let last_observed = event
-                .event_time
-                .as_ref()
-                .map(|time| time.0.to_string())
-                .or_else(|| node_time_string(event.last_timestamp.as_ref()))
-                .or_else(|| node_time_string(event.first_timestamp.as_ref()))
-                .or_else(|| node_time_string(event.metadata.creation_timestamp.as_ref()));
-            let first_observed = event
-                .first_timestamp
-                .as_ref()
-                .and_then(|time| node_time_string(Some(time)))
-                .or_else(|| event.event_time.as_ref().map(|time| time.0.to_string()));
-            let source = event.reporting_component.clone().or_else(|| {
-                event
-                    .source
-                    .as_ref()
-                    .and_then(|source| source.component.clone())
-            });
-            Some(ClusterEvent {
-                name,
-                namespace: event
-                    .metadata
-                    .namespace
-                    .clone()
-                    .or(event.involved_object.namespace.clone()),
-                event_type: event.type_.unwrap_or_else(|| "Normal".to_string()),
-                reason: event.reason,
-                message: event.message,
-                involved_kind: event.involved_object.kind,
-                involved_name: event.involved_object.name,
-                action: event.action,
-                count: event
-                    .count
-                    .or_else(|| event.series.as_ref().and_then(|series| series.count)),
-                source,
-                first_observed,
-                last_observed,
-            })
-        })
+        .filter_map(cluster_event_from)
         .collect::<Vec<_>>();
     events.sort_by(|left, right| right.last_observed.cmp(&left.last_observed));
     Ok(events)
+}
+
+fn cluster_event_from(event: Event) -> Option<ClusterEvent> {
+    let name = event.metadata.name.clone()?;
+    let last_observed = event
+        .event_time
+        .as_ref()
+        .map(|time| time.0.to_string())
+        .or_else(|| node_time_string(event.last_timestamp.as_ref()))
+        .or_else(|| node_time_string(event.first_timestamp.as_ref()))
+        .or_else(|| node_time_string(event.metadata.creation_timestamp.as_ref()));
+    let first_observed = event
+        .first_timestamp
+        .as_ref()
+        .and_then(|time| node_time_string(Some(time)))
+        .or_else(|| event.event_time.as_ref().map(|time| time.0.to_string()));
+    let source = event.reporting_component.clone().or_else(|| {
+        event
+            .source
+            .as_ref()
+            .and_then(|source| source.component.clone())
+    });
+    Some(ClusterEvent {
+        name,
+        namespace: event
+            .metadata
+            .namespace
+            .clone()
+            .or(event.involved_object.namespace.clone()),
+        event_type: event.type_.unwrap_or_else(|| "Normal".to_string()),
+        reason: event.reason,
+        message: event.message,
+        involved_kind: event.involved_object.kind,
+        involved_name: event.involved_object.name,
+        action: event.action,
+        count: event
+            .count
+            .or_else(|| event.series.as_ref().and_then(|series| series.count)),
+        source,
+        first_observed,
+        last_observed,
+    })
+}
+
+/// Events about one object (Argo CD Application, Pod, …), read with a field selector so
+/// they are not crowded out by the cluster-wide event cap.
+#[tauri::command]
+async fn read_object_events(
+    kubeconfig_path: Option<String>,
+    context: Option<String>,
+    namespace: String,
+    kind: String,
+    name: String,
+) -> Result<Vec<ClusterEvent>, String> {
+    bounded_cluster_read(
+        "Reading events",
+        cluster_read_timeout(&kubeconfig_path, &context, 35),
+        async move {
+            let client = client_for(kubeconfig_path, context).await?;
+            let params = ListParams::default()
+                .fields(&format!(
+                    "involvedObject.kind={kind},involvedObject.name={name}"
+                ))
+                .limit(100);
+            let mut events = Api::<Event>::namespaced(client, &namespace)
+                .list(&params)
+                .await
+                .map_err(|error| error.to_string())?
+                .items
+                .into_iter()
+                .filter_map(cluster_event_from)
+                .collect::<Vec<_>>();
+            events.sort_by(|left, right| right.last_observed.cmp(&left.last_observed));
+            Ok(events)
+        },
+    )
+    .await
 }
 
 fn dynamic_api_for_request(client: Client, request: &ResourceRequest) -> Api<DynamicObject> {
@@ -2380,7 +2462,10 @@ async fn run_resource_watch(
         // The UI only needs change signals, so watch metadata from the current
         // version: no replay of every object as ADDED, no full objects on the wire.
         let start_version = match api.list_metadata(&ListParams::default().limit(1)).await {
-            Ok(list) => list.metadata.resource_version.unwrap_or_else(|| "0".to_string()),
+            Ok(list) => list
+                .metadata
+                .resource_version
+                .unwrap_or_else(|| "0".to_string()),
             Err(_) => "0".to_string(),
         };
         let watch_params = WatchParams::default().timeout(290);
@@ -2592,34 +2677,120 @@ struct ArgoApplicationActionRequest {
     namespace: String,
     name: String,
     action: String,
+    #[serde(default)]
+    options: Value,
 }
 
-/// The merge patch Argo CD's own CLI applies: an annotation for refresh, an
-/// `operation` for sync. Refuses to queue a sync while one is still running.
-fn argocd_action_patch(action: &str, application: &Value) -> Result<Value, String> {
+fn argocd_operation_running(application: &Value) -> bool {
+    application["status"]["operationState"]["phase"].as_str() == Some("Running")
+        || application
+            .get("operation")
+            .is_some_and(|operation| !operation.is_null())
+}
+
+fn argocd_sync_operation(sync: Value) -> Value {
+    serde_json::json!({
+        "operation": {
+            "initiatedBy": { "username": "kuberniva" },
+            "sync": sync
+        }
+    })
+}
+
+/// The merge patches Argo CD's own API applies: an annotation for refresh, an
+/// `operation` for sync and rollback, the operation phase for terminate, and
+/// `spec.syncPolicy.automated` for auto-sync. Guards mirror Argo CD's own rules.
+fn argocd_action_patch(
+    action: &str,
+    application: &Value,
+    options: &Value,
+) -> Result<Value, String> {
+    let flag = |key: &str| options[key].as_bool().unwrap_or(false);
     match action {
         "refresh" | "hard-refresh" => {
-            let mode = if action == "hard-refresh" { "hard" } else { "normal" };
+            let mode = if action == "hard-refresh" {
+                "hard"
+            } else {
+                "normal"
+            };
             Ok(serde_json::json!({
                 "metadata": { "annotations": { "argocd.argoproj.io/refresh": mode } }
             }))
         }
         "sync" => {
-            if application["status"]["operationState"]["phase"].as_str() == Some("Running")
-                || application.get("operation").is_some_and(|operation| !operation.is_null())
-            {
+            if argocd_operation_running(application) {
                 return Err("A sync is already in progress for this application".to_string());
             }
-            let mut sync = serde_json::json!({ "syncStrategy": { "hook": {} } });
-            if let Some(revision) = application["spec"]["source"]["targetRevision"].as_str() {
-                sync["revision"] = Value::String(revision.to_string());
+            let strategy = if flag("force") {
+                serde_json::json!({ "apply": { "force": true } })
+            } else {
+                serde_json::json!({ "hook": {} })
+            };
+            let mut sync = serde_json::json!({ "syncStrategy": strategy });
+            let revision = options["revision"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| application["spec"]["source"]["targetRevision"].as_str());
+            if let Some(revision) = revision {
+                sync["revision"] = Value::String(revision.trim().to_string());
             }
-            Ok(serde_json::json!({
-                "operation": {
-                    "initiatedBy": { "username": "kuberniva" },
-                    "sync": sync
+            if flag("prune") {
+                sync["prune"] = Value::Bool(true);
+            }
+            if flag("dryRun") {
+                sync["dryRun"] = Value::Bool(true);
+            }
+            if flag("applyOutOfSyncOnly") {
+                sync["syncOptions"] = serde_json::json!(["ApplyOutOfSyncOnly=true"]);
+            }
+            if let Some(resources) = options["resources"]
+                .as_array()
+                .filter(|items| !items.is_empty())
+            {
+                sync["resources"] = Value::Array(resources.clone());
+            }
+            Ok(argocd_sync_operation(sync))
+        }
+        "rollback" => {
+            if argocd_operation_running(application) {
+                return Err("A sync is already in progress for this application".to_string());
+            }
+            if !application["spec"]["syncPolicy"]["automated"].is_null() {
+                return Err("Turn off auto-sync before rolling back; Argo CD would otherwise sync forward again".to_string());
+            }
+            let id = options["historyId"]
+                .as_i64()
+                .ok_or_else(|| "Choose a history entry to roll back to".to_string())?;
+            let entry = application["status"]["history"]
+                .as_array()
+                .and_then(|history| {
+                    history
+                        .iter()
+                        .find(|entry| entry["id"].as_i64() == Some(id))
+                })
+                .ok_or_else(|| format!("History entry {id} no longer exists"))?;
+            let mut sync =
+                serde_json::json!({ "syncStrategy": { "hook": {} }, "prune": flag("prune") });
+            for key in ["revision", "revisions", "source", "sources"] {
+                if !entry[key].is_null() {
+                    sync[key] = entry[key].clone();
                 }
-            }))
+            }
+            Ok(argocd_sync_operation(sync))
+        }
+        "terminate" => {
+            if application["status"]["operationState"]["phase"].as_str() != Some("Running") {
+                return Err("No sync is running for this application".to_string());
+            }
+            Ok(serde_json::json!({ "status": { "operationState": { "phase": "Terminating" } } }))
+        }
+        "set-auto-sync" => {
+            let automated = if flag("enabled") {
+                serde_json::json!({ "prune": flag("prune"), "selfHeal": flag("selfHeal") })
+            } else {
+                Value::Null
+            };
+            Ok(serde_json::json!({ "spec": { "syncPolicy": { "automated": automated } } }))
         }
         other => Err(format!("Unsupported Argo CD action: {other}")),
     }
@@ -2640,7 +2811,7 @@ async fn argocd_application_action(request: ArgoApplicationActionRequest) -> Res
         .await
         .map_err(|error| error.to_string())?;
     let current = serde_json::to_value(current).map_err(|error| error.to_string())?;
-    let patch = argocd_action_patch(&request.action, &current)?;
+    let patch = argocd_action_patch(&request.action, &current, &request.options)?;
     api.patch(
         &request.name,
         &PatchParams::default(),
@@ -2654,7 +2825,9 @@ async fn argocd_application_action(request: ArgoApplicationActionRequest) -> Res
 /// Full objects of one type, for structured views that read spec and status
 /// (Gateway routes, admission policies, Argo CD applications).
 #[tauri::command]
-async fn list_resource_manifests(request: ResourceRequest) -> Result<Vec<serde_json::Value>, String> {
+async fn list_resource_manifests(
+    request: ResourceRequest,
+) -> Result<Vec<serde_json::Value>, String> {
     bounded_cluster_read(
         "Reading resources",
         cluster_read_timeout(&request.kubeconfig_path, &request.context, 35),
@@ -2684,8 +2857,14 @@ async fn list_resource_manifests_inner(
         .collect::<Result<Vec<_>, _>>()?;
     let key = |value: &serde_json::Value| {
         (
-            value["metadata"]["namespace"].as_str().unwrap_or_default().to_string(),
-            value["metadata"]["name"].as_str().unwrap_or_default().to_string(),
+            value["metadata"]["namespace"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            value["metadata"]["name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
         )
     };
     objects.sort_by_key(key);
@@ -3082,40 +3261,150 @@ async fn exec_pod_command(request: PodExecRequest) -> Result<PodExecResponse, St
         return Err("Enter a command to run in the selected container".to_string());
     }
     let client = client_for(request.kubeconfig_path, request.context).await?;
-    ensure_resource_access(
-        client.clone(),
-        AccessReviewCheck {
-            key: "pod-exec".to_string(),
-            group: String::new(),
-            version: "v1".to_string(),
-            resource: "pods".to_string(),
-            verb: "create".to_string(),
-            namespace: Some(request.namespace.clone()),
-            name: Some(request.pod.clone()),
-            subresource: Some("exec".to_string()),
-        },
-    )
-    .await?;
+    ensure_pod_exec_access(client.clone(), &request.namespace, &request.pod).await?;
     let pods = Api::<Pod>::namespaced(client, &request.namespace);
-    let selected_container = request
+    let container = request
         .container
         .filter(|container| !container.trim().is_empty());
-    let attach = selected_container
-        .clone()
+    let argv = exec_argv(request.mode.as_deref(), request.shell.as_deref(), command)?;
+    let outcome = run_pod_exec(&pods, &request.pod, container.clone(), argv.clone(), 30)
+        .await
+        .map_err(|error| {
+            if error == EXEC_TIMEOUT {
+                "The command did not finish within 30 seconds".to_string()
+            } else {
+                error
+            }
+        })?;
+    if let Some(failure) = outcome.failure {
+        if outcome.stdout.is_empty() && outcome.stderr.is_empty() {
+            return Err(explain_exec_failure(
+                &failure,
+                &argv[0],
+                container.as_deref(),
+            ));
+        }
+    }
+    Ok(PodExecResponse {
+        stdout: outcome.stdout,
+        stderr: outcome.stderr,
+        exit_code: outcome.exit_code,
+    })
+}
+
+const EXEC_TIMEOUT: &str = "exec timed out";
+const SHELL_CANDIDATES: [&str; 5] = [
+    "/bin/bash",
+    "/bin/sh",
+    "/busybox/sh",
+    "/bin/ash",
+    "/usr/bin/bash",
+];
+
+fn exec_argv(
+    mode: Option<&str>,
+    shell: Option<&str>,
+    command: &str,
+) -> Result<Vec<String>, String> {
+    if mode == Some("direct") {
+        let argv = shell_words::split(command)
+            .map_err(|error| format!("Could not parse the command: {error}"))?;
+        if argv.is_empty() {
+            return Err("Enter a command to run in the selected container".to_string());
+        }
+        return Ok(argv);
+    }
+    let shell = shell
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("/bin/sh");
+    // Keep login semantics for the common shells; busybox/ash variants use plain -c.
+    let flag = if shell == "/bin/sh" || shell.ends_with("bash") {
+        "-lc"
+    } else {
+        "-c"
+    };
+    Ok(vec![
+        shell.to_string(),
+        flag.to_string(),
+        command.to_string(),
+    ])
+}
+
+fn explain_exec_failure(failure: &str, program: &str, container: Option<&str>) -> String {
+    let lower = failure.to_ascii_lowercase();
+    if lower.contains("no such file")
+        || lower.contains("not found")
+        || lower.contains("executable file")
+    {
+        let target = container
+            .map(|name| format!(" in {name}"))
+            .unwrap_or_default();
+        return format!(
+            "{program} does not exist{target}. The image may be distroless or shell-less: run the binary without a shell, or add a debug container."
+        );
+    }
+    failure.to_string()
+}
+
+struct ExecOutcome {
+    stdout: String,
+    stderr: String,
+    exit_code: Option<i32>,
+    failure: Option<String>,
+}
+
+fn exec_status_outcome(
+    status: Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::Status>,
+) -> (Option<i32>, Option<String>) {
+    let Some(status) = status else {
+        return (None, None);
+    };
+    if status.status.as_deref() != Some("Failure") {
+        return (Some(0), None);
+    }
+    let exit_code = status
+        .details
+        .as_ref()
+        .and_then(|details| details.causes.as_ref())
+        .and_then(|causes| {
+            causes
+                .iter()
+                .find(|cause| cause.reason.as_deref() == Some("ExitCode"))
+        })
+        .and_then(|cause| cause.message.as_deref())
+        .and_then(|code| code.parse::<i32>().ok());
+    if status.reason.as_deref() == Some("NonZeroExitCode") {
+        return (exit_code, None);
+    }
+    (
+        exit_code,
+        Some(
+            status
+                .message
+                .clone()
+                .unwrap_or_else(|| "The command could not start".to_string()),
+        ),
+    )
+}
+
+async fn run_pod_exec(
+    pods: &Api<Pod>,
+    pod: &str,
+    container: Option<String>,
+    argv: Vec<String>,
+    timeout_secs: u64,
+) -> Result<ExecOutcome, String> {
+    let attach = container
         .map(|container| AttachParams::default().container(container))
         .unwrap_or_default()
         .stdout(true)
         .stderr(true);
-    let shell_command = command.to_string();
-    let response = tokio::time::timeout(std::time::Duration::from_secs(30), async move {
+    tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async move {
         let mut attached = pods
-            .exec(
-                &request.pod,
-                vec!["/bin/sh", "-lc", shell_command.as_str()],
-                &attach,
-            )
+            .exec(pod, argv, &attach)
             .await
             .map_err(|error| error.to_string())?;
+        let status = attached.take_status();
         let mut stdout_reader = attached.stdout().ok_or_else(|| {
             "The Kubernetes API did not provide stdout for this exec session".to_string()
         })?;
@@ -3139,15 +3428,205 @@ async fn exec_pod_command(request: PodExecRequest) -> Result<PodExecResponse, St
             Ok::<Vec<u8>, String>(buffer)
         };
         let (stdout, stderr) = tokio::join!(stdout_task, stderr_task);
+        let status = match status {
+            Some(status) => status.await,
+            None => None,
+        };
         attached.join().await.map_err(|error| error.to_string())?;
-        Ok::<PodExecResponse, String>(PodExecResponse {
+        let (exit_code, failure) = exec_status_outcome(status.as_ref());
+        Ok::<ExecOutcome, String>(ExecOutcome {
             stdout: String::from_utf8_lossy(&stdout?).into_owned(),
             stderr: String::from_utf8_lossy(&stderr?).into_owned(),
+            exit_code,
+            failure,
         })
     })
     .await
-    .map_err(|_| "The command did not finish within 30 seconds".to_string())??;
-    Ok(response)
+    .map_err(|_| EXEC_TIMEOUT.to_string())?
+}
+
+fn debug_containers_for(pod: &Pod) -> Vec<DebugContainerInfo> {
+    let statuses = pod
+        .status
+        .as_ref()
+        .and_then(|status| status.ephemeral_container_statuses.clone())
+        .unwrap_or_default();
+    pod.spec
+        .as_ref()
+        .and_then(|spec| spec.ephemeral_containers.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|container| {
+            let state = statuses
+                .iter()
+                .find(|status| status.name == container.name)
+                .and_then(|status| status.state.clone());
+            DebugContainerInfo {
+                running: state.as_ref().is_some_and(|state| state.running.is_some()),
+                waiting_reason: state
+                    .as_ref()
+                    .and_then(|state| state.waiting.as_ref())
+                    .and_then(|waiting| waiting.reason.clone()),
+                name: container.name,
+                image: container.image.unwrap_or_default(),
+                target: container.target_container_name,
+            }
+        })
+        .collect()
+}
+
+async fn ensure_pod_exec_access(client: Client, namespace: &str, pod: &str) -> Result<(), String> {
+    ensure_resource_access(
+        client,
+        AccessReviewCheck {
+            key: "pod-exec".to_string(),
+            group: String::new(),
+            version: "v1".to_string(),
+            resource: "pods".to_string(),
+            verb: "create".to_string(),
+            namespace: Some(namespace.to_string()),
+            name: Some(pod.to_string()),
+            subresource: Some("exec".to_string()),
+        },
+    )
+    .await
+}
+
+/// Finds which shell the container actually ships, so commands work in Alpine,
+/// BusyBox, and Debian images alike, and lists debug containers already attached.
+#[tauri::command]
+async fn inspect_container_shell(
+    request: ContainerShellRequest,
+) -> Result<ContainerShellInfo, String> {
+    let client = client_for(request.kubeconfig_path, request.context).await?;
+    ensure_pod_exec_access(client.clone(), &request.namespace, &request.pod).await?;
+    let pods = Api::<Pod>::namespaced(client, &request.namespace);
+    let container = request.container.filter(|value| !value.trim().is_empty());
+    let probes = SHELL_CANDIDATES.iter().map(|shell| {
+        let argv = vec![shell.to_string(), "-c".to_string(), "exit 0".to_string()];
+        run_pod_exec(&pods, &request.pod, container.clone(), argv, 8)
+    });
+    let results = futures_util::future::join_all(probes).await;
+    let shell = SHELL_CANDIDATES
+        .iter()
+        .zip(results)
+        .find(|(_, result)| {
+            matches!(result, Ok(outcome) if outcome.failure.is_none() && outcome.exit_code.unwrap_or(0) == 0)
+        })
+        .map(|(shell, _)| shell.to_string());
+    let pod = pods
+        .get(&request.pod)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(ContainerShellInfo {
+        shell,
+        debug_containers: debug_containers_for(&pod),
+    })
+}
+
+fn debug_container_name() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("kuberniva-debug-{:x}", (nanos & 0xff_ffff) as u32)
+}
+
+/// Adds an ephemeral debug container (like `kubectl debug --target`) that shares the
+/// target's process namespace. Reuses a running one with the same image and target.
+#[tauri::command]
+async fn start_debug_container(
+    request: DebugContainerRequest,
+) -> Result<DebugContainerInfo, String> {
+    let image = request.image.trim().to_string();
+    if image.is_empty() {
+        return Err(
+            "Choose a debug image, for example busybox:1.36 or one from your internal registry"
+                .to_string(),
+        );
+    }
+    let client = client_for(request.kubeconfig_path, request.context).await?;
+    ensure_resource_access(
+        client.clone(),
+        AccessReviewCheck {
+            key: "pod-ephemeral".to_string(),
+            group: String::new(),
+            version: "v1".to_string(),
+            resource: "pods".to_string(),
+            verb: "patch".to_string(),
+            namespace: Some(request.namespace.clone()),
+            name: Some(request.pod.clone()),
+            subresource: Some("ephemeralcontainers".to_string()),
+        },
+    )
+    .await?;
+    let pods = Api::<Pod>::namespaced(client, &request.namespace);
+    let target = request
+        .target_container
+        .filter(|value| !value.trim().is_empty());
+    let current = pods
+        .get(&request.pod)
+        .await
+        .map_err(|error| error.to_string())?;
+    if let Some(existing) = debug_containers_for(&current)
+        .into_iter()
+        .find(|container| {
+            container.running && container.image == image && container.target == target
+        })
+    {
+        return Ok(existing);
+    }
+    let name = debug_container_name();
+    let mut container = serde_json::json!({
+        "name": name,
+        "image": image,
+        "imagePullPolicy": "IfNotPresent",
+        "command": ["sh", "-c", "while :; do sleep 3600; done"],
+        "stdin": false,
+        "tty": false
+    });
+    if let Some(target) = &target {
+        container["targetContainerName"] = Value::String(target.clone());
+    }
+    let patch = serde_json::json!({ "spec": { "ephemeralContainers": [container] } });
+    pods.patch_ephemeral_containers(&request.pod, &PatchParams::default(), &Patch::Strategic(&patch))
+        .await
+        .map_err(|error| {
+            let message = error.to_string();
+            if message.contains("404") || message.to_ascii_lowercase().contains("not found") {
+                "This cluster does not support ephemeral debug containers (Kubernetes 1.25 or later is required)".to_string()
+            } else {
+                message
+            }
+        })?;
+    for _ in 0..90 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let pod = pods
+            .get(&request.pod)
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(info) = debug_containers_for(&pod)
+            .into_iter()
+            .find(|candidate| candidate.name == name)
+        {
+            if info.running {
+                return Ok(info);
+            }
+            if let Some(reason) = info.waiting_reason.as_deref() {
+                if matches!(
+                    reason,
+                    "ErrImagePull" | "ImagePullBackOff" | "InvalidImageName"
+                ) {
+                    return Err(format!(
+                        "Could not pull {image} ({reason}). In an air-gapped cluster, use a debug image from your internal registry."
+                    ));
+                }
+            }
+        }
+    }
+    Err(format!(
+        "The debug container did not start within 90 seconds. Check the Pod's events for {name}."
+    ))
 }
 
 fn command_basename(command: &str) -> &str {
@@ -3740,7 +4219,10 @@ mod tests {
     fn interactive_auth_contexts_get_time_for_browser_sign_in() {
         let path = std::env::temp_dir().join(format!(
             "kuberniva-auth-timeout-{}.yaml",
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         std::fs::write(
             &path,
@@ -3799,7 +4281,7 @@ users:
         {
             return None; // kubectl is not installed on this machine.
         }
-        let nanos = SystemTime::now()
+        let nanos = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
@@ -4312,28 +4794,180 @@ users:
     }
 
     #[test]
+    fn exec_modes_build_shell_and_shell_less_argv() {
+        assert_eq!(
+            exec_argv(None, None, "ls | wc -l").unwrap(),
+            ["/bin/sh", "-lc", "ls | wc -l"]
+        );
+        assert_eq!(
+            exec_argv(Some("shell"), Some("/busybox/sh"), "id").unwrap(),
+            ["/busybox/sh", "-c", "id"]
+        );
+        assert_eq!(
+            exec_argv(
+                Some("direct"),
+                None,
+                "/app/server --config '/etc/app config.yaml' --check"
+            )
+            .unwrap(),
+            ["/app/server", "--config", "/etc/app config.yaml", "--check"]
+        );
+        assert!(exec_argv(Some("direct"), None, "echo 'unterminated").is_err());
+    }
+
+    #[test]
+    fn exec_status_separates_exit_codes_from_missing_binaries() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Status, StatusCause, StatusDetails};
+        let success = Status {
+            status: Some("Success".into()),
+            ..Default::default()
+        };
+        assert_eq!(exec_status_outcome(Some(&success)), (Some(0), None));
+        let exited = Status {
+            status: Some("Failure".into()),
+            reason: Some("NonZeroExitCode".into()),
+            details: Some(StatusDetails {
+                causes: Some(vec![StatusCause {
+                    reason: Some("ExitCode".into()),
+                    message: Some("2".into()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(exec_status_outcome(Some(&exited)), (Some(2), None));
+        let missing = Status {
+            status: Some("Failure".into()),
+            message: Some("exec: \"/bin/sh\": stat /bin/sh: no such file or directory".into()),
+            ..Default::default()
+        };
+        let (_, failure) = exec_status_outcome(Some(&missing));
+        let explained = explain_exec_failure(&failure.unwrap(), "/bin/sh", Some("app"));
+        assert!(
+            explained.starts_with("/bin/sh does not exist in app."),
+            "{explained}"
+        );
+        assert!(explained.contains("debug container"));
+    }
+
+    #[test]
+    fn debug_containers_report_target_and_state() {
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "api" },
+            "spec": {
+                "containers": [{ "name": "app" }],
+                "ephemeralContainers": [
+                    { "name": "kuberniva-debug-1", "image": "registry.corp/busybox:1.36", "targetContainerName": "app" },
+                    { "name": "kuberniva-debug-2", "image": "busybox:1.36" }
+                ]
+            },
+            "status": { "ephemeralContainerStatuses": [
+                { "name": "kuberniva-debug-1", "image": "", "imageID": "", "ready": false, "restartCount": 0, "state": { "running": {} } },
+                { "name": "kuberniva-debug-2", "image": "", "imageID": "", "ready": false, "restartCount": 0, "state": { "waiting": { "reason": "ImagePullBackOff" } } }
+            ] }
+        }))
+        .unwrap();
+        let containers = debug_containers_for(&pod);
+        assert_eq!(containers.len(), 2);
+        assert!(containers[0].running);
+        assert_eq!(containers[0].target.as_deref(), Some("app"));
+        assert!(!containers[1].running);
+        assert_eq!(
+            containers[1].waiting_reason.as_deref(),
+            Some("ImagePullBackOff")
+        );
+    }
+
+    #[test]
     fn argocd_actions_build_cli_compatible_patches() {
         let idle = serde_json::json!({
             "spec": { "source": { "targetRevision": "main" } },
             "status": { "operationState": { "phase": "Succeeded" } }
         });
-        let refresh = argocd_action_patch("refresh", &idle).unwrap();
+        let refresh = argocd_action_patch("refresh", &idle, &Value::Null).unwrap();
         assert_eq!(
             refresh["metadata"]["annotations"]["argocd.argoproj.io/refresh"],
             "normal"
         );
-        let sync = argocd_action_patch("sync", &idle).unwrap();
+        let sync = argocd_action_patch("sync", &idle, &Value::Null).unwrap();
         assert_eq!(sync["operation"]["sync"]["revision"], "main");
         assert_eq!(sync["operation"]["initiatedBy"]["username"], "kuberniva");
 
         let multi_source = serde_json::json!({ "spec": { "sources": [{}, {}] } });
-        let sync = argocd_action_patch("sync", &multi_source).unwrap();
+        let sync = argocd_action_patch("sync", &multi_source, &Value::Null).unwrap();
         assert!(sync["operation"]["sync"].get("revision").is_none());
 
         let running = serde_json::json!({ "status": { "operationState": { "phase": "Running" } } });
-        assert!(argocd_action_patch("sync", &running).is_err());
-        assert!(argocd_action_patch("refresh", &running).is_ok());
-        assert!(argocd_action_patch("delete", &idle).is_err());
+        assert!(argocd_action_patch("sync", &running, &Value::Null).is_err());
+        assert!(argocd_action_patch("refresh", &running, &Value::Null).is_ok());
+        assert!(argocd_action_patch("delete", &idle, &Value::Null).is_err());
+    }
+
+    #[test]
+    fn argocd_sync_options_rollback_terminate_and_auto_sync() {
+        let manual = serde_json::json!({
+            "spec": { "source": { "targetRevision": "main" } },
+            "status": {
+                "operationState": { "phase": "Succeeded" },
+                "history": [{ "id": 4, "revision": "abc123", "source": { "repoURL": "r", "path": "p" } }]
+            }
+        });
+        let options = serde_json::json!({
+            "prune": true, "dryRun": true, "applyOutOfSyncOnly": true, "force": true, "revision": "v2",
+            "resources": [{ "group": "apps", "kind": "Deployment", "name": "api", "namespace": "shop" }]
+        });
+        let sync =
+            argocd_action_patch("sync", &manual, &options).unwrap()["operation"]["sync"].clone();
+        assert_eq!(sync["revision"], "v2");
+        assert_eq!(sync["prune"], true);
+        assert_eq!(sync["dryRun"], true);
+        assert_eq!(sync["syncOptions"][0], "ApplyOutOfSyncOnly=true");
+        assert_eq!(sync["syncStrategy"]["apply"]["force"], true);
+        assert_eq!(sync["resources"][0]["kind"], "Deployment");
+
+        let rollback =
+            argocd_action_patch("rollback", &manual, &serde_json::json!({ "historyId": 4 }))
+                .unwrap();
+        assert_eq!(rollback["operation"]["sync"]["revision"], "abc123");
+        assert_eq!(rollback["operation"]["sync"]["source"]["path"], "p");
+        assert!(
+            argocd_action_patch("rollback", &manual, &serde_json::json!({ "historyId": 9 }))
+                .is_err()
+        );
+        let automated = serde_json::json!({ "spec": { "syncPolicy": { "automated": {} } }, "status": { "history": [{ "id": 4 }] } });
+        assert!(argocd_action_patch(
+            "rollback",
+            &automated,
+            &serde_json::json!({ "historyId": 4 })
+        )
+        .is_err());
+
+        assert!(argocd_action_patch("terminate", &manual, &Value::Null).is_err());
+        let running = serde_json::json!({ "status": { "operationState": { "phase": "Running" } } });
+        assert_eq!(
+            argocd_action_patch("terminate", &running, &Value::Null).unwrap()["status"]
+                ["operationState"]["phase"],
+            "Terminating"
+        );
+
+        let on = argocd_action_patch(
+            "set-auto-sync",
+            &manual,
+            &serde_json::json!({ "enabled": true, "selfHeal": true }),
+        )
+        .unwrap();
+        assert_eq!(
+            on["spec"]["syncPolicy"]["automated"],
+            serde_json::json!({ "prune": false, "selfHeal": true })
+        );
+        let off = argocd_action_patch(
+            "set-auto-sync",
+            &manual,
+            &serde_json::json!({ "enabled": false }),
+        )
+        .unwrap();
+        assert!(off["spec"]["syncPolicy"]["automated"].is_null());
     }
 
     #[test]
@@ -4348,8 +4982,10 @@ users:
             assert_eq!(category, "Admission Policies", "{plural}");
             assert!(!custom);
         }
-        let (webhooks, _, _) =
-            category_for("admissionregistration.k8s.io", "validatingwebhookconfigurations");
+        let (webhooks, _, _) = category_for(
+            "admissionregistration.k8s.io",
+            "validatingwebhookconfigurations",
+        );
         assert_eq!(webhooks, "Cluster");
     }
 
@@ -4540,6 +5176,7 @@ pub fn run() {
             list_resource_objects,
             list_resource_manifests,
             argocd_application_action,
+            read_object_events,
             get_resource_detail,
             delete_resource_object,
             save_resource_detail,
@@ -4549,6 +5186,8 @@ pub fn run() {
             save_log_file,
             get_pod_runtime,
             exec_pod_command,
+            inspect_container_shell,
+            start_debug_container,
             run_cluster_command,
             run_kubectl_command,
             start_cluster_command,

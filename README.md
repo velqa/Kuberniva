@@ -31,14 +31,14 @@ Kuberniva is an open-source, local-first Kubernetes desktop app. It opens instan
 | ⭐ **Shortcuts** | Pin up to 10 clusters, rename their shortcuts, and keep them across restarts. |
 | 📊 **Overview** | See cluster-wide CPU, memory, and node storage totals first, then select any node for its capacity, allocation, network, and live usage. |
 | 🛎️ **Events** | Browse recent Kubernetes Events with warning/normal filters and search. |
-| 🐙 **Argo CD** | When Argo CD is installed, see every Application's sync and health, filter to what needs attention, inspect source and managed resources, and Refresh or Sync after a confirmation. |
+| 🐙 **Argo CD** | When Argo CD is installed, every Application gets a full page: health and sync at a glance, a resource tree with live Pods, the last sync's per-resource results, deployment history with rollback, and events. Sync with options (prune, dry run, revision, selected resources), toggle auto-sync, or terminate a running sync, each after a confirmation. ApplicationSets and Projects have their own tabs. |
 | 🚪 **Gateway API** | Gateways show listeners, addresses, and attached routes; HTTPRoutes and GRPCRoutes show hostnames, parent status, and rules with weighted backends; Services list the routes that target them. |
 | 🛡️ **Admission Policies** | ValidatingAdmissionPolicy, MutatingAdmissionPolicy, and bindings get their own group with structured properties and highlighted CEL expressions. |
 | 🧭 **Resources** | Browse API types Lens-style: Resources and Custom APIs expand into trees right in the sidebar, grouped by Configuration, Access Control, Network, Storage, and Cluster. Or start from a searchable directory with your recently opened types on top. Tables use the full width until you open an object. |
 | 🚀 **Workloads** | Switch between Deployments, StatefulSets, DaemonSets, Jobs, CronJobs, Pods, and other workload types from the tabs on top. Compact, single-line tables show status, readiness, restarts, CPU, and memory at a glance. |
 | 🔎 **Details** | Open any workload for a compact Logs / Shell / YAML / Delete toolbar, an ordered Properties list, diagnostics, containers, and configuration. Empty sections stay hidden. |
 | 📝 **Editors** | Edit ConfigMaps and Secrets as key/value data, reveal Secret values on demand, edit YAML, and view certificate expiry. |
-| 📜 **Logs & exec** | Switch between sibling Pods' logs, pick containers, search, copy, or download output, and open a shell in any container. |
+| 📜 **Logs & exec** | Switch between sibling Pods' logs, pick containers, search, copy, or download output, and run commands in any container. Kuberniva detects the container's shell, runs binaries directly in shell-less images, or attaches an ephemeral debug container from an image you choose (handy for air-gapped registries). |
 | ⌨️ **CLI** | A built-in terminal bound to the active cluster and namespace, with live streaming output. See the CLI section below. |
 | 🎨 **Workspace** | Warm ivory light theme and neutral charcoal dark theme, a collapsible sidebar, adjustable interface size, and persistent cluster context. |
 | 🔄 **Updates** | **Settings → Check for updates** downloads signed updates in the background and applies them on restart. Kuberniva also checks quietly at launch. |

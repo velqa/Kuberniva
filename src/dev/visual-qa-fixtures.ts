@@ -380,10 +380,10 @@ export const visualQaLargeOverview = {
 
 export const visualQaOverview = {
   nodes: [
-    { ...nodeBase, name: 'worker-1', uid: 'visual-node-1', addresses: [{ type: 'InternalIP', address: '10.0.12.21' }], providerId: 'qa://worker-1', creationTimestamp: new Date(Date.now() - 14 * 86_400_000).toISOString(), cpuCapacity: '8 cores', memoryCapacity: '32Gi', cpuUsage: '3.12 cores', memoryUsage: '14.6Gi', cpuUsagePercent: 39, memoryUsagePercent: 46 },
-    { ...nodeBase, name: 'worker-2', uid: 'visual-node-2', addresses: [{ type: 'InternalIP', address: '10.0.12.22' }], providerId: 'qa://worker-2', creationTimestamp: new Date(Date.now() - 14 * 86_400_000).toISOString(), cpuCapacity: '8 cores', memoryCapacity: '32Gi', cpuUsage: '2.47 cores', memoryUsage: '11.2Gi', cpuUsagePercent: 31, memoryUsagePercent: 35 },
+    { ...nodeBase, name: 'worker-1', uid: 'visual-node-1', addresses: [{ type: 'InternalIP', address: '10.0.12.21' }], providerId: 'qa://worker-1', creationTimestamp: new Date(Date.now() - 14 * 86_400_000).toISOString(), cpuCapacity: '8', memoryCapacity: '32863332Ki', cpuUsage: '3123456789n', memoryUsage: '15309824Ki', cpuUsagePercent: 39.0432098625, memoryUsagePercent: 46.5864537 },
+    { ...nodeBase, name: 'worker-2', uid: 'visual-node-2', addresses: [{ type: 'InternalIP', address: '10.0.12.22' }], providerId: 'qa://worker-2', creationTimestamp: new Date(Date.now() - 14 * 86_400_000).toISOString(), cpuCapacity: '8', memoryCapacity: '32863332Ki', cpuUsage: '178901234n', memoryUsage: '11744052Ki', cpuUsagePercent: 2.2362654250, memoryUsagePercent: 35.7360112 },
   ],
-  totals: { cpuCapacity: '16 cores', memoryCapacity: '64Gi', storageCapacity: '480Gi', cpuUsage: '5.59 cores', memoryUsage: '25.8Gi', cpuUsagePercent: 35, memoryUsagePercent: 40, metricNodes: 2 },
+  totals: { cpuCapacity: '16 cores', memoryCapacity: '64Gi', storageCapacity: '480Gi', cpuUsage: '3.30 cores', memoryUsage: '25.8Gi', cpuUsagePercent: 20.6397376438, memoryUsagePercent: 41.1612324, metricNodes: 2 },
   metricsAvailable: true,
   observedAt: new Date().toISOString(),
 };
@@ -414,6 +414,8 @@ export const visualQaExtraResources = [
   { group: 'admissionregistration.k8s.io', version: 'v1', apiVersion: 'admissionregistration.k8s.io/v1', kind: 'ValidatingAdmissionPolicy', plural: 'validatingadmissionpolicies', namespaced: false, category: 'Admission Policies', custom: false, crd: false },
   { group: 'admissionregistration.k8s.io', version: 'v1', apiVersion: 'admissionregistration.k8s.io/v1', kind: 'ValidatingAdmissionPolicyBinding', plural: 'validatingadmissionpolicybindings', namespaced: false, category: 'Admission Policies', custom: false, crd: false },
   { group: 'argoproj.io', version: 'v1alpha1', apiVersion: 'argoproj.io/v1alpha1', kind: 'Application', plural: 'applications', namespaced: true, category: 'Custom Resources', custom: true, crd: true },
+  { group: 'argoproj.io', version: 'v1alpha1', apiVersion: 'argoproj.io/v1alpha1', kind: 'ApplicationSet', plural: 'applicationsets', namespaced: true, category: 'Custom Resources', custom: true, crd: true },
+  { group: 'argoproj.io', version: 'v1alpha1', apiVersion: 'argoproj.io/v1alpha1', kind: 'AppProject', plural: 'appprojects', namespaced: true, category: 'Custom Resources', custom: true, crd: true },
 ];
 
 export const visualQaGateway = {
@@ -474,15 +476,57 @@ export const visualQaAdmissionPolicy = {
   status: { typeChecking: { expressionWarnings: [{ fieldRef: 'spec.validations[0].expression', warning: 'params may be absent when the binding omits paramRef' }] } },
 };
 
-const argoApp = (name: string, project: string, sync: string, health: string, phase: string, extra: Record<string, unknown> = {}) => ({
-  metadata: { name, namespace: 'argocd' },
-  spec: { project, source: { repoURL: 'https://github.com/acme/deploy.git', path: `apps/${name}`, targetRevision: 'main' }, destination: { server: 'https://kubernetes.default.svc', namespace: name }, syncPolicy: name.startsWith('billing') ? {} : { automated: { prune: true, selfHeal: true } } },
-  status: { sync: { status: sync, revision: '4f2a91c0d1e2' }, health: { status: health }, operationState: { phase, message: phase === 'Failed' ? 'one or more synchronization tasks completed unsuccessfully' : 'successfully synced (all tasks run)' }, reconciledAt: new Date(Date.now() - 4 * 60_000).toISOString(), resources: [
-    { kind: 'Deployment', name, namespace: name, status: sync, health: { status: health } },
-    { kind: 'Service', name, namespace: name, status: 'Synced', health: { status: 'Healthy' } },
-    { kind: 'ConfigMap', name: `${name}-config`, namespace: name, status: 'Synced' },
-  ], ...extra },
-});
+const argoApp = (name: string, project: string, sync: string, health: string, phase: string, extra: Record<string, unknown> = {}) => {
+  const minutesAgo = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
+  const failed = phase === 'Failed';
+  return {
+    metadata: { name, namespace: 'argocd', creationTimestamp: minutesAgo(60 * 24 * 40) },
+    spec: {
+      project,
+      source: name.startsWith('billing')
+        ? { repoURL: 'https://charts.acme.io', chart: 'billing', targetRevision: '2.8.1', helm: { releaseName: name, valueFiles: ['values-prod.yaml'], parameters: [{ name: 'replicaCount', value: '3' }, { name: 'image.tag', value: '2.8.1' }] } }
+        : { repoURL: 'https://github.com/acme/deploy.git', path: `apps/${name}/overlays/prod`, targetRevision: 'main', kustomize: { images: [`ghcr.io/acme/${name}:4f2a91c`] } },
+      destination: { server: 'https://kubernetes.default.svc', namespace: name },
+      syncPolicy: name.startsWith('billing') ? { syncOptions: ['CreateNamespace=true', 'ServerSideApply=true'] } : { automated: { prune: true, selfHeal: true }, syncOptions: ['CreateNamespace=true'] },
+    },
+    status: {
+      sync: { status: sync, revision: '4f2a91c0d1e2' },
+      health: { status: health },
+      reconciledAt: minutesAgo(4),
+      summary: { images: [`ghcr.io/acme/${name}:4f2a91c`, 'ghcr.io/acme/otel-sidecar:0.9.2'], externalURLs: name === 'storefront' || name.startsWith('billing') ? [`https://${name}.acme.example.com`] : [] },
+      operationState: {
+        phase,
+        message: failed ? 'one or more synchronization tasks completed unsuccessfully' : phase === 'Running' ? 'waiting for healthy state of apps/Deployment/storefront' : 'successfully synced (all tasks run)',
+        startedAt: minutesAgo(phase === 'Running' ? 1 : 22),
+        finishedAt: phase === 'Running' ? undefined : minutesAgo(21),
+        operation: { initiatedBy: failed ? { username: 'vijay' } : { automated: true }, sync: { revision: '4f2a91c0d1e2', prune: !failed } },
+        syncResult: { revision: '4f2a91c0d1e2', resources: [
+          { kind: 'ConfigMap', name: `${name}-config`, namespace: name, status: 'Synced', message: 'configmap/' + name + '-config configured', syncPhase: 'Sync' },
+          { kind: 'Service', name, namespace: name, status: 'Synced', message: 'service/' + name + ' unchanged', syncPhase: 'Sync' },
+          { group: 'apps', kind: 'Deployment', name, namespace: name, status: failed ? 'SyncFailed' : 'Synced', message: failed ? 'admission webhook "policy.acme.io" denied the request: image must come from registry.acme.io' : 'deployment.apps/' + name + ' configured', syncPhase: 'Sync' },
+          { group: 'batch', kind: 'Job', name: `${name}-migrate`, namespace: name, status: 'Synced', message: 'job completed', hookPhase: 'Succeeded', syncPhase: 'PreSync' },
+        ] },
+      },
+      history: [
+        { id: 14, revision: '9c1d7e2a4b11', deployedAt: minutesAgo(60 * 50), deployStartedAt: minutesAgo(60 * 50 + 2), initiatedBy: { automated: true }, source: { repoURL: 'https://github.com/acme/deploy.git', path: `apps/${name}`, targetRevision: 'main' } },
+        { id: 15, revision: '1b7e40c9d2f3', deployedAt: minutesAgo(60 * 26), deployStartedAt: minutesAgo(60 * 26 + 1), initiatedBy: { username: 'oncall' }, source: { repoURL: 'https://github.com/acme/deploy.git', path: `apps/${name}`, targetRevision: 'main' } },
+        { id: 16, revision: '4f2a91c0d1e2', deployedAt: minutesAgo(21), deployStartedAt: minutesAgo(22), initiatedBy: { automated: true }, source: { repoURL: 'https://github.com/acme/deploy.git', path: `apps/${name}`, targetRevision: 'main' } },
+      ],
+      resources: [
+        { version: 'v1', kind: 'Namespace', name, status: 'Synced', health: { status: 'Healthy' } },
+        { version: 'v1', kind: 'ServiceAccount', name, namespace: name, status: 'Synced' },
+        { version: 'v1', kind: 'ConfigMap', name: `${name}-config`, namespace: name, status: sync },
+        { version: 'v1', kind: 'ConfigMap', name: `${name}-feature-flags`, namespace: name, status: 'OutOfSync', requiresPruning: sync === 'OutOfSync' },
+        { version: 'v1', kind: 'Secret', name: `${name}-tls`, namespace: name, status: 'Synced' },
+        { version: 'v1', kind: 'Service', name, namespace: name, status: 'Synced', health: { status: 'Healthy' } },
+        { group: 'apps', version: 'v1', kind: 'Deployment', name, namespace: name, status: failed ? 'OutOfSync' : 'Synced', health: { status: health, message: health === 'Degraded' ? 'Deployment "' + name + '" exceeded its progress deadline' : health === 'Progressing' ? 'Waiting for rollout to finish: 1 of 3 updated replicas are available...' : undefined } },
+        { group: 'autoscaling', version: 'v2', kind: 'HorizontalPodAutoscaler', name, namespace: name, status: 'Synced', health: { status: 'Healthy' } },
+        { group: 'networking.k8s.io', version: 'v1', kind: 'Ingress', name, namespace: name, status: 'Synced', health: { status: 'Healthy' } },
+      ],
+      ...extra,
+    },
+  };
+};
 
 export const visualQaArgoApps = [
   argoApp('billing-api', 'payments', 'OutOfSync', 'Degraded', 'Failed', { conditions: [{ type: 'SyncError', message: 'Deployment billing-api: container image pull back-off' }] }),
@@ -492,4 +536,15 @@ export const visualQaArgoApps = [
   argoApp('ingress-nginx', 'platform', 'Synced', 'Healthy', 'Succeeded'),
   argoApp('cert-manager', 'platform', 'Synced', 'Healthy', 'Succeeded'),
   argoApp('observability', 'platform', 'Synced', 'Healthy', 'Succeeded'),
+];
+
+export const visualQaArgoSets = [
+  { metadata: { name: 'platform-addons', namespace: 'argocd' }, spec: { generators: [{ clusters: {} }], template: { metadata: { name: '{{name}}-addons' }, spec: { project: 'platform' } } }, status: { conditions: [{ type: 'ResourcesUpToDate', status: 'True', message: 'All applications have been generated successfully' }], resources: [{}, {}, {}] } },
+  { metadata: { name: 'team-previews', namespace: 'argocd' }, spec: { generators: [{ pullRequest: {} }], template: { metadata: { name: 'preview-{{number}}' }, spec: { project: 'web' } }, syncPolicy: { applicationsSync: 'create-update' } }, status: { conditions: [{ type: 'ErrorOccurred', status: 'True', message: 'failed to list pull requests: 401 Unauthorized' }] } },
+];
+
+export const visualQaArgoProjects = [
+  { metadata: { name: 'payments', namespace: 'argocd' }, spec: { description: 'Payments team services', sourceRepos: ['https://github.com/acme/deploy.git'], destinations: [{ server: 'https://kubernetes.default.svc', namespace: 'billing-*' }, { server: 'https://kubernetes.default.svc', namespace: 'checkout' }], roles: [{ name: 'ci' }, { name: 'oncall' }], syncWindows: [{ kind: 'deny', schedule: '0 22 * * *' }] } },
+  { metadata: { name: 'platform', namespace: 'argocd' }, spec: { description: 'Cluster add-ons', sourceRepos: ['*'], destinations: [{ server: '*', namespace: '*' }], clusterResourceWhitelist: [{ group: '*', kind: '*' }] } },
+  { metadata: { name: 'web', namespace: 'argocd' }, spec: { sourceRepos: ['https://github.com/acme/web-*'], destinations: [{ name: 'prod', namespace: 'web' }] } },
 ];

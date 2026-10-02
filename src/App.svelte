@@ -1,10 +1,11 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from 'svelte';
   import { admissionPolicyView, isAdmissionPolicyKind, tokenizeCel, type CelEntry } from './lib/admission-policy';
-  import { argoApplication, argoTone, summarizeArgo, type ArgoApp } from './lib/argocd';
+  import { argoApplication, argoApplicationSet, argoProject, argoTone, isForbidden, resourcesByKind, summarizeArgo, type ArgoApp, type ArgoAppSet, type ArgoProject, type ArgoResource } from './lib/argocd';
   import { conditions as gatewayConditions, gatewayAddresses, gatewayListeners, routeHostnames, routeParents, routeRules, routesAttachedToGateway, routesTargetingService, type RouteSummary } from './lib/gateway-api';
+  import { cpuLabel, memoryLabel, percentLabel, resourceQuantityLabel } from './lib/quantity';
   import { readDeadlineMs, shouldRecoverAfterResume, usesInteractiveAuth, withRequestDeadline } from './lib/request-recovery';
-  import { Bell, Blocks, Boxes, Check, ChevronDown, ChevronRight, Command, Container, Copy, Database, Download, FileText, GitBranch, HardDrive, KeyRound, LayoutDashboard, LoaderCircle, Menu, Moon, Network, RefreshCw, Search, ScrollText, Server, Settings2, Shield, ShieldCheck, Star, Sun, Terminal, WifiOff, Workflow } from '@lucide/svelte';
+  import { Bell, Blocks, Boxes, Check, ChevronDown, ChevronRight, Command, Container, Copy, Database, Download, FileText, GitBranch, Ghost, HardDrive, Heart, HeartCrack, Pause, CircleCheck, CircleArrowUp, CircleQuestionMark, Undo2, Ban, Clock, ArrowLeft, Zap, KeyRound, LayoutDashboard, LoaderCircle, Menu, Moon, Network, RefreshCw, Search, ScrollText, Server, Settings2, Shield, ShieldCheck, Star, Sun, Terminal, WifiOff, Workflow } from '@lucide/svelte';
 
   type View = 'Clusters' | 'Favorites' | 'Overview' | 'Events' | 'Argo CD' | 'Resources' | 'Workloads' | 'Explore' | 'Logs' | 'Settings';
   type ThemeMode = 'light' | 'dark';
@@ -32,7 +33,10 @@
   type PodPort = { container: string; name?: string; port: number; protocol: string };
   type PodLogResponse = { lines: string[]; containers: string[]; selectedContainer?: string; ports: PodPort[] };
   type PodRuntime = { containers: string[]; ports: PodPort[] };
-  type PodExecResponse = { stdout: string; stderr: string };
+  type PodExecResponse = { stdout: string; stderr: string; exitCode?: number | null };
+  type TerminalAccess = 'shell' | 'direct' | 'debug';
+  type DebugContainerInfo = { name: string; image: string; target?: string | null; running: boolean; waitingReason?: string | null };
+  type ContainerShellInfo = { shell?: string | null; debugContainers: DebugContainerInfo[] };
   type OpeningLogsTarget = { key: string; label: string };
   type LogTarget = { pod: string; namespace: string };
   type CertificateInfo = { expiresAt: string; daysRemaining: number; expired: boolean };
@@ -143,6 +147,19 @@
   let loadingTerminalPods = false;
   let loadingTerminalRuntime = false;
   let runningTerminalCommand = false;
+  // Distroless and air-gapped images often ship no shell: detect one, or run the
+  // binary directly, or attach an ephemeral debug container from a trusted image.
+  const debugImageStorageKey = 'kuberniva.debugImage';
+  let terminalAccess: TerminalAccess = 'shell';
+  let terminalShell: string | null = null;
+  let inspectingShell = false;
+  let terminalShellChecked = false;
+  let terminalDebugContainers: DebugContainerInfo[] = [];
+  let activeDebugContainer: DebugContainerInfo | null = null;
+  let debugShell: string | null = null;
+  let startingDebugContainer = false;
+  let debugImage = loadDebugImage();
+  let shellInspectGeneration = 0;
   let cliCommand = '';
   let cliLines: CliLine[] = [];
   let appVersion = '';
@@ -375,7 +392,7 @@
                 : loadingOverview && activeView === 'Overview' ? 'Refreshing node metrics…'
                   : loadingEvents && activeView === 'Events' ? 'Loading cluster events…' : '';
   $: protectedWorkflowOpen = protectedWorkflowFor([
-    kubeconfigOpen, commandOpen, deletionTarget, argoActionTarget, runningArgoAction, favoriteContextMenu, favoriteRenameId, loadingCatalog, deletingResource,
+    kubeconfigOpen, commandOpen, deletionTarget, argoDialog, runningArgoAction, favoriteContextMenu, favoriteRenameId, loadingCatalog, deletingResource,
     editorResource, yamlResource, loadingEditor, savingEditor, loadingYaml, savingYaml, loadingRelatedPods, relatedObject,
     activeView, workloadDetailMode, terminalTarget, logTarget, openingLogsTarget, loadingTerminalPods, loadingTerminalRuntime,
     runningTerminalCommand, loadingLogs, downloadingLogs,
@@ -526,23 +543,11 @@
   }
 
   function podMetricLabel(value?: string) {
-    return value || '—';
+    return memoryLabel(value);
   }
 
   function cpuMetricLabel(value?: string) {
-    if (!value) return '—';
-    const trimmed = value.trim();
-    const match = trimmed.match(/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(m|cores?|core)?$/i);
-    if (!match) return value;
-    const numeric = Number(match[1]);
-    if (!Number.isFinite(numeric)) return value;
-    const cores = match[2]?.toLowerCase() === 'm' ? numeric / 1_000 : numeric;
-    if (cores < 1) {
-      const rounded = Math.round(cores * 1_000) / 1_000;
-      if (cores > 0 && rounded === 0) return '<0.001 cores';
-      return `${rounded.toFixed(3).replace(/0+$/, '').replace(/\.$/, '')} cores`;
-    }
-    return `${cores.toFixed(2)} cores`;
+    return cpuLabel(value);
   }
 
   function certificateRemainingLabel(certificate: CertificateInfo) {
@@ -575,8 +580,16 @@
   }
 
   // Argo CD: auto-detected from the catalog, like Lens' navigator entry.
-  type ArgoAction = 'refresh' | 'sync';
+  type ArgoAction = 'refresh' | 'hard-refresh' | 'sync' | 'rollback' | 'terminate' | 'set-auto-sync';
+  type ArgoAppTab = 'overview' | 'resources' | 'sync' | 'history' | 'events';
+  type ArgoDialog = { action: ArgoAction; app: ArgoApp; historyId?: number; revision?: string; resources?: ArgoResource[]; enable?: boolean };
   let argoApps: ArgoApp[] = [];
+  let argoSets: ArgoAppSet[] = [];
+  let argoProjects: ArgoProject[] = [];
+  let argoTab: 'apps' | 'sets' | 'projects' = 'apps';
+  let argoScopeNote = '';
+  let selectedArgoSetKey = '';
+  let selectedArgoProjectKey = '';
   let loadingArgo = false;
   let argoError = '';
   let argoClusterId = '';
@@ -584,9 +597,30 @@
   let argoFilter: 'all' | 'attention' = 'all';
   let argoSearch = '';
   let selectedArgoKey = '';
-  let argoActionTarget: { app: ArgoApp; action: ArgoAction } | null = null;
+  let argoDialog: ArgoDialog | null = null;
   let runningArgoAction = false;
+  let argoAppTab: ArgoAppTab = 'overview';
+  let argoResourceFilter: 'all' | 'outofsync' | 'unhealthy' | 'prune' = 'all';
+  let argoResourceSearch = '';
+  let collapsedArgoKinds: Record<string, boolean> = {};
+  let argoPodChildren: Record<string, { loading: boolean; pods: ResourceObject[]; error: string }> = {};
+  let argoEvents: ClusterEvent[] = [];
+  let argoEventsKey = '';
+  let loadingArgoEvents = false;
+  let argoEventsError = '';
+  let argoSyncOptions = { revision: '', prune: false, dryRun: false, applyOutOfSyncOnly: false, force: false };
+  let argoAutoSyncOptions = { prune: false, selfHeal: true };
+  $: argoVisibleResources = selectedArgoApp ? filterArgoResources(selectedArgoApp.resources, argoResourceFilter, argoResourceSearch) : [];
+  $: argoResourceGroups = resourcesByKind(argoVisibleResources);
+  $: argoProblemResources = selectedArgoApp ? selectedArgoApp.resources.filter((resource) => resource.sync === 'OutOfSync' || ['Degraded', 'Missing'].includes(resource.health) || resource.requiresPruning) : [];
+  $: if (argoAppTab === 'events' && selectedArgoApp && argoEventsKey !== `${activeClusterId}|${argoKey(selectedArgoApp)}`) void loadArgoEvents(selectedArgoApp);
   $: argoApplicationResource = catalog.resources.find((resource) => resource.group === 'argoproj.io' && resource.kind === 'Application') || null;
+  $: argoSetResource = catalog.resources.find((resource) => resource.group === 'argoproj.io' && resource.kind === 'ApplicationSet') || null;
+  $: argoProjectResource = catalog.resources.find((resource) => resource.group === 'argoproj.io' && resource.kind === 'AppProject') || null;
+  $: selectedArgoSet = argoSets.find((set) => `${set.namespace}/${set.name}` === selectedArgoSetKey) || null;
+  $: selectedArgoProject = argoProjects.find((project) => `${project.namespace}/${project.name}` === selectedArgoProjectKey) || null;
+  $: visibleArgoSets = argoSets.filter((set) => `${set.name} ${set.project} ${set.generators.join(' ')}`.toLowerCase().includes(argoSearch.toLowerCase()));
+  $: visibleArgoProjects = argoProjects.filter((project) => `${project.name} ${project.description}`.toLowerCase().includes(argoSearch.toLowerCase()));
   $: argoSummary = summarizeArgo(argoApps);
   $: visibleArgoApps = (argoFilter === 'attention' ? argoSummary.attention : argoApps)
     .filter((app) => `${app.name} ${app.project} ${app.destination}`.toLowerCase().includes(argoSearch.toLowerCase()));
@@ -616,18 +650,44 @@
     };
   }
 
+  /** Lists cluster-wide, then falls back to the selected namespace and `argocd` when RBAC only allows a namespace. */
+  async function listArgoManifests(resource: ResourceDescriptor) {
+    const scopes = ['all namespaces', ...new Set([namespace, 'argocd'].filter((candidate) => candidate && candidate !== 'all namespaces'))];
+    let lastError: unknown;
+    for (const scope of scopes) {
+      try {
+        return { items: await invokeRead<Record<string, unknown>[]>('list_resource_manifests', manifestListRequest(resource, scope)), scope };
+      } catch (error) {
+        lastError = error;
+        if (!isForbidden(error)) break;
+      }
+    }
+    throw lastError;
+  }
+
   async function loadArgoApps(force = false) {
     const resource = argoApplicationResource;
     if (!activeClusterId || !resource || (loadingArgo && !force)) return;
     const requestClusterId = activeClusterId;
     const requestGeneration = ++argoRequestGeneration;
-    if (argoClusterId !== requestClusterId) argoApps = [];
+    if (argoClusterId !== requestClusterId) {
+      argoApps = [];
+      argoSets = [];
+      argoProjects = [];
+    }
     loadingArgo = true;
     argoError = '';
     try {
-      const manifests = await invokeRead<Record<string, unknown>[]>('list_resource_manifests', manifestListRequest(resource));
+      const [apps, sets, projects] = await Promise.all([
+        listArgoManifests(resource),
+        argoSetResource ? listArgoManifests(argoSetResource).catch(() => null) : null,
+        argoProjectResource ? listArgoManifests(argoProjectResource).catch(() => null) : null,
+      ]);
       if (requestGeneration !== argoRequestGeneration || requestClusterId !== activeClusterId) return;
-      argoApps = manifests.map(argoApplication);
+      argoApps = apps.items.map(argoApplication);
+      argoSets = (sets?.items || []).map((manifest) => argoApplicationSet(manifest, argoApps));
+      argoProjects = (projects?.items || []).map((manifest) => argoProject(manifest, argoApps));
+      argoScopeNote = apps.scope === 'all namespaces' ? '' : `Showing ${apps.scope} only · you can't list Applications across all namespaces`;
       argoClusterId = requestClusterId;
       lastConnectionVerifiedAt = Date.now();
     } catch (error) {
@@ -637,11 +697,164 @@
     }
   }
 
+  function openArgoApp(app: ArgoApp) {
+    selectedArgoKey = argoKey(app);
+    argoAppTab = 'overview';
+    argoResourceFilter = 'all';
+    argoResourceSearch = '';
+    collapsedArgoKinds = {};
+    argoPodChildren = {};
+    argoEvents = [];
+    argoEventsKey = '';
+  }
+
+  function openArgoDialog(dialog: ArgoDialog) {
+    if (dialog.action === 'sync') {
+      argoSyncOptions = { revision: dialog.revision || dialog.app.sources[0]?.targetRevision || '', prune: false, dryRun: false, applyOutOfSyncOnly: false, force: false };
+    }
+    if (dialog.action === 'set-auto-sync' && dialog.enable) argoAutoSyncOptions = { prune: false, selfHeal: true };
+    argoDialog = dialog;
+  }
+
+  function filterArgoResources(resources: ArgoResource[], filter: typeof argoResourceFilter, search: string) {
+    const query = search.trim().toLowerCase();
+    return resources.filter((resource) => (
+      filter === 'all'
+      || (filter === 'outofsync' && resource.sync === 'OutOfSync')
+      || (filter === 'unhealthy' && ['Degraded', 'Missing', 'Progressing', 'Suspended'].includes(resource.health))
+      || (filter === 'prune' && resource.requiresPruning)
+    ) && (!query || `${resource.kind} ${resource.name} ${resource.namespace}`.toLowerCase().includes(query)));
+  }
+
+  function argoResourceKey(resource: ArgoResource) {
+    return `${resource.group}/${resource.kind}/${resource.namespace}/${resource.name}`;
+  }
+
+  function argoHealthIcon(status: string) {
+    return status === 'Healthy' ? Heart : status === 'Degraded' ? HeartCrack : status === 'Progressing' ? LoaderCircle : status === 'Missing' ? Ghost : status === 'Suspended' ? Pause : CircleQuestionMark;
+  }
+
+  function argoSyncIcon(status: string) {
+    return status === 'Synced' ? CircleCheck : status === 'OutOfSync' ? CircleArrowUp : CircleQuestionMark;
+  }
+
+  function argoDuration(start: string, end: string) {
+    const seconds = Math.round((Date.parse(end || new Date().toISOString()) - Date.parse(start)) / 1000);
+    if (!Number.isFinite(seconds) || seconds < 0) return '—';
+    if (seconds < 60) return `${seconds}s`;
+    if (seconds < 3600) return seconds % 60 ? `${Math.floor(seconds / 60)}m ${seconds % 60}s` : `${seconds / 60}m`;
+    return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+  }
+
+  function argoDescriptor(resource: ArgoResource) {
+    return catalog.resources.find((candidate) => candidate.group === resource.group && candidate.kind === resource.kind) || null;
+  }
+
+  const ARGO_POD_PARENTS = new Set(['Deployment', 'StatefulSet', 'DaemonSet', 'ReplicaSet', 'Job']);
+
+  function argoHasPods(app: ArgoApp, resource: ArgoResource) {
+    return app.inCluster && ARGO_POD_PARENTS.has(resource.kind) && Boolean(argoDescriptor(resource));
+  }
+
+  async function toggleArgoPods(resource: ArgoResource) {
+    const key = argoResourceKey(resource);
+    if (argoPodChildren[key]) {
+      const { [key]: _removed, ...rest } = argoPodChildren;
+      argoPodChildren = rest;
+      return;
+    }
+    const descriptor = argoDescriptor(resource);
+    if (!descriptor) return;
+    argoPodChildren = { ...argoPodChildren, [key]: { loading: true, pods: [], error: '' } };
+    try {
+      const pods = await invokeRead<ResourceObject[]>('list_workload_pods', {
+        request: {
+          kubeconfigPath: activeKubeconfigPath || kubeconfigPath || null,
+          context: activeCluster,
+          group: descriptor.group,
+          version: descriptor.version,
+          kind: descriptor.kind,
+          plural: descriptor.plural,
+          namespace: resource.namespace,
+          name: resource.name,
+        },
+      });
+      if (argoPodChildren[key]) argoPodChildren = { ...argoPodChildren, [key]: { loading: false, pods, error: '' } };
+    } catch (error) {
+      if (argoPodChildren[key]) argoPodChildren = { ...argoPodChildren, [key]: { loading: false, pods: [], error: String(error).replace(/^Error:\s*/, '') } };
+    }
+  }
+
+  async function openArgoResource(resource: ArgoResource) {
+    const descriptor = argoDescriptor(resource);
+    if (!descriptor) {
+      notify(`${resource.kind} is not served by this cluster's API`);
+      return;
+    }
+    const object: ResourceObject = { name: resource.name, namespace: resource.namespace || undefined };
+    if (descriptor.category === 'Workloads') {
+      await navigateTo('Workloads');
+      await selectWorkloadResource(descriptor);
+    } else {
+      await openTreeResource(descriptor);
+    }
+    await openObject(descriptor, object);
+  }
+
+  async function loadArgoEvents(app: ArgoApp) {
+    const key = `${activeClusterId}|${argoKey(app)}`;
+    argoEventsKey = key;
+    loadingArgoEvents = true;
+    argoEventsError = '';
+    try {
+      const events = await invokeRead<ClusterEvent[]>('read_object_events', {
+        kubeconfigPath: activeKubeconfigPath || kubeconfigPath || null,
+        context: activeCluster,
+        namespace: app.namespace,
+        kind: 'Application',
+        name: app.name,
+      });
+      if (argoEventsKey === key) argoEvents = events;
+    } catch (error) {
+      if (argoEventsKey === key) argoEventsError = String(error).replace(/^Error:\s*/, '');
+    } finally {
+      if (argoEventsKey === key) loadingArgoEvents = false;
+    }
+  }
+
+  async function copyText(value: string, label: string) {
+    try {
+      if ('__TAURI_INTERNALS__' in window) {
+        const { writeText } = await import('@tauri-apps/plugin-clipboard-manager');
+        await writeText(value, { label });
+      } else {
+        await navigator.clipboard.writeText(value);
+      }
+      notify(`Copied ${label}`);
+    } catch (error) {
+      notify(`Could not copy ${label}: ${String(error)}`);
+    }
+  }
+
+  function argoActionOptions(dialog: ArgoDialog) {
+    if (dialog.action === 'sync') {
+      return {
+        ...argoSyncOptions,
+        revision: argoSyncOptions.revision.trim(),
+        resources: (dialog.resources || []).map((resource) => ({ group: resource.group, kind: resource.kind, name: resource.name, namespace: resource.namespace })),
+      };
+    }
+    if (dialog.action === 'rollback') return { historyId: dialog.historyId, prune: argoSyncOptions.prune };
+    if (dialog.action === 'set-auto-sync') return { enabled: Boolean(dialog.enable), ...argoAutoSyncOptions };
+    return {};
+  }
+
   async function runArgoAction() {
-    const target = argoActionTarget;
+    const dialog = argoDialog;
     const resource = argoApplicationResource;
-    if (!target || !resource || runningArgoAction) return;
+    if (!dialog || !resource || runningArgoAction) return;
     runningArgoAction = true;
+    const verb: Record<ArgoAction, string> = { refresh: 'Refresh requested for', 'hard-refresh': 'Hard refresh requested for', sync: dialog.resources?.length ? 'Selective sync started for' : 'Sync started for', rollback: 'Rollback started for', terminate: 'Termination requested for', 'set-auto-sync': dialog.enable ? 'Auto-sync turned on for' : 'Auto-sync turned off for' };
     try {
       const { invoke } = await import('@tauri-apps/api/core');
       await invoke('argocd_application_action', {
@@ -649,16 +862,19 @@
           kubeconfigPath: activeKubeconfigPath || kubeconfigPath || null,
           context: activeCluster,
           version: resource.version,
-          namespace: target.app.namespace,
-          name: target.app.name,
-          action: target.action,
+          namespace: dialog.app.namespace,
+          name: dialog.app.name,
+          action: dialog.action,
+          options: argoActionOptions(dialog),
         },
       });
-      notify(target.action === 'sync' ? `Sync started for ${target.app.name}` : `Refresh requested for ${target.app.name}`);
-      argoActionTarget = null;
+      notify(`${verb[dialog.action]} ${dialog.app.name}`);
+      argoDialog = null;
+      if (dialog.action === 'sync' || dialog.action === 'rollback') argoAppTab = 'sync';
       window.setTimeout(() => void loadArgoApps(true), 1_500);
+      window.setTimeout(() => void loadArgoApps(true), 6_000);
     } catch (error) {
-      notify(`Could not ${target.action} ${target.app.name}: ${String(error).replace(/^Error:\s*/, '')}`);
+      notify(`Could not ${dialog.action.replace(/-/g, ' ')} ${dialog.app.name}: ${String(error).replace(/^Error:\s*/, '')}`);
     } finally {
       runningArgoAction = false;
     }
@@ -1107,7 +1323,7 @@
   }
 
   function hasProtectedWorkflow() {
-    const modalOpen = kubeconfigOpen || commandOpen || Boolean(deletionTarget) || Boolean(argoActionTarget) || runningArgoAction || Boolean(favoriteContextMenu) || Boolean(favoriteRenameId);
+    const modalOpen = kubeconfigOpen || commandOpen || Boolean(deletionTarget) || Boolean(argoDialog) || runningArgoAction || Boolean(favoriteContextMenu) || Boolean(favoriteRenameId);
     const connectionWorkflow = loadingCatalog || deletingResource;
     const resourceWorkflow = Boolean(editorResource || yamlResource || loadingEditor || savingEditor || loadingYaml || savingYaml || loadingRelatedPods || relatedObject);
     const workloadWorkflow = activeView === 'Workloads' && (
@@ -1250,7 +1466,7 @@
   async function restoreVisualQaScenario() {
     if (!import.meta.env.DEV) return false;
     const scenario = new URLSearchParams(window.location.search).get('visual-qa');
-    if (!scenario || (!visualQaRecoveryEnabled && !['overview', 'workloads', 'workloads-first-open', 'workload-details', 'pod-details', 'workload-logs', 'workload-yaml', 'resources', 'custom-apis', 'resources-directory', 'custom-directory', 'overview-large', 'events', 'workloads-large', 'argocd', 'gateway', 'httproute', 'admission-policy', 'configuration', 'configuration-many', 'secret', 'permissions-readonly'].includes(scenario))) return false;
+    if (!scenario || (!visualQaRecoveryEnabled && !['overview', 'workloads', 'workloads-first-open', 'workload-details', 'pod-details', 'workload-logs', 'workload-yaml', 'resources', 'custom-apis', 'resources-directory', 'custom-directory', 'overview-large', 'events', 'workloads-large', 'argocd', 'gateway', 'httproute', 'admission-policy', 'workload-terminal', 'configuration', 'configuration-many', 'secret', 'permissions-readonly'].includes(scenario))) return false;
     const fixtures = await import('./dev/visual-qa-fixtures');
     const qaCluster = fixtures.visualQaCluster as Cluster;
     const directoryScenario = scenario === 'resources-directory' || scenario === 'custom-directory';
@@ -1282,8 +1498,8 @@
       activeView = 'Overview';
       clusterOverview = (scenario === 'overview-large' ? fixtures.visualQaLargeOverview : fixtures.visualQaOverview) as ClusterOverview;
       selectedNodeName = clusterOverview.nodes[0]?.name || '';
-    } else if (scenario === 'workloads' || scenario === 'workloads-large' || scenario === 'workloads-first-open' || scenario === 'workload-details' || scenario === 'pod-details' || scenario === 'workload-logs' || scenario === 'workload-yaml' || scenario === 'recovery-workloads' || scenario === 'recovery-timeout') {
-      const showWorkloadDetail = scenario === 'workload-details' || scenario === 'pod-details' || scenario === 'workload-logs' || scenario === 'workload-yaml';
+    } else if (scenario === 'workloads' || scenario === 'workload-terminal' || scenario === 'workloads-large' || scenario === 'workloads-first-open' || scenario === 'workload-details' || scenario === 'pod-details' || scenario === 'workload-logs' || scenario === 'workload-yaml' || scenario === 'recovery-workloads' || scenario === 'recovery-timeout') {
+      const showWorkloadDetail = scenario === 'workload-terminal' || scenario === 'workload-details' || scenario === 'pod-details' || scenario === 'workload-logs' || scenario === 'workload-yaml';
       const showPodDetail = scenario === 'pod-details';
       activeView = 'Workloads';
       workloadResource = qaResources.find((resource) => resource.kind === (showWorkloadDetail && !showPodDetail ? 'Deployment' : 'Pod')) || null;
@@ -1343,6 +1559,17 @@
               logContainers = ['api', 'telemetry-sidecar'];
               selectedLogContainer = 'api';
               logPorts = [{ container: 'api', name: 'http', port: 8080, protocol: 'TCP' }];
+            } else if (scenario === 'workload-terminal') {
+              workloadDetailMode = 'terminal';
+              terminalPods = (fixtures.visualQaPods as ResourceObject[]).slice(0, 2);
+              terminalTarget = { pod: terminalPods[0].name, namespace: terminalPods[0].namespace || namespace };
+              terminalContainers = ['api', 'telemetry-sidecar'];
+              selectedTerminalContainer = 'api';
+              terminalShellChecked = true;
+              terminalShell = null;
+              terminalAccess = 'direct';
+              terminalCommand = '/app/api --version';
+              terminalOutput = 'exec /app/api --version\napi 3.14.2 (distroless, go1.23)';
             } else if (scenario === 'workload-yaml') {
               yamlResource = workloadResource;
               yamlObject = editorObject;
@@ -1356,6 +1583,8 @@
     } else if (scenario === 'argocd') {
       activeView = 'Argo CD';
       argoApps = fixtures.visualQaArgoApps.map((app) => argoApplication(app));
+      argoSets = fixtures.visualQaArgoSets.map((set) => argoApplicationSet(set, argoApps));
+      argoProjects = fixtures.visualQaArgoProjects.map((project) => argoProject(project, argoApps));
       argoClusterId = qaCluster.id;
       selectedArgoKey = 'argocd/billing-api';
     } else if (extendedScenario) {
@@ -3820,7 +4049,105 @@
     loadingTerminalPods = false;
     loadingTerminalRuntime = false;
     runningTerminalCommand = false;
+    resetTerminalAccess();
     schedulePendingResumeRecovery();
+  }
+
+  function loadDebugImage() {
+    try {
+      return window.localStorage.getItem(debugImageStorageKey) || 'busybox:1.36';
+    } catch {
+      return 'busybox:1.36';
+    }
+  }
+
+  function rememberDebugImage(image: string) {
+    try {
+      window.localStorage.setItem(debugImageStorageKey, image);
+    } catch {
+      // Only a convenience; the field keeps its value for this session.
+    }
+  }
+
+  function resetTerminalAccess() {
+    shellInspectGeneration += 1;
+    terminalAccess = 'shell';
+    terminalShell = null;
+    inspectingShell = false;
+    terminalShellChecked = false;
+    terminalDebugContainers = [];
+    activeDebugContainer = null;
+    debugShell = null;
+    startingDebugContainer = false;
+  }
+
+  function terminalRequestBase() {
+    return {
+      kubeconfigPath: activeKubeconfigPath || kubeconfigPath || null,
+      context: activeCluster,
+      namespace: terminalTarget?.namespace || '',
+      pod: terminalTarget?.pod || '',
+    };
+  }
+
+  async function inspectTerminalShell() {
+    if (!terminalTarget) return;
+    const generation = ++shellInspectGeneration;
+    const container = selectedTerminalContainer;
+    inspectingShell = true;
+    terminalShellChecked = false;
+    terminalShell = null;
+    activeDebugContainer = null;
+    debugShell = null;
+    try {
+      const info = await invokeRead<ContainerShellInfo>('inspect_container_shell', { request: { ...terminalRequestBase(), container: container || null } });
+      if (generation !== shellInspectGeneration) return;
+      terminalShell = info.shell || null;
+      terminalDebugContainers = info.debugContainers;
+      const reusable = info.debugContainers.find((candidate) => candidate.running && (!candidate.target || candidate.target === container));
+      if (reusable) {
+        activeDebugContainer = reusable;
+        debugShell = '/bin/sh';
+      }
+      terminalAccess = terminalShell ? 'shell' : reusable ? 'debug' : 'direct';
+      terminalOutput = '';
+    } catch (error) {
+      if (generation !== shellInspectGeneration) return;
+      // Detection is best effort; keep the classic /bin/sh behaviour if it fails.
+      terminalShell = '/bin/sh';
+      terminalAccess = 'shell';
+      terminalOutput = `Could not detect a shell: ${String(error).replace(/^Error:\s*/, '')}`;
+    } finally {
+      if (generation === shellInspectGeneration) {
+        inspectingShell = false;
+        terminalShellChecked = true;
+      }
+    }
+  }
+
+  async function startDebugContainer() {
+    const image = debugImage.trim();
+    if (!terminalTarget || !image || startingDebugContainer) return;
+    startingDebugContainer = true;
+    rememberDebugImage(image);
+    terminalOutput = `Adding debug container (${image}) to ${terminalTarget.pod}… pulling the image can take a minute.`;
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+      const info = await invoke<DebugContainerInfo>('start_debug_container', {
+        request: { ...terminalRequestBase(), targetContainer: selectedTerminalContainer || null, image },
+      });
+      activeDebugContainer = info;
+      terminalDebugContainers = [...terminalDebugContainers.filter((candidate) => candidate.name !== info.name), info];
+      const shellInfo = await invokeRead<ContainerShellInfo>('inspect_container_shell', { request: { ...terminalRequestBase(), container: info.name } });
+      debugShell = shellInfo.shell || '/bin/sh';
+      terminalAccess = 'debug';
+      terminalCommand = 'ps aux; ls /proc/1/root';
+      terminalOutput = `Debug container ${info.name} is running${info.target ? ` and shares ${info.target}'s processes` : ''}.\nThe target's filesystem is visible under /proc/<pid>/root (usually /proc/1/root).`;
+    } catch (error) {
+      terminalOutput = `Could not start a debug container: ${String(error).replace(/^Error:\s*/, '')}`;
+    } finally {
+      startingDebugContainer = false;
+    }
   }
 
   async function listWorkloadPods(resource: ResourceDescriptor, object: ResourceObject) {
@@ -3874,6 +4201,7 @@
     }
     if (!await mayUsePodSubresource('create', 'exec', object)) return;
     terminalTarget = { pod: object.name, namespace: podNamespace };
+    resetTerminalAccess();
     terminalContainers = [];
     terminalPorts = [];
     selectedTerminalContainer = '';
@@ -3893,6 +4221,7 @@
     } finally {
       loadingTerminalRuntime = false;
     }
+    if (terminalTarget) void inspectTerminalShell();
   }
 
   async function openWorkloadTerminal(resource: ResourceDescriptor, object: ResourceObject) {
@@ -3914,6 +4243,10 @@
     }
   }
 
+  function terminalPrompt() {
+    return terminalAccess === 'direct' ? 'exec' : terminalAccess === 'debug' ? `debug$` : '$';
+  }
+
   async function runTerminalCommand() {
     if (!terminalTarget || !terminalCommand.trim()) return;
     runningTerminalCommand = true;
@@ -3921,19 +4254,19 @@
       const { invoke } = await import('@tauri-apps/api/core');
       const response = await invoke<PodExecResponse>('exec_pod_command', {
         request: {
-          kubeconfigPath: activeKubeconfigPath || kubeconfigPath || null,
-          context: activeCluster,
-          namespace: terminalTarget.namespace,
-          pod: terminalTarget.pod,
-          container: selectedTerminalContainer || null,
+          ...terminalRequestBase(),
+          container: (terminalAccess === 'debug' ? activeDebugContainer?.name : selectedTerminalContainer) || null,
           command: terminalCommand,
+          mode: terminalAccess === 'direct' ? 'direct' : 'shell',
+          shell: terminalAccess === 'debug' ? debugShell : terminalShell,
         },
       });
       const output = `${response.stdout || ''}${response.stderr ? `${response.stdout ? '\n' : ''}${response.stderr}` : ''}`.trimEnd();
-      terminalOutput = `$ ${terminalCommand}\n${output || '(command completed without output)'}`;
+      const exit = response.exitCode ? `\n[exit code ${response.exitCode}]` : '';
+      terminalOutput = `${terminalPrompt()} ${terminalCommand}\n${output || '(command completed without output)'}${exit}`;
     } catch (error) {
       refreshPermissionsAfterFailure(error, workloadResource);
-      terminalOutput = `$ ${terminalCommand}\n${String(error)}`;
+      terminalOutput = `${terminalPrompt()} ${terminalCommand}\n${String(error).replace(/^Error:\s*/, '')}`;
     } finally {
       runningTerminalCommand = false;
     }
@@ -5559,13 +5892,149 @@
         </section>
       {:else if activeView === 'Argo CD'}
         <section class="argo-page panel">
+          {#if !(argoTab === 'apps' && selectedArgoApp)}
           <header class="argo-heading">
-            <div><p class="events-scope">Applications from {argoApplicationResource?.apiVersion || 'argoproj.io'} across all namespaces{argoClusterId === activeClusterId && argoApps.length ? ` · ${argoApps.length} total` : ''}.</p></div>
+            <div class="argo-tabs" role="tablist" aria-label="Argo CD resources"><button type="button" role="tab" aria-selected={argoTab === 'apps'} on:click={() => (argoTab = 'apps')}>Applications<b>{argoApps.length}</b></button>{#if argoSetResource}<button type="button" role="tab" aria-selected={argoTab === 'sets'} on:click={() => (argoTab = 'sets')}>ApplicationSets<b>{argoSets.length}</b></button>{/if}{#if argoProjectResource}<button type="button" role="tab" aria-selected={argoTab === 'projects'} on:click={() => (argoTab = 'projects')}>Projects<b>{argoProjects.length}</b></button>{/if}</div>
             <div class="argo-heading-controls">
-              <div class="argo-segmented" role="group" aria-label="Application filter"><button type="button" aria-pressed={argoFilter === 'all'} on:click={() => (argoFilter = 'all')}>All</button><button type="button" aria-pressed={argoFilter === 'attention'} on:click={() => (argoFilter = 'attention')}>Needs attention{#if argoSummary.attention.length}<b>{argoSummary.attention.length}</b>{/if}</button></div>
-              <label class="argo-search"><Search size={13} /><input bind:value={argoSearch} placeholder="Filter applications" aria-label="Filter Argo CD applications" spellcheck="false" /></label>
+              {#if argoTab === 'apps'}<div class="argo-segmented" role="group" aria-label="Application filter"><button type="button" aria-pressed={argoFilter === 'all'} on:click={() => (argoFilter = 'all')}>All</button><button type="button" aria-pressed={argoFilter === 'attention'} on:click={() => (argoFilter = 'attention')}>Needs attention{#if argoSummary.attention.length}<b>{argoSummary.attention.length}</b>{/if}</button></div>{/if}
+              <label class="argo-search"><Search size={13} /><input bind:value={argoSearch} placeholder={argoTab === 'apps' ? 'Filter applications' : argoTab === 'sets' ? 'Filter ApplicationSets' : 'Filter projects'} aria-label="Filter Argo CD resources" spellcheck="false" /></label>
             </div>
           </header>
+          {/if}
+          {#if argoScopeNote}<p class="terminal-access-note argo-scope-note">{argoScopeNote}</p>{/if}
+          {#if argoTab === 'apps' && selectedArgoApp}
+            {@const app = selectedArgoApp}
+            <div class="argo-app">
+              <header class="argo-app-header">
+                <button type="button" class="argo-back" on:click={() => (selectedArgoKey = '')}><ArrowLeft size={14} />Applications</button>
+                <div class="argo-app-title"><span class="argo-app-mark"><GitBranch size={18} /></span><div><h2>{app.name}</h2><small>{app.project} · {app.namespace}{app.owner ? ` · from ApplicationSet ${app.owner}` : ''}</small></div></div>
+                <div class="argo-app-actions">
+                  <button type="button" class="secondary" title="Compare with Git again" on:click={() => openArgoDialog({ action: 'refresh', app })}><RefreshCw size={13} />Refresh</button>
+                  <button type="button" class="secondary" title={app.automated ? 'Turn auto-sync off' : 'Turn auto-sync on'} on:click={() => openArgoDialog({ action: 'set-auto-sync', app, enable: !app.automated })}><Zap size={13} />{app.automated ? 'Auto-sync on' : 'Auto-sync off'}</button>
+                  {#if app.operation === 'Running'}<button type="button" class="destructive" on:click={() => openArgoDialog({ action: 'terminate', app })}><Ban size={13} />Terminate</button>{/if}
+                  <button type="button" class="primary" disabled={app.operation === 'Running'} title={app.operation === 'Running' ? 'A sync is already running' : 'Sync to the target revision'} on:click={() => openArgoDialog({ action: 'sync', app })}><GitBranch size={13} />Sync</button>
+                </div>
+              </header>
+              <div class="argo-status-strip">
+                <div class="argo-status-card argo-tone-{argoTone(app.health)}"><span class="argo-status-icon"><svelte:component this={argoHealthIcon(app.health)} size={20} /></span><div><small>App health</small><strong>{app.health}</strong><em>{app.resources.find((resource) => resource.healthMessage && resource.health !== 'Healthy')?.healthMessage || `${app.resources.filter((resource) => resource.health === 'Healthy').length} of ${app.resources.filter((resource) => resource.health).length} resources healthy`}</em></div></div>
+                <div class="argo-status-card argo-tone-{argoTone(app.sync)}"><span class="argo-status-icon"><svelte:component this={argoSyncIcon(app.sync)} size={20} /></span><div><small>Sync status</small><strong>{app.sync}{#if app.revision}<code>{app.revision}</code>{/if}</strong><em>{app.sync === 'OutOfSync' ? `${app.resources.filter((resource) => resource.sync === 'OutOfSync').length} resources differ from ${app.sources[0]?.targetRevision || 'Git'}` : `Tracking ${app.sources[0]?.targetRevision || 'HEAD'}`} · {app.automated ? 'auto-sync' : 'manual sync'}</em></div></div>
+                <div class="argo-status-card argo-tone-{argoTone(app.operation)}"><span class="argo-status-icon">{#if app.operation === 'Running'}<LoaderCircle size={20} class="animate-spin" />{:else}<Clock size={20} />{/if}</span><div><small>Last sync</small><strong>{app.operation || 'Never synced'}</strong><em>{app.lastOperation ? `${app.lastOperation.finishedAt ? `${resourceAge(app.lastOperation.finishedAt)} ago` : 'in progress'} · by ${app.lastOperation.initiatedBy}${app.lastOperation.dryRun ? ' · dry run' : ''}` : 'No operation recorded'}</em></div></div>
+              </div>
+              <div class="argo-app-tabs" role="tablist" aria-label="Application sections">
+                {#each [['overview', 'Overview'], ['resources', `Resources ${app.resources.length}`], ['sync', 'Last sync'], ['history', `History ${app.history.length}`], ['events', 'Events']] as [tab, label]}<button type="button" role="tab" aria-selected={argoAppTab === tab} on:click={() => (argoAppTab = tab as ArgoAppTab)}>{label}</button>{/each}
+              </div>
+              <div class="argo-app-body">
+                {#if argoAppTab === 'overview'}
+                  <div class="argo-overview-grid">
+                    {#if argoProblemResources.length || app.conditions.length}
+                      <section class="argo-card argo-card-wide argo-card-attention">
+                        <header><strong>Needs attention</strong><small>{argoProblemResources.length} resource{argoProblemResources.length === 1 ? '' : 's'}{app.conditions.length ? ` · ${app.conditions.length} condition${app.conditions.length === 1 ? '' : 's'}` : ''}</small></header>
+                        {#each app.conditions as condition}<p class="argo-condition">{condition}</p>{/each}
+                        <div class="argo-problem-list">{#each argoProblemResources.slice(0, 8) as resource}<button type="button" on:click={() => { argoAppTab = 'resources'; argoResourceSearch = resource.name; }}><span class="argo-kind">{resource.kind}</span><strong>{resource.name}</strong>{#if resource.sync === 'OutOfSync'}<b class="ov-status ov-status-warn">OutOfSync</b>{/if}{#if ['Degraded', 'Missing'].includes(resource.health)}<b class="ov-status ov-status-bad">{resource.health}</b>{/if}{#if resource.requiresPruning}<b class="ov-status ov-status-none">Prune</b>{/if}{#if resource.healthMessage}<small>{resource.healthMessage}</small>{/if}</button>{/each}</div>
+                      </section>
+                    {/if}
+                    {#each app.sources as source, index}
+                      <section class="argo-card">
+                        <header><strong>Source{app.sources.length > 1 ? ` ${index + 1}` : ''}</strong><b class="argo-type-badge">{source.type}</b></header>
+                        <dl class="argo-facts"><div><dt>Repository</dt><dd class="argo-copyable"><span title={source.repoURL}>{source.repo || '—'}</span>{#if source.repoURL}<button type="button" aria-label="Copy repository URL" on:click={() => copyText(source.repoURL, 'repository URL')}><Copy size={12} /></button>{/if}</dd></div>{#if source.chart}<div><dt>Chart</dt><dd>{source.chart}</dd></div>{:else}<div><dt>Path</dt><dd><code>{source.path || '.'}</code></dd></div>{/if}<div><dt>Target revision</dt><dd><code>{source.targetRevision}</code></dd></div>{#if source.valueFiles.length}<div><dt>Value files</dt><dd>{#each source.valueFiles as file}<code>{file}</code>{/each}</dd></div>{/if}</dl>
+                        {#if source.parameters.length}<div class="argo-parameters"><span>Parameters</span>{#each source.parameters as parameter}<div><code>{parameter.name}</code><b title={parameter.value}>{parameter.value}</b></div>{/each}</div>{/if}
+                      </section>
+                    {/each}
+                    <section class="argo-card">
+                      <header><strong>Destination</strong>{#if app.inCluster}<b class="argo-type-badge">This cluster</b>{/if}</header>
+                      <dl class="argo-facts"><div><dt>Cluster</dt><dd>{app.destination.split(' / ')[0]}</dd></div><div><dt>Namespace</dt><dd>{app.destinationNamespace || '—'}</dd></div><div><dt>Sync policy</dt><dd>{app.automated ? `Automated${app.automated.prune ? ' · prune' : ''}${app.automated.selfHeal ? ' · self-heal' : ''}` : 'Manual'}</dd></div>{#if app.syncOptions.length}<div><dt>Sync options</dt><dd>{#each app.syncOptions as option}<code>{option}</code>{/each}</dd></div>{/if}<div><dt>Created</dt><dd>{app.createdAt ? `${resourceAge(app.createdAt)} ago` : '—'}</dd></div>{#if app.reconciledAt}<div><dt>Reconciled</dt><dd>{resourceAge(app.reconciledAt)} ago</dd></div>{/if}</dl>
+                    </section>
+                    {#if app.images.length}
+                      <section class="argo-card"><header><strong>Images</strong><small>{app.images.length}</small></header><div class="argo-chip-list">{#each app.images as image}<code title={image}>{image}</code>{/each}</div></section>
+                    {/if}
+                    {#if app.externalURLs.length}
+                      <section class="argo-card"><header><strong>Links</strong><small>From Ingress and Service status</small></header><div class="argo-link-list">{#each app.externalURLs as url}<div><span title={url}>{url}</span><button type="button" aria-label={`Copy ${url}`} on:click={() => copyText(url, 'link')}><Copy size={12} /></button></div>{/each}</div></section>
+                    {/if}
+                    <section class="argo-card">
+                      <header><strong>Resources</strong><small>{app.resources.length} managed</small></header>
+                      <div class="argo-mini-stats">
+                        <div><span>Healthy</span><strong>{app.resources.filter((resource) => resource.health === 'Healthy').length}</strong></div>
+                        <div><span>Out of sync</span><strong class:argo-text-warn={app.resources.some((resource) => resource.sync === 'OutOfSync')}>{app.resources.filter((resource) => resource.sync === 'OutOfSync').length}</strong></div>
+                        <div><span>Degraded</span><strong class:argo-text-bad={app.resources.some((resource) => ['Degraded', 'Missing'].includes(resource.health))}>{app.resources.filter((resource) => ['Degraded', 'Missing'].includes(resource.health)).length}</strong></div>
+                      </div>
+                      <button type="button" class="argo-link-button" on:click={() => (argoAppTab = 'resources')}>View resource tree →</button>
+                    </section>
+                  </div>
+                {:else if argoAppTab === 'resources'}
+                  <div class="argo-resource-toolbar">
+                    <div class="argo-segmented" role="group" aria-label="Resource filter">
+                      {#each [['all', 'All', app.resources.length], ['outofsync', 'Out of sync', app.resources.filter((resource) => resource.sync === 'OutOfSync').length], ['unhealthy', 'Unhealthy', app.resources.filter((resource) => ['Degraded', 'Missing', 'Progressing', 'Suspended'].includes(resource.health)).length], ['prune', 'Needs prune', app.resources.filter((resource) => resource.requiresPruning).length]] as [value, label, count]}<button type="button" aria-pressed={argoResourceFilter === value} on:click={() => (argoResourceFilter = value as typeof argoResourceFilter)}>{label}<i>{count}</i></button>{/each}
+                    </div>
+                    <label class="argo-search"><Search size={13} /><input bind:value={argoResourceSearch} placeholder="Filter resources" aria-label="Filter application resources" spellcheck="false" /></label>
+                  </div>
+                  <div class="argo-tree">
+                    <div class="argo-tree-root"><span class="argo-app-mark"><GitBranch size={14} /></span><strong>{app.name}</strong><span class="argo-badge argo-tone-{argoTone(app.health)}"><svelte:component this={argoHealthIcon(app.health)} size={12} />{app.health}</span><span class="argo-badge argo-tone-{argoTone(app.sync)}"><svelte:component this={argoSyncIcon(app.sync)} size={12} />{app.sync}</span></div>
+                    {#each argoResourceGroups as [kind, resources]}
+                      <div class="argo-tree-group">
+                        <button type="button" class="argo-tree-kind" aria-expanded={!collapsedArgoKinds[kind]} on:click={() => (collapsedArgoKinds = { ...collapsedArgoKinds, [kind]: !collapsedArgoKinds[kind] })}><ChevronRight size={13} class={collapsedArgoKinds[kind] ? '' : 'argo-chevron-open'} /><strong>{kind}</strong><small>{resources.length}</small>{#if resources.some((resource) => ['Degraded', 'Missing'].includes(resource.health))}<b class="ov-dot ov-dot-bad"></b>{:else if resources.some((resource) => resource.sync === 'OutOfSync')}<b class="ov-dot argo-dot-warn"></b>{/if}</button>
+                        {#if !collapsedArgoKinds[kind]}
+                          {#each resources as resource (argoResourceKey(resource))}
+                            {@const pods = argoPodChildren[argoResourceKey(resource)]}
+                            <div class="argo-tree-node">
+                              <div class="argo-node-row">
+                                {#if argoHasPods(app, resource)}<button type="button" class="argo-node-toggle" aria-label={pods ? `Hide Pods for ${resource.name}` : `Show Pods for ${resource.name}`} on:click={() => toggleArgoPods(resource)}><ChevronRight size={12} class={pods ? 'argo-chevron-open' : ''} /></button>{:else}<span class="argo-node-toggle"></span>{/if}
+                                <span class="argo-node-health argo-tone-{argoTone(resource.health || 'Unknown')}" title={resource.health || 'No health check'}><svelte:component this={resource.health ? argoHealthIcon(resource.health) : CircleCheck} size={14} /></span>
+                                <div class="argo-node-name"><strong>{resource.name}</strong><small>{resource.namespace || 'cluster-scoped'}{resource.hook ? ' · hook' : ''}{resource.healthMessage ? ` · ${resource.healthMessage}` : ''}</small></div>
+                                <span class="argo-badge argo-tone-{argoTone(resource.sync)}"><svelte:component this={argoSyncIcon(resource.sync)} size={12} />{resource.sync || 'Unknown'}</span>
+                                {#if resource.requiresPruning}<span class="argo-badge argo-tone-none">Prune</span>{/if}
+                                <div class="argo-node-actions">
+                                  <button type="button" title={`Sync only ${resource.kind} ${resource.name}`} disabled={app.operation === 'Running'} on:click={() => openArgoDialog({ action: 'sync', app, resources: [resource] })}>Sync</button>
+                                  {#if app.inCluster && argoDescriptor(resource)}<button type="button" title="Open in Kuberniva" on:click={() => openArgoResource(resource)}>Open →</button>{/if}
+                                </div>
+                              </div>
+                              {#if pods}
+                                <div class="argo-pod-children">
+                                  {#if pods.loading}<p>Finding Pods…</p>{:else if pods.error}<p>{pods.error}</p>{:else if !pods.pods.length}<p>No live Pods.</p>{:else}
+                                    {#each pods.pods as pod}<button type="button" class="argo-pod-row" title="Open logs" on:click={() => openPodLogs(pod, pods.pods, `Argo CD · ${app.name}`)}><span class="ov-dot ov-dot-{workloadStatusTone(pod).includes('bad') || workloadStatusTone(pod).includes('error') ? 'bad' : (pod.status === 'Running' || pod.status === 'Succeeded') ? 'ok' : 'none'}"></span><strong>{pod.name}</strong><small>{pod.status || '—'} · {podContainerSummary(pod)} ready · {pod.restarts ?? 0} restarts · {resourceAge(pod.createdAt)}</small><em>Logs →</em></button>{/each}
+                                  {/if}
+                                </div>
+                              {/if}
+                            </div>
+                          {/each}
+                        {/if}
+                      </div>
+                    {:else}<div class="argo-empty"><strong>No resources match</strong><small>Try another filter.</small></div>{/each}
+                  </div>
+                {:else if argoAppTab === 'sync'}
+                  {#if app.lastOperation}
+                    {@const op = app.lastOperation}
+                    <section class="argo-card argo-sync-summary">
+                      <div class="argo-sync-headline"><span class="argo-badge argo-tone-{argoTone(op.phase)}">{op.phase}</span>{#if op.dryRun}<span class="argo-badge argo-tone-none">Dry run</span>{/if}{#if op.prune}<span class="argo-badge argo-tone-none">Prune</span>{/if}<p>{op.message || 'No message'}</p></div>
+                      <dl class="argo-facts argo-facts-inline"><div><dt>Revision</dt><dd><code>{op.revision || '—'}</code></dd></div><div><dt>Started</dt><dd>{op.startedAt ? `${resourceAge(op.startedAt)} ago` : '—'}</dd></div><div><dt>Duration</dt><dd>{op.startedAt ? argoDuration(op.startedAt, op.finishedAt) : '—'}</dd></div><div><dt>Initiated by</dt><dd>{op.initiatedBy}</dd></div>{#if op.retryCount}<div><dt>Retries</dt><dd>{op.retryCount}</dd></div>{/if}</dl>
+                    </section>
+                    <section class="argo-card">
+                      <header><strong>Result per resource</strong><small>{op.results.length}</small></header>
+                      {#if op.results.length}<div class="argo-result-table"><div class="argo-result-row argo-result-head"><span>Resource</span><span>Phase</span><span>Result</span><span>Message</span></div>{#each op.results as result}<div class="argo-result-row"><span><small class="argo-kind">{result.kind}</small>{result.name}</span><span>{result.hookPhase || result.syncPhase || '—'}</span><span><b class="ov-status ov-status-{result.status === 'Synced' || result.status === 'Pruned' ? 'ok' : result.status === 'SyncFailed' ? 'bad' : 'none'}">{result.status || '—'}</b></span><span class="argo-result-message" title={result.message}>{result.message || '—'}</span></div>{/each}</div>{:else}<p class="gw-empty">No per-resource results were recorded.</p>{/if}
+                    </section>
+                  {:else}<div class="argo-empty"><Clock size={22} /><strong>No sync has run yet</strong><small>Use Sync to apply the target revision.</small></div>{/if}
+                {:else if argoAppTab === 'history'}
+                  {#if app.history.length}
+                    <ol class="argo-history">
+                      {#each app.history as entry, index}
+                        <li class:argo-history-current={index === 0}>
+                          <span class="argo-history-dot"></span>
+                          <div class="argo-history-body"><div><strong>#{entry.id}</strong><code>{entry.revision || '—'}</code>{#if index === 0}<span class="argo-badge argo-tone-ok">Current</span>{/if}</div><small>{entry.deployedAt ? `Deployed ${resourceAge(entry.deployedAt)} ago` : 'Deploy time unknown'}{entry.startedAt && entry.deployedAt ? ` · took ${argoDuration(entry.startedAt, entry.deployedAt)}` : ''} · by {entry.initiatedBy}</small>{#if entry.source}<small class="argo-muted" title={entry.source}>{entry.source}</small>{/if}</div>
+                          {#if index > 0}<button type="button" class="secondary" disabled={Boolean(app.automated) || app.operation === 'Running'} title={app.automated ? 'Turn off auto-sync first; Argo CD would sync forward again' : `Roll back to #${entry.id}`} on:click={() => openArgoDialog({ action: 'rollback', app, historyId: entry.id, revision: entry.revision })}><Undo2 size={13} />Roll back</button>{/if}
+                        </li>
+                      {/each}
+                    </ol>
+                  {:else}<div class="argo-empty"><Clock size={22} /><strong>No deployment history</strong><small>Argo CD records each successful sync here.</small></div>{/if}
+                {:else}
+                  {#if loadingArgoEvents && !argoEvents.length}<div class="drawer-state"><i></i>Reading events…</div>
+                  {:else if argoEventsError}<div class="argo-empty"><strong>Events could not be loaded</strong><small>{argoEventsError}</small></div>
+                  {:else if !argoEvents.length}<div class="argo-empty"><ScrollText size={22} /><strong>No recent events</strong><small>Kubernetes keeps events for about an hour.</small></div>
+                  {:else}
+                    <div class="argo-events">{#each argoEvents as event}<div class:argo-event-warning={event.eventType === 'Warning'} class="argo-event"><span class="ov-dot ov-dot-{event.eventType === 'Warning' ? 'bad' : 'ok'}"></span><div><strong>{event.reason || event.eventType}</strong><p>{event.message || ''}</p></div><small>{event.lastObserved ? `${resourceAge(event.lastObserved)} ago` : ''}{event.count && event.count > 1 ? ` · ×${event.count}` : ''}</small></div>{/each}</div>
+                  {/if}
+                {/if}
+              </div>
+            </div>
+          {:else if argoTab === 'apps'}
           <div class="ov-kpis argo-kpis">
             <div class="ov-kpi"><span>Applications</span><strong>{argoSummary.total}</strong><em>{argoSummary.progressing} progressing</em></div>
             <div class:ov-kpi-warn={argoSummary.outOfSync > 0} class="ov-kpi"><span>Synced</span><strong>{argoSummary.synced}<small>/{argoSummary.total}</small></strong><em>{argoSummary.outOfSync} out of sync</em></div>
@@ -5579,36 +6048,68 @@
           {:else if !visibleArgoApps.length}
             <div class="argo-empty"><GitBranch size={22} /><strong>{argoApps.length ? (argoFilter === 'attention' && !argoSearch ? 'No applications need attention' : 'No applications match') : 'No Argo CD applications found'}</strong><small>{argoApps.length ? 'Try another filter.' : 'Applications you can list will appear here.'}</small></div>
           {:else}
-            <div class:argo-body-detail={selectedArgoApp} class="argo-body">
+            <div class="argo-body">
               <div class="argo-table" role="table" aria-label="Argo CD applications">
-                <div class="argo-row argo-row-head" role="row"><span>Application</span><span>Sync</span><span>Health</span><span>Last sync</span>{#if !selectedArgoApp}<span>Destination</span>{/if}</div>
+                <div class="argo-row argo-app-row argo-row-head" role="row"><span>Application</span><span>Health</span><span>Sync</span><span>Last sync</span><span>Source</span><span>Destination</span></div>
                 {#each visibleArgoApps as app (argoKey(app))}
-                  <button type="button" role="row" class:argo-row-selected={selectedArgoKey === argoKey(app)} class="argo-row" on:click={() => (selectedArgoKey = selectedArgoKey === argoKey(app) ? '' : argoKey(app))}>
+                  <button type="button" role="row" class="argo-row argo-app-row" on:click={() => openArgoApp(app)}>
                     <span class="argo-app-name"><strong>{app.name}</strong><small>{app.project}{app.attention.length ? ` · ${app.attention.join(', ')}` : ''}</small></span>
-                    <span><b class="ov-status ov-status-{argoTone(app.sync)}">{app.sync}</b></span>
-                    <span><b class="ov-status ov-status-{argoTone(app.health)}">{app.health}</b></span>
-                    <span><b class="ov-status ov-status-{argoTone(app.operation)}">{app.operation || '—'}</b></span>
-                    {#if !selectedArgoApp}<span class="argo-muted" title={app.destination}>{app.destination}</span>{/if}
+                    <span><span class="argo-badge argo-tone-{argoTone(app.health)}"><svelte:component this={argoHealthIcon(app.health)} size={12} />{app.health}</span></span>
+                    <span><span class="argo-badge argo-tone-{argoTone(app.sync)}"><svelte:component this={argoSyncIcon(app.sync)} size={12} />{app.sync}</span></span>
+                    <span class="argo-muted">{app.operation || '—'}{app.lastOperation?.finishedAt ? ` · ${resourceAge(app.lastOperation.finishedAt)}` : ''}</span>
+                    <span class="argo-muted" title={app.source}>{app.source}</span>
+                    <span class="argo-muted" title={app.destination}>{app.destination}</span>
                   </button>
                 {/each}
               </div>
-              {#if selectedArgoApp}
-                {@const app = selectedArgoApp}
-                <aside class="argo-details" aria-label={`${app.name} details`}>
-                  <header><div><strong>{app.name}</strong><small>{app.namespace} · {app.project}</small></div><button type="button" class="argo-close" aria-label="Close application details" on:click={() => (selectedArgoKey = '')}>×</button></header>
-                  <div class="argo-actions"><button type="button" class="secondary" on:click={() => (argoActionTarget = { app, action: 'refresh' })}><RefreshCw size={13} />Refresh</button><button type="button" class="primary" disabled={app.operation === 'Running'} title={app.operation === 'Running' ? 'A sync is already running' : 'Sync to the target revision'} on:click={() => (argoActionTarget = { app, action: 'sync' })}><GitBranch size={13} />Sync</button></div>
-                  {#if app.attention.length}<div class="argo-attention">{#each app.attention as reason}<span>{reason}</span>{/each}</div>{/if}
-                  <dl class="argo-properties">
-                    <div><dt>Sync</dt><dd><b class="ov-status ov-status-{argoTone(app.sync)}">{app.sync}</b>{#if app.revision}<code>{app.revision}</code>{/if}</dd></div>
-                    <div><dt>Health</dt><dd><b class="ov-status ov-status-{argoTone(app.health)}">{app.health}</b></dd></div>
-                    <div><dt>Source</dt><dd title={app.source}>{app.source}</dd></div>
-                    <div><dt>Destination</dt><dd>{app.destination}</dd></div>
-                    <div><dt>Sync policy</dt><dd>{app.autoSync}</dd></div>
-                    <div><dt>Last sync</dt><dd>{app.operation || '—'}{#if app.operationMessage}<small>{app.operationMessage}</small>{/if}</dd></div>
-                    {#if app.reconciledAt}<div><dt>Reconciled</dt><dd>{resourceAge(app.reconciledAt)} ago</dd></div>{/if}
-                  </dl>
-                  {#if app.conditions.length}<section class="argo-section"><strong>Conditions</strong>{#each app.conditions as condition}<p>{condition}</p>{/each}</section>{/if}
-                  {#if app.resources.length}<section class="argo-section"><strong>Resources <small>{app.resources.length}</small></strong><div class="argo-resources">{#each app.resources as item}<div><span title={`${item.kind} ${item.namespace ? `${item.namespace}/` : ''}${item.name}`}><small>{item.kind}</small>{item.name}</span><b class="ov-status ov-status-{argoTone(item.sync)}">{item.sync || '—'}</b>{#if item.health}<b class="ov-status ov-status-{argoTone(item.health)}">{item.health}</b>{/if}</div>{/each}</div></section>{/if}
+            </div>
+          {/if}
+          {:else if argoTab === 'sets'}
+            <div class:argo-body-detail={selectedArgoSet} class="argo-body">
+              <div class="argo-table" role="table" aria-label="Argo CD ApplicationSets">
+                <div class="argo-row argo-set-row argo-row-head" role="row"><span>ApplicationSet</span><span>Generators</span><span>Apps</span><span>Status</span></div>
+                {#each visibleArgoSets as set (`${set.namespace}/${set.name}`)}
+                  <button type="button" role="row" class:argo-row-selected={selectedArgoSetKey === `${set.namespace}/${set.name}`} class="argo-row argo-set-row" on:click={() => (selectedArgoSetKey = selectedArgoSetKey === `${set.namespace}/${set.name}` ? '' : `${set.namespace}/${set.name}`)}>
+                    <span class="argo-app-name"><strong>{set.name}</strong><small>{set.project} · {set.namespace}</small></span>
+                    <span class="argo-muted">{set.generators.join(', ') || '—'}</span>
+                    <span>{set.generated}</span>
+                    <span><b class="ov-status ov-status-{set.attention.length ? 'bad' : 'ok'}">{set.attention.length ? 'Error' : 'Healthy'}</b></span>
+                  </button>
+                {:else}<div class="argo-empty"><GitBranch size={22} /><strong>{argoSets.length ? 'No ApplicationSets match' : 'No ApplicationSets found'}</strong></div>{/each}
+              </div>
+              {#if selectedArgoSet}
+                {@const set = selectedArgoSet}
+                <aside class="argo-details" aria-label={`${set.name} details`}>
+                  <header><div><strong>{set.name}</strong><small>{set.namespace} · ApplicationSet</small></div><button type="button" class="argo-close" aria-label="Close ApplicationSet details" on:click={() => (selectedArgoSetKey = '')}>×</button></header>
+                  {#if set.attention.length}<div class="argo-attention">{#each set.attention as reason}<span>{reason}</span>{/each}</div>{/if}
+                  <dl class="argo-properties"><div><dt>Generators</dt><dd>{set.generators.join(', ') || '—'}</dd></div><div><dt>Template name</dt><dd><code>{set.template}</code></dd></div><div><dt>Project</dt><dd>{set.project}</dd></div><div><dt>Sync policy</dt><dd>{set.policy}</dd></div><div><dt>Applications</dt><dd>{set.generated}</dd></div></dl>
+                  {#if set.conditions.length}<section class="argo-section"><strong>Conditions</strong><div class="argo-resources">{#each set.conditions as condition}<div><span title={condition.message}>{condition.type}{#if condition.message}<small> · {condition.message}</small>{/if}</span><b class="ov-status ov-status-{condition.ok ? 'ok' : 'bad'}">{condition.ok ? 'OK' : 'Check'}</b></div>{/each}</div></section>{/if}
+                  {#if argoApps.some((app) => app.owner === set.name)}<section class="argo-section"><strong>Generated applications</strong><div class="argo-resources">{#each argoApps.filter((app) => app.owner === set.name) as app}<div><span>{app.name}</span><b class="ov-status ov-status-{argoTone(app.sync)}">{app.sync}</b><b class="ov-status ov-status-{argoTone(app.health)}">{app.health}</b></div>{/each}</div></section>{/if}
+                </aside>
+              {/if}
+            </div>
+          {:else}
+            <div class:argo-body-detail={selectedArgoProject} class="argo-body">
+              <div class="argo-table" role="table" aria-label="Argo CD projects">
+                <div class="argo-row argo-set-row argo-row-head" role="row"><span>Project</span><span>Destinations</span><span>Apps</span><span>Roles</span></div>
+                {#each visibleArgoProjects as project (`${project.namespace}/${project.name}`)}
+                  <button type="button" role="row" class:argo-row-selected={selectedArgoProjectKey === `${project.namespace}/${project.name}`} class="argo-row argo-set-row" on:click={() => (selectedArgoProjectKey = selectedArgoProjectKey === `${project.namespace}/${project.name}` ? '' : `${project.namespace}/${project.name}`)}>
+                    <span class="argo-app-name"><strong>{project.name}</strong><small>{project.description || project.namespace}</small></span>
+                    <span class="argo-muted" title={project.destinations.join(', ')}>{project.destinations.join(', ') || '—'}</span>
+                    <span>{project.apps}</span>
+                    <span>{project.roles}</span>
+                  </button>
+                {:else}<div class="argo-empty"><GitBranch size={22} /><strong>{argoProjects.length ? 'No projects match' : 'No projects found'}</strong></div>{/each}
+              </div>
+              {#if selectedArgoProject}
+                {@const project = selectedArgoProject}
+                <aside class="argo-details" aria-label={`${project.name} details`}>
+                  <header><div><strong>{project.name}</strong><small>{project.namespace} · AppProject</small></div><button type="button" class="argo-close" aria-label="Close project details" on:click={() => (selectedArgoProjectKey = '')}>×</button></header>
+                  {#if project.description}<p class="argo-muted">{project.description}</p>{/if}
+                  <dl class="argo-properties"><div><dt>Applications</dt><dd>{project.apps}</dd></div><div><dt>Roles</dt><dd>{project.roles}</dd></div><div><dt>Sync windows</dt><dd>{project.syncWindows || 'None'}</dd></div><div><dt>Cluster resources</dt><dd>{project.clusterResources ? `${project.clusterResources} allowed kinds` : 'None allowed'}</dd></div></dl>
+                  <section class="argo-section"><strong>Source repositories <small>{project.sources.length}</small></strong><div class="policy-rules">{#each project.sources as source}<code>{source}</code>{:else}<span class="argo-muted">None allowed</span>{/each}</div></section>
+                  <section class="argo-section"><strong>Destinations <small>{project.destinations.length}</small></strong><div class="policy-rules">{#each project.destinations as destination}<code>{destination}</code>{:else}<span class="argo-muted">None allowed</span>{/each}</div></section>
+                  {#if argoApps.some((app) => app.project === project.name)}<section class="argo-section"><strong>Applications</strong><div class="argo-resources">{#each argoApps.filter((app) => app.project === project.name) as app}<div><span>{app.name}</span><b class="ov-status ov-status-{argoTone(app.sync)}">{app.sync}</b><b class="ov-status ov-status-{argoTone(app.health)}">{app.health}</b></div>{/each}</div></section>{/if}
                 </aside>
               {/if}
             </div>
@@ -5670,10 +6171,10 @@
                         </div>
                         <div class="node-metrics-grid">
                           <section class="node-metric-card node-metric-cpu"><div class="node-metric-heading"><span>CPU usage</span><strong>{cpuMetricLabel(node.cpuUsage)}</strong><b>{usagePercentLabel(node.cpuUsagePercent)}</b></div>{#if node.cpuUsagePercent !== undefined}<div class="usage-meter" aria-label={`CPU ${usagePercentLabel(node.cpuUsagePercent)}`}><i style:width={`${node.cpuUsagePercent}%`}></i></div>{/if}<small>{node.cpuUsage ? `${cpuMetricLabel(node.cpuUsage)} used of ${cpuMetricLabel(node.cpuCapacity)} · ${remainingPercentLabel(node.cpuUsagePercent)}` : `Capacity ${cpuMetricLabel(node.cpuCapacity)}`}</small></section>
-                          <section class="node-metric-card node-metric-memory"><div class="node-metric-heading"><span>Memory usage</span><strong>{node.memoryUsage || '—'}</strong><b>{usagePercentLabel(node.memoryUsagePercent)}</b></div>{#if node.memoryUsagePercent !== undefined}<div class="usage-meter memory-meter" aria-label={`Memory ${usagePercentLabel(node.memoryUsagePercent)}`}><i style:width={`${node.memoryUsagePercent}%`}></i></div>{/if}<small>{node.memoryUsage ? `${node.memoryUsage} used of ${node.memoryCapacity || 'unknown capacity'} · ${remainingPercentLabel(node.memoryUsagePercent)}` : `Capacity ${node.memoryCapacity || 'unavailable'}`}</small></section>
+                          <section class="node-metric-card node-metric-memory"><div class="node-metric-heading"><span>Memory usage</span><strong>{memoryLabel(node.memoryUsage)}</strong><b>{usagePercentLabel(node.memoryUsagePercent)}</b></div>{#if node.memoryUsagePercent !== undefined}<div class="usage-meter memory-meter" aria-label={`Memory ${usagePercentLabel(node.memoryUsagePercent)}`}><i style:width={`${node.memoryUsagePercent}%`}></i></div>{/if}<small>{node.memoryUsage ? `${memoryLabel(node.memoryUsage)} used of ${node.memoryCapacity ? memoryLabel(node.memoryCapacity) : 'unknown capacity'} · ${remainingPercentLabel(node.memoryUsagePercent)}` : `Capacity ${node.memoryCapacity ? memoryLabel(node.memoryCapacity) : 'unavailable'}`}</small></section>
                         </div>
                       {:else if nodeDetailTab === 'Allocation'}
-                        <section class="node-detail-section node-detail-section-expanded"><div class="node-detail-section-heading"><strong>Capacity & allocation</strong><small>{node.unschedulable ? 'Cordoned' : 'Schedulable'}</small></div><div class="node-property-list">{#each node.capacity as property}<div><span>{property.key}</span><strong>{property.key === 'cpu' ? cpuMetricLabel(property.value) : property.value}</strong><small>allocatable {property.key === 'cpu' ? cpuMetricLabel(node.allocatable.find((candidate) => candidate.key === property.key)?.value) : node.allocatable.find((candidate) => candidate.key === property.key)?.value || '—'}</small></div>{/each}</div></section>
+                        <section class="node-detail-section node-detail-section-expanded"><div class="node-detail-section-heading"><strong>Capacity & allocation</strong><small>{node.unschedulable ? 'Cordoned' : 'Schedulable'}</small></div><div class="node-property-list">{#each node.capacity as property}<div><span>{property.key}</span><strong>{resourceQuantityLabel(property.key, property.value)}</strong><small>allocatable {property.key === 'cpu' ? cpuMetricLabel(node.allocatable.find((candidate) => candidate.key === property.key)?.value) : node.allocatable.find((candidate) => candidate.key === property.key)?.value || '—'}</small></div>{/each}</div></section>
                       {:else if nodeDetailTab === 'Network'}
                         <section class="node-detail-section node-detail-section-expanded"><div class="node-detail-section-heading"><strong>Network & identity</strong><small>{node.podCidrs.length ? node.podCidrs.join(' · ') : 'Pod CIDR unavailable'}</small></div><div class="node-property-list">{#each node.addresses as address}<div><span>{address.type}</span><strong>{address.address}</strong></div>{/each}{#if node.providerId}<div><span>Provider</span><strong>{node.providerId}</strong></div>{/if}{#if node.uid}<div><span>UID</span><strong>{node.uid}</strong></div>{/if}</div></section>
                       {:else if nodeDetailTab === 'Health'}
@@ -5687,8 +6188,8 @@
           <section class="cluster-overview-dashboard ov-health">
             <section class="ov-kpis" aria-label="Cluster summary">
               <div class="ov-kpi"><span>Nodes</span><strong>{readyNodeCount}<small>/{clusterOverview.nodes.length}</small></strong><em>{clusterOverview.nodes.length - readyNodeCount ? `${clusterOverview.nodes.length - readyNodeCount} not ready` : 'All ready'}</em></div>
-              <div class="ov-kpi"><span>CPU</span><strong>{clusterOverview.totals.cpuUsagePercent ?? '—'}<small>%</small></strong><em>{clusterOverview.totals.cpuUsage || 'No metrics'} of {clusterOverview.totals.cpuCapacity || '—'}</em><i class="ov-bar ov-bar-{usageTone(clusterOverview.totals.cpuUsagePercent)}"><b style:width={`${clusterOverview.totals.cpuUsagePercent || 0}%`}></b></i></div>
-              <div class="ov-kpi"><span>Memory</span><strong>{clusterOverview.totals.memoryUsagePercent ?? '—'}<small>%</small></strong><em>{clusterOverview.totals.memoryUsage || 'No metrics'} of {clusterOverview.totals.memoryCapacity || '—'}</em><i class="ov-bar ov-bar-{usageTone(clusterOverview.totals.memoryUsagePercent)}"><b style:width={`${clusterOverview.totals.memoryUsagePercent || 0}%`}></b></i></div>
+              <div class="ov-kpi"><span>CPU</span><strong>{percentLabel(clusterOverview.totals.cpuUsagePercent)}<small>%</small></strong><em>{clusterOverview.totals.cpuUsage ? cpuLabel(clusterOverview.totals.cpuUsage) : 'No metrics'} of {cpuLabel(clusterOverview.totals.cpuCapacity)}</em><i class="ov-bar ov-bar-{usageTone(clusterOverview.totals.cpuUsagePercent)}"><b style:width={`${clusterOverview.totals.cpuUsagePercent || 0}%`}></b></i></div>
+              <div class="ov-kpi"><span>Memory</span><strong>{percentLabel(clusterOverview.totals.memoryUsagePercent)}<small>%</small></strong><em>{clusterOverview.totals.memoryUsage ? memoryLabel(clusterOverview.totals.memoryUsage) : 'No metrics'} of {memoryLabel(clusterOverview.totals.memoryCapacity)}</em><i class="ov-bar ov-bar-{usageTone(clusterOverview.totals.memoryUsagePercent)}"><b style:width={`${clusterOverview.totals.memoryUsagePercent || 0}%`}></b></i></div>
               <div class:ov-kpi-warn={overviewIssueNodes.length} class="ov-kpi"><span>Health</span><strong>{overviewIssueNodes.length ? overviewIssueNodes.length : 'OK'}</strong><em>{overviewIssueNodes.length ? `node${overviewIssueNodes.length === 1 ? '' : 's'} need attention` : 'No node conditions'}</em></div>
             </section>
             <section class="ov-table panel" aria-label="Nodes">
@@ -5699,8 +6200,8 @@
                   <strong>{node.name}</strong>
                   <span><b class="ov-status ov-status-{nodeStatus(node).tone}">{nodeStatus(node).label}</b></span>
                   <span class="ov-muted">{node.roles.join(', ') || 'worker'}</span>
-                  <span class="ov-meter">{#if node.cpuUsagePercent !== undefined}<i class="ov-bar ov-bar-{usageTone(node.cpuUsagePercent)}"><b style:width={`${node.cpuUsagePercent}%`}></b></i><small>{node.cpuUsagePercent}%</small>{:else}<small>—</small>{/if}</span>
-                  <span class="ov-meter">{#if node.memoryUsagePercent !== undefined}<i class="ov-bar ov-bar-{usageTone(node.memoryUsagePercent)}"><b style:width={`${node.memoryUsagePercent}%`}></b></i><small>{node.memoryUsagePercent}%</small>{:else}<small>—</small>{/if}</span>
+                  <span class="ov-meter">{#if node.cpuUsagePercent !== undefined}<i class="ov-bar ov-bar-{usageTone(node.cpuUsagePercent)}"><b style:width={`${node.cpuUsagePercent}%`}></b></i><small>{percentLabel(node.cpuUsagePercent)}%</small>{:else}<small>—</small>{/if}</span>
+                  <span class="ov-meter">{#if node.memoryUsagePercent !== undefined}<i class="ov-bar ov-bar-{usageTone(node.memoryUsagePercent)}"><b style:width={`${node.memoryUsagePercent}%`}></b></i><small>{percentLabel(node.memoryUsagePercent)}%</small>{:else}<small>—</small>{/if}</span>
                   <span class="ov-muted">{node.kubeletVersion || '—'}</span>
                 </button>
               {/each}
@@ -5940,30 +6441,46 @@
                       {#if loadingTerminalPods}<div class="drawer-state"><i></i>Finding live Pods…</div>{:else if terminalPods.length === 0}<div class="workload-terminal-empty"><strong>No live Pod is available</strong><p>Wait for a replica to become ready, then try again.</p></div>{:else}
                         <div class="terminal-pod-strip"><span>Pod</span><div>{#each terminalPods as pod}<button class:terminal-pod-selected={terminalTarget?.pod === pod.name && terminalTarget?.namespace === (pod.namespace || namespace)} on:click={() => selectTerminalPod(pod)}>{pod.name}</button>{/each}</div></div>
                         {#if loadingTerminalRuntime}<div class="drawer-state"><i></i>Inspecting containers…</div>{:else if terminalTarget}
-                          <div class="terminal-target"><div><span>Connected target</span><strong>{terminalTarget.namespace}/{terminalTarget.pod}</strong></div>{#if terminalContainers.length > 1}<label>Container<select bind:value={selectedTerminalContainer}>{#each terminalContainers as container}<option value={container}>{container}</option>{/each}</select></label>{:else}<small>{selectedTerminalContainer || 'Container unavailable'}</small>{/if}</div>
+                          <div class="terminal-target"><div><span>Connected target</span><strong>{terminalTarget.namespace}/{terminalTarget.pod}</strong></div>{#if terminalContainers.length > 1}<label>Container<select bind:value={selectedTerminalContainer} on:change={() => void inspectTerminalShell()}>{#each terminalContainers as container}<option value={container}>{container}</option>{/each}</select></label>{:else}<small>{selectedTerminalContainer || 'Container unavailable'}</small>{/if}</div>
                           {#if terminalPorts.length}<div class="terminal-port-hints"><span>Declared ports</span><div>{#each terminalPorts as port}<small>{port.container} · {port.port}/{port.protocol}</small>{/each}</div></div>{/if}
-                          <form class="terminal-command" on:submit|preventDefault={runTerminalCommand}><label>Command<input bind:value={terminalCommand} placeholder="e.g. printenv | sort" spellcheck="false" /></label><button class="primary" disabled={runningTerminalCommand}>{runningTerminalCommand ? 'Running…' : 'Run'}</button></form>
-                          <pre class="terminal-output">{terminalOutput || 'Run a command to inspect this container. Commands use /bin/sh -lc and require pods/exec permission.'}</pre>
+                          <div class="terminal-access" role="group" aria-label="How to run commands">
+                            <button type="button" aria-pressed={terminalAccess === 'shell'} disabled={!terminalShell} title={terminalShell ? `Runs through ${terminalShell}` : 'No shell found in this container'} on:click={() => (terminalAccess = 'shell')}><span>Shell</span><small>{inspectingShell ? 'Detecting…' : terminalShell || 'none found'}</small></button>
+                            <button type="button" aria-pressed={terminalAccess === 'direct'} title="Runs the program directly, without a shell: no pipes, globs, or variables" on:click={() => (terminalAccess = 'direct')}><span>No shell</span><small>exec a binary</small></button>
+                            <button type="button" aria-pressed={terminalAccess === 'debug'} title="Ephemeral container that shares this container's processes" on:click={() => (terminalAccess = 'debug')}><span>Debug container</span><small>{activeDebugContainer ? activeDebugContainer.image : 'ephemeral'}</small></button>
+                          </div>
+                          {#if terminalShellChecked && !terminalShell && terminalAccess !== 'debug'}<p class="terminal-access-note">No shell was found in <b>{selectedTerminalContainer || 'this container'}</b>, which is common for distroless images. Run its binaries directly, or add a debug container.</p>{/if}
+                          {#if terminalAccess === 'debug' && !activeDebugContainer}
+                            <form class="terminal-debug-setup" on:submit|preventDefault={startDebugContainer}>
+                              <label>Debug image<input bind:value={debugImage} placeholder="registry.internal/busybox:1.36" spellcheck="false" disabled={startingDebugContainer} /></label>
+                              <button class="primary" disabled={startingDebugContainer || !debugImage.trim()}>{startingDebugContainer ? 'Starting…' : 'Add debug container'}</button>
+                              <small>Adds an ephemeral container to {terminalTarget.pod} that shares {selectedTerminalContainer || 'the target'}'s processes. It stays until the Pod restarts. In air-gapped clusters, use an image from your internal registry; it needs <code>sh</code>. Requires patch on pods/ephemeralcontainers.</small>
+                            </form>
+                          {:else}
+                            <form class="terminal-command" on:submit|preventDefault={runTerminalCommand}><label>{terminalAccess === 'direct' ? 'Program and arguments' : terminalAccess === 'debug' ? `Command in ${activeDebugContainer?.name}` : 'Command'}<input bind:value={terminalCommand} placeholder={terminalAccess === 'direct' ? 'e.g. /app/server --version' : 'e.g. printenv | sort'} spellcheck="false" /></label><button class="primary" disabled={runningTerminalCommand || inspectingShell}>{runningTerminalCommand ? 'Running…' : 'Run'}</button></form>
+                          {/if}
+                          <pre class="terminal-output">{terminalOutput || (inspectingShell ? 'Checking which shell this container provides…' : terminalAccess === 'direct' ? 'Runs the program directly with Kubernetes exec. Shell features like pipes and $VARIABLES are not available.' : `Run a command to inspect this container. Commands use ${terminalAccess === 'debug' ? debugShell || '/bin/sh' : terminalShell || '/bin/sh'} and require pods/exec permission.`)}</pre>
                         {/if}
                       {/if}
                     </section>
                   {:else}
                     <div class="workload-inspector-body">
                       {#if editorPermissionSet.canViewLogs || editorPermissionSet.canExec}<section class="workload-action-grid">{#if editorPermissionSet.canViewLogs}<button class:workload-action-loading={editorLogsOpening} class="workload-action-card workload-logs-action" disabled={Boolean(openingLogsTarget)} aria-busy={editorLogsOpening} on:click={() => openWorkloadLogs(editorResource!, editorObject!)}><span>{#if editorLogsOpening}<RefreshCw size={18} class="workload-action-spinner" />{:else}≡{/if}</span><div><strong>{editorLogsOpening ? 'Opening logs…' : 'View logs'}</strong><small>{editorLogsOpening ? `Preparing ${editorResource.kind} logs and the first live stream` : editorResource.kind === 'Pod' ? 'Keep workload types visible beside this Pod stream' : 'Choose a live Pod and stream its output without leaving Workloads'}</small></div><b>{editorLogsOpening ? '•••' : '→'}</b></button>{/if}{#if editorPermissionSet.canExec}<button class="workload-action-card workload-terminal-action" disabled={loadingTerminalPods || Boolean(openingLogsTarget)} on:click={() => openWorkloadTerminal(editorResource!, editorObject!)}><span>⌘</span><div><strong>Terminal</strong><small>Tunnel into a Pod container with Kubernetes exec</small></div><b>→</b></button>{/if}</section>{/if}
-                      <dl class="workload-properties">
-                        <dt>Status</dt><dd><b class={`workload-status-label ${workloadStatusTone(editorObject)}`}>{workloadStatusLabel(editorObject)}</b></dd>
+                      <section class="detail-facts" aria-label="Key facts">
+                        <div class="detail-fact detail-fact-status"><span>Status</span><strong><b class={`workload-status-label ${workloadStatusTone(editorObject)}`}>{workloadStatusLabel(editorObject)}</b></strong></div>
                         {#if editorResource.kind === 'Pod'}
-                          <dt>Ready</dt><dd>{podContainerSummary(editorObject)}</dd>
-                          <dt>Restarts</dt><dd>{editorObject.restarts ?? 0}</dd>
-                          {#if editorObject.nodeName}<dt>Node</dt><dd>{editorObject.nodeName}</dd>{/if}
-                          {#if editorObject.cpuUsage}<dt>CPU</dt><dd>{cpuMetricLabel(editorObject.cpuUsage)}</dd>{/if}
-                          {#if editorObject.memoryUsage}<dt>Memory</dt><dd>{editorObject.memoryUsage}</dd>{/if}
+                          <div class="detail-fact"><span>Ready</span><strong>{podContainerSummary(editorObject)}</strong>{#if editorObject.totalContainers}<i class="detail-meter"><b style:width={`${Math.round(((editorObject.readyContainers || 0) / editorObject.totalContainers) * 100)}%`}></b></i>{/if}</div>
+                          <div class:detail-fact-warn={(editorObject.restarts || 0) > 0} class="detail-fact"><span>Restarts</span><strong>{editorObject.restarts ?? 0}</strong></div>
+                          <div class="detail-fact"><span>CPU</span><strong>{editorObject.cpuUsage ? cpuMetricLabel(editorObject.cpuUsage) : '—'}</strong></div>
+                          <div class="detail-fact"><span>Memory</span><strong>{editorObject.memoryUsage ? podMetricLabel(editorObject.memoryUsage) : '—'}</strong></div>
                         {:else}
-                          <dt>Replicas</dt><dd>{workloadReplicaSummary(editorManifest)}</dd>
+                          <div class="detail-fact"><span>Replicas</span><strong>{workloadReplicaSummary(editorManifest)}</strong></div>
                         {/if}
-                        <dt>Age</dt><dd>{resourceAge(editorObject.createdAt)}</dd>
-                        <dt>Namespace</dt><dd>{editorObject.namespace || 'cluster scoped'}</dd>
-                        <dt>API</dt><dd>{editorResource.apiVersion}</dd>
+                        <div class="detail-fact"><span>Age</span><strong>{resourceAge(editorObject.createdAt)}</strong></div>
+                      </section>
+                      <dl class="detail-placement">
+                        {#if editorResource.kind === 'Pod' && editorObject.nodeName}<div><dt>Node</dt><dd>{editorObject.nodeName}</dd></div>{/if}
+                        <div><dt>Namespace</dt><dd>{editorObject.namespace || 'cluster scoped'}</dd></div>
+                        <div><dt>API</dt><dd>{editorResource.apiVersion}</dd></div>
                       </dl>
                       {#if editorResource.kind === 'Pod'}<section class="pod-diagnostics-card"><div class="pod-diagnostics-heading"><strong>Diagnostics</strong><span>{selectedPodEvents.filter((event) => event.eventType === 'Warning').length} warnings</span></div>{#if podContainerDiagnostics(editorManifest).length}<div class="pod-container-diagnostics">{#each podContainerDiagnostics(editorManifest) as container}<article class:pod-diagnostic-warning={!container.ready || container.state !== 'Running'}><span class="pod-diagnostic-dot"></span><div><strong>{container.name}</strong><small>{container.state}{container.reason ? ` · ${container.reason}` : ''}{container.restarts ? ` · ${container.restarts} restarts` : ''}</small>{#if container.message}<p>{container.message}</p>{/if}</div></article>{/each}</div>{/if}{#if podConditionDiagnostics(editorManifest).length}<div class="pod-condition-strip">{#each podConditionDiagnostics(editorManifest) as condition}<span class:pod-condition-false={condition.status !== 'True'} title={condition.message || condition.reason}><b>{condition.type}</b>{condition.status}</span>{/each}</div>{/if}<div class="pod-event-list">{#each selectedPodEvents as event}<article class:pod-event-warning={event.eventType === 'Warning'}><span>{event.eventType === 'Warning' ? '!' : '✓'}</span><div><strong>{event.reason || event.action || event.eventType}</strong><p>{event.message || 'No event message returned.'}</p></div><time>{resourceAge(event.lastObserved)}</time></article>{:else}{#if loadingEvents}<div class="pod-events-loading"><i></i></div>{:else}<small class="pod-events-empty">No recent Pod events.</small>{/if}{/each}</div></section>{/if}
                       <section class="workload-detail-card"><div class="workload-detail-card-heading"><div><strong>Containers</strong><small>Images declared on the Pod template</small></div><b>{workloadImages(editorManifest).length}</b></div>{#if workloadImages(editorManifest).length}<div class="workload-image-list">{#each workloadImages(editorManifest) as container}<div><span>{container.init ? 'Init' : 'App'}</span><strong>{container.name}</strong><small title={container.image}>{container.image}</small></div>{/each}</div>{:else}<p>No container image is declared on this resource.</p>{/if}</section>
@@ -6015,16 +6532,32 @@
     <footer class="workspace-statusbar"><button class:workspace-cli-active={cliOpen} type="button" disabled={!activeClusterId} title={activeClusterId ? `Open terminal for ${activeCluster}` : 'Select a cluster first'} on:click={toggleClusterCli}><Terminal size={14} /><span>CLI</span></button>{#if activeClusterId}<small>{activeCluster} · {namespace === 'all namespaces' ? 'all namespaces' : namespace}</small>{/if}<div class="workspace-zoom-controls" role="group" aria-label="Interface size"><button type="button" disabled={uiScale <= 0.8} aria-label="Decrease interface size" title="Decrease interface size" on:click={() => adjustUiScale(-0.05)}>−</button><output aria-live="polite">{Math.round(uiScale * 100)}%</output><button type="button" disabled={uiScale >= 1.25} aria-label="Increase interface size" title="Increase interface size" on:click={() => adjustUiScale(0.05)}>+</button></div></footer>
   </section>
 
-  {#if argoActionTarget}
-    {@const target = argoActionTarget}
-    <div class="modal-backdrop deletion-backdrop" role="presentation" on:click={() => !runningArgoAction && (argoActionTarget = null)}>
-      <div use:focusOnMount class="deletion-modal argo-action-modal" role="dialog" aria-modal="true" aria-labelledby="argo-dialog-title" tabindex="-1" on:click|stopPropagation on:keydown|stopPropagation={(event) => event.key === 'Escape' && !runningArgoAction && (argoActionTarget = null)}>
-        <div class="deletion-modal-mark"><GitBranch size={18} /></div>
-        <p class="eyebrow">Argo CD</p>
-        <h2 id="argo-dialog-title">{target.action === 'sync' ? `Sync ${target.app.name}?` : `Refresh ${target.app.name}?`}</h2>
-        <p class="deletion-intro">{target.action === 'sync' ? 'Argo CD will apply the target revision to the destination. Resources may be created, updated, or pruned according to the application’s sync policy.' : 'Argo CD will compare the live state with Git again. Nothing in the cluster changes.'}</p>
-        <dl class="deletion-target-summary"><div><dt>Cluster</dt><dd>{activeCluster}</dd></div><div><dt>Application</dt><dd>{target.app.namespace}/{target.app.name}</dd></div><div><dt>Source</dt><dd title={target.app.source}>{target.app.source}</dd></div><div><dt>Destination</dt><dd>{target.app.destination}</dd></div></dl>
-        <div class="deletion-actions"><button class="secondary" disabled={runningArgoAction} on:click={() => (argoActionTarget = null)}>Cancel</button><button class="primary" disabled={runningArgoAction} on:click={runArgoAction}>{runningArgoAction ? 'Sending…' : target.action === 'sync' ? 'Sync now' : 'Refresh'}</button></div>
+  {#if argoDialog}
+    {@const dialog = argoDialog}
+    <div class="modal-backdrop deletion-backdrop" role="presentation" on:click={() => !runningArgoAction && (argoDialog = null)}>
+      <div use:focusOnMount class="deletion-modal argo-action-modal" role="dialog" aria-modal="true" aria-labelledby="argo-dialog-title" tabindex="-1" on:click|stopPropagation on:keydown|stopPropagation={(event) => event.key === 'Escape' && !runningArgoAction && (argoDialog = null)}>
+        <div class="deletion-modal-mark">{#if dialog.action === 'rollback'}<Undo2 size={18} />{:else if dialog.action === 'terminate'}<Ban size={18} />{:else if dialog.action === 'set-auto-sync'}<Zap size={18} />{:else}<GitBranch size={18} />{/if}</div>
+        <p class="eyebrow">Argo CD · {dialog.app.name}</p>
+        <h2 id="argo-dialog-title">{dialog.action === 'sync' ? (dialog.resources?.length ? `Sync ${dialog.resources[0].kind} ${dialog.resources[0].name}?` : `Sync ${dialog.app.name}?`) : dialog.action === 'rollback' ? `Roll back to #${dialog.historyId}?` : dialog.action === 'terminate' ? 'Terminate the running sync?' : dialog.action === 'set-auto-sync' ? (dialog.enable ? 'Turn on auto-sync?' : 'Turn off auto-sync?') : 'Refresh from Git?'}</h2>
+        <p class="deletion-intro">{dialog.action === 'sync' ? 'Argo CD applies the chosen revision to the destination.' : dialog.action === 'rollback' ? `Argo CD re-applies revision ${dialog.revision || ''} from the deployment history.` : dialog.action === 'terminate' ? 'Argo CD stops the current operation. Resources already applied stay as they are.' : dialog.action === 'set-auto-sync' ? (dialog.enable ? 'Argo CD will sync automatically whenever Git changes.' : 'Changes in Git will wait for a manual sync.') : 'Argo CD compares the live state with Git again. Nothing in the cluster changes.'}</p>
+        {#if dialog.action === 'sync'}
+          <div class="argo-dialog-options">
+            <label class="argo-dialog-field">Revision<input bind:value={argoSyncOptions.revision} placeholder="Branch, tag, or commit" spellcheck="false" /></label>
+            <label><input type="checkbox" bind:checked={argoSyncOptions.prune} />Prune<small>Delete resources that are no longer in Git</small></label>
+            <label><input type="checkbox" bind:checked={argoSyncOptions.dryRun} />Dry run<small>Validate without changing the cluster</small></label>
+            <label><input type="checkbox" bind:checked={argoSyncOptions.applyOutOfSyncOnly} />Apply out-of-sync only<small>Skip resources that already match</small></label>
+            <label><input type="checkbox" bind:checked={argoSyncOptions.force} />Force<small>Delete and recreate resources that cannot be patched</small></label>
+          </div>
+        {:else if dialog.action === 'rollback'}
+          <div class="argo-dialog-options"><label><input type="checkbox" bind:checked={argoSyncOptions.prune} />Prune<small>Delete resources that are not in that revision</small></label></div>
+        {:else if dialog.action === 'set-auto-sync' && dialog.enable}
+          <div class="argo-dialog-options">
+            <label><input type="checkbox" bind:checked={argoAutoSyncOptions.selfHeal} />Self-heal<small>Revert manual changes made in the cluster</small></label>
+            <label><input type="checkbox" bind:checked={argoAutoSyncOptions.prune} />Prune<small>Delete resources removed from Git</small></label>
+          </div>
+        {/if}
+        <dl class="deletion-target-summary"><div><dt>Cluster</dt><dd>{activeCluster}</dd></div><div><dt>Application</dt><dd>{dialog.app.namespace}/{dialog.app.name}</dd></div><div><dt>Destination</dt><dd>{dialog.app.destination}</dd></div></dl>
+        <div class="deletion-actions"><button class="secondary" disabled={runningArgoAction} on:click={() => (argoDialog = null)}>Cancel</button><button class={dialog.action === 'terminate' || (dialog.action === 'sync' && argoSyncOptions.force) ? 'destructive' : 'primary'} disabled={runningArgoAction} on:click={runArgoAction}>{runningArgoAction ? 'Sending…' : dialog.action === 'sync' ? (argoSyncOptions.dryRun ? 'Dry run' : 'Sync now') : dialog.action === 'rollback' ? 'Roll back' : dialog.action === 'terminate' ? 'Terminate' : dialog.action === 'set-auto-sync' ? (dialog.enable ? 'Turn on' : 'Turn off') : 'Refresh'}</button></div>
       </div>
     </div>
   {/if}

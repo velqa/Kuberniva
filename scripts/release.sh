@@ -124,17 +124,17 @@ echo "Built $out:"
 ls -lh "$out"
 
 if $publish; then
-  notes_args=(--notes "Kuberniva $version")
-  if [[ -n "$notes_file" ]]; then notes_args=(--notes-file "$notes_file"); fi
+  # The GitHub release notes end with the DMG checksum; the in-app notes stay without it.
+  dmg_sha256="$(shasum -a 256 "$out/$dmg" | cut -d' ' -f1)"
+  printf '%s\n\nDMG SHA-256: `%s`\n' "$notes" "$dmg_sha256" > "$out/release-notes.md"
   gh release create "$tag" "$out/$dmg" "$out/$archive" "$out/latest.json" \
     --repo "$REPO" \
     --target "$(git rev-parse HEAD)" \
     --title "Kuberniva $version" \
-    "${notes_args[@]}" \
+    --notes-file "$out/release-notes.md" \
     --latest
 
   # Point the Homebrew cask at the new DMG so `brew upgrade` and new installs get it.
-  dmg_sha256="$(shasum -a 256 "$out/$dmg" | cut -d' ' -f1)"
   tap_dir="$(mktemp -d)"
   trap 'rm -rf "$tap_dir"' EXIT
   gh repo clone "$TAP_REPO" "$tap_dir" -- --quiet
