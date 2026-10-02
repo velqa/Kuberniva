@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from 'svelte';
+  import { LiveResourceStore, panePercent, type RowChange } from './lib/live-resources';
   import { admissionPolicyView, isAdmissionPolicyKind, tokenizeCel, type CelEntry } from './lib/admission-policy';
   import { argoApplication, argoApplicationSet, argoProject, argoTone, isForbidden, resourcesByKind, summarizeArgo, type ArgoApp, type ArgoAppSet, type ArgoProject, type ArgoResource } from './lib/argocd';
   import { conditions as gatewayConditions, gatewayAddresses, gatewayListeners, routeHostnames, routeParents, routeRules, routesAttachedToGateway, routesTargetingService, type RouteSummary } from './lib/gateway-api';
@@ -62,7 +63,8 @@
   type CliSession = { lines: CliLine[]; runId: string | null; running: boolean; startedAt: number; draft: string; open: boolean; expanded: boolean };
   type CliOutputEvent = { runId: string; chunks: { stream: 'stdout' | 'stderr'; text: string }[] };
   type CliExitEvent = { runId: string; exitCode?: number | null; success: boolean; cancelled: boolean; error?: string | null };
-  type ResourceWatchSignal = { watchId: string; action: string; error?: string };
+  type ResourceSnapshot = { items: ResourceObject[]; resourceVersion: string };
+  type ResourceWatchSignal = { watchId: string; sequence: number; action: string; changes?: RowChange<ResourceObject>[]; items?: ResourceObject[]; resourceVersion?: string; error?: string };
   type ResourceWatchStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'error';
   type LiveDataStatus = 'loading' | 'live' | 'loaded' | 'stale' | 'paused' | 'unavailable';
   type LiveRefreshContext = { clusterId: string; view: View; dataKey: string };
@@ -208,6 +210,8 @@
   let sidebarWidth = 280;
   let resourceNavigatorWidth = 272;
   let resourceObjectPaneWidth = 300;
+  let workloadListPercent = 38;
+  let stopWorkloadPaneResize: (() => void) | undefined;
   let accessDecisions: Record<string, AccessReviewDecision> = {};
   let catalogPermissionsReady = false;
   let loadingPermissions = false;
@@ -255,7 +259,15 @@
   let resourceWatchUnlisten: (() => void) | undefined;
   let resourceWatchListenerReady: Promise<void> | null = null;
   let resourceWatchErrorNotified = false;
-  const resourceWatchSignalBuffer = new Map<string, ResourceWatchSignal>();
+  let liveResourceStore = new LiveResourceStore<ResourceObject>();
+  let resourceWatchSequence = 0;
+  let liveListPublishTimer: ReturnType<typeof window.setTimeout> | undefined;
+  let liveDetailTimer: ReturnType<typeof window.setTimeout> | undefined;
+  let liveDetailReading = false;
+  let liveMetricsTimer: ReturnType<typeof window.setInterval> | undefined;
+  // Without watch permission the list still refreshes, from periodic snapshots.
+  let liveSnapshotPollTimer: ReturnType<typeof window.setInterval> | undefined;
+  let liveStoreVersion = '';
   const visualQaRecoveryScenario = import.meta.env.DEV ? new URLSearchParams(window.location.search).get('visual-qa') || '' : '';
   const visualQaRecoveryEnabled = import.meta.env.DEV && ['recovery-workloads', 'recovery-editing', 'recovery-timeout'].includes(visualQaRecoveryScenario);
   let removeVisualQaRecoveryControl: (() => void) | undefined;
@@ -293,6 +305,7 @@
   const storedCatalogLimit = 8;
   const clusterSessionCache = new Map<string, ClusterSession>();
   const resourceObjectCache = new Map<string, ResourceObject[]>();
+  const resourceSnapshotVersions = new Map<string, string>();
   const liveDataUpdatedAt = new Map<string, number>();
   const liveDataStaleAfterMs = 120_000;
   const workspaceStorageKey = 'kuberniva.workspace.v1';
@@ -300,6 +313,7 @@
   const uiScaleStorageKey = 'kuberniva.ui-scale.v1';
   const resourceNavigatorWidthStorageKey = 'kuberniva.resource-navigator-width.v1';
   const resourceObjectPaneWidthStorageKey = 'kuberniva.resource-object-width.v1';
+  const workloadPaneStorageKey = 'kuberniva.workload-list-percent.v1';
 
   const resourceCategories: ResourceCategory[] = ['Configuration', 'Access Control', 'Network', 'Gateway APIs', 'Admission Policies', 'Storage', 'Cluster'];
   // Gateway APIs and Admission Policies get their own groups, shown only when the cluster serves them.
@@ -440,7 +454,8 @@
   $: configEditorDirty = Boolean(configModalOpen && editorManifest && !loadingEditor && editorEntriesSignature(editorEntries) !== editorDataSignature(editorManifest));
   $: if (activeClusterId !== cliSessionClusterId) swapCliSession(activeClusterId);
   $: workloadDetailOpen = (editorResource?.category === 'Workloads' && editorObject !== null) || (workloadDetailMode === 'logs' && logTarget !== null);
-  $: workloadColumns = buildWorkloadColumns(workloadResource?.kind === 'Pod', namespace === 'all namespaces', workloadDetailOpen);
+  // A list dragged wider than the details gets its full columns back.
+  $: workloadColumns = buildWorkloadColumns(workloadResource?.kind === 'Pod', namespace === 'all namespaces', !workloadDetailOpen || workloadListPercent >= 62 ? 'full' : workloadListPercent >= 46 ? 'medium' : 'compact');
   $: workloadGridColumns = `${workloadColumns.map((column) => column.width).join(' ')} 18px`;
   $: workloadSearchNeedle = workloadSearch.toLowerCase();
   $: visibleWorkloadObjects = workloadSearchNeedle
@@ -1703,6 +1718,18 @@
 
   function stopLiveObjectRefresh() {
     resourceWatchGeneration += 1;
+    // Rows and their cursor are cached together, so a later watch resumes exactly here.
+    if (liveListPublishTimer) commitLiveCache();
+    if (liveSnapshotPollTimer) window.clearInterval(liveSnapshotPollTimer);
+    liveSnapshotPollTimer = undefined;
+    if (liveListPublishTimer) window.clearTimeout(liveListPublishTimer);
+    if (liveDetailTimer) window.clearTimeout(liveDetailTimer);
+    if (liveMetricsTimer) window.clearInterval(liveMetricsTimer);
+    liveListPublishTimer = undefined;
+    liveDetailTimer = undefined;
+    liveMetricsTimer = undefined;
+    resourceWatchSequence = 0;
+    liveResourceStore.abortReset();
     if (resourceWatchRefreshTimer) window.clearTimeout(resourceWatchRefreshTimer);
     resourceWatchRefreshTimer = undefined;
     resourceWatchRefreshPending = false;
@@ -1715,7 +1742,6 @@
     resourceWatchDataKey = '';
     resourceWatchErrorNotified = false;
     resourceWatchStatus = 'idle';
-    resourceWatchSignalBuffer.clear();
     if (watchId && '__TAURI_INTERNALS__' in window) {
       void import('@tauri-apps/api/core')
         .then(({ invoke }) => invoke('stop_resource_watch', { watchId }))
@@ -1732,7 +1758,8 @@
     if (permissions.resolved && !permissions.canWatch) {
       resourceWatchStatus = 'error';
       liveDataStatus = 'loaded';
-      liveDataStatusMessage = 'Snapshot loaded · live watch is not permitted';
+      liveDataStatusMessage = 'Snapshot loaded · refreshing every 30 seconds (watch is not permitted)';
+      startSnapshotPolling();
       return;
     }
     void startResourceWatch(resource);
@@ -1748,6 +1775,7 @@
       plural: resource.plural,
       namespaced: resource.namespaced,
       namespace,
+      resourceVersion: resourceSnapshotVersions.get(resourceObjectCacheKey(activeClusterId, resource, namespace)) || null,
     };
   }
 
@@ -1762,10 +1790,20 @@
     const watchGeneration = resourceWatchGeneration;
     const requestView = resource.category === 'Workloads' ? 'Workloads' : 'Resources';
     const requestContext = liveRefreshContext(requestClusterId, requestView, resource, requestNamespace);
+    const watchId = `resource-${crypto.randomUUID()}`;
+    liveResourceStore = new LiveResourceStore(resource.category === 'Workloads' ? workloadObjects : resourceObjects);
+    liveStoreVersion = resourceSnapshotVersions.get(requestContext.dataKey) || '';
+    resourceWatchSequence = 0;
+    resourceWatchId = watchId;
+    resourceWatchKey = nextWatchKey;
+    resourceWatchClusterId = requestClusterId;
+    resourceWatchView = requestView;
+    resourceWatchDataKey = requestContext.dataKey;
     resourceWatchStatus = 'connecting';
     try {
       const { invoke } = await import('@tauri-apps/api/core');
-      const watchId = await invoke<string>('start_resource_watch', {
+      await invoke<string>('start_resource_watch', {
+        watchId,
         request: resourceWatchRequest(resource),
       });
       if (
@@ -1786,73 +1824,144 @@
       resourceWatchView = requestView;
       resourceWatchDataKey = resourceObjectCacheKey(requestClusterId, resource, requestNamespace);
       resourceWatchErrorNotified = false;
-      const bufferedSignal = resourceWatchSignalBuffer.get(watchId);
-      resourceWatchSignalBuffer.delete(watchId);
-      if (bufferedSignal) scheduleResourceWatchRefresh(bufferedSignal);
+      if (resource.kind === 'Pod' && !resource.group) {
+        liveMetricsTimer = window.setInterval(() => void refreshLivePodMetrics(resource, watchId), 60_000);
+      }
     } catch (error) {
       if (!liveRefreshContextMatchesCurrent(requestContext)) return;
       resourceWatchStatus = 'error';
       markLiveDataUnavailable(`Live updates unavailable for ${resource.kind}`, requestContext);
       // A resource can be listable without watch permission. Keep the current
       // list usable and surface the limitation once instead of retrying loudly.
-      if (!resourceWatchErrorNotified) {
-        resourceWatchErrorNotified = true;
-        notify(`Live updates unavailable for ${resource.kind}: ${String(error)}`);
+      resourceWatchErrorNotified = true;
+    }
+  }
+
+  function commitLiveCache() {
+    if (!resourceWatchDataKey) return [];
+    const rows = liveResourceStore.rows();
+    resourceObjectCache.set(resourceWatchDataKey, rows);
+    if (liveStoreVersion) resourceSnapshotVersions.set(resourceWatchDataKey, liveStoreVersion);
+    liveDataUpdatedAt.set(resourceWatchDataKey, Date.now());
+    return rows;
+  }
+
+  function startSnapshotPolling() {
+    if (liveSnapshotPollTimer) return;
+    liveSnapshotPollTimer = window.setInterval(() => {
+      if (document.hidden || hasProtectedWorkflow()) return;
+      void refreshVisibleObjectList();
+    }, 30_000);
+  }
+
+  function publishLiveRows() {
+    liveListPublishTimer = undefined;
+    if (!resourceWatchId) return;
+    const rows = commitLiveCache();
+    if (resourceWatchClusterId !== activeClusterId || resourceWatchView !== activeView || resourceWatchDataKey !== activeLiveDataKey()) return;
+    lastConnectionVerifiedAt = Date.now();
+    if (activeView === 'Workloads') {
+      workloadObjects = rows;
+      reconcileWorkloadObjectSelection(rows);
+    } else {
+      resourceObjects = rows;
+      reconcileResourceObjectSelection(rows);
+    }
+    if (editorObject && editorResource && resourceKey(editorResource) === resourceKey((activeView === 'Workloads' ? workloadResource : selectedResource)!)) {
+      const current = liveResourceStore.get(editorObject);
+      const editable = editorResource.kind === 'ConfigMap' || editorResource.kind === 'Secret' || yamlMode === 'edit' || savingEditor || savingYaml;
+      if (!current || (editorObject.uid && current.uid !== editorObject.uid)) {
+        if (!editable) { closeEditor(); closeYamlEditor(); }
+      } else {
+        const changed = current.resourceVersion !== editorObject.resourceVersion;
+        editorObject = current;
+        if (changed && !editable) queueLiveDetailRefresh();
       }
     }
   }
 
+  function queueLiveDetailRefresh() {
+    if (liveDetailTimer) return;
+    const watchId = resourceWatchId;
+    liveDetailTimer = window.setTimeout(async () => {
+      liveDetailTimer = undefined;
+      if (watchId !== resourceWatchId || !editorResource || !editorObject || loadingEditor || savingEditor || savingYaml || yamlMode === 'edit') return;
+      if (liveDetailReading) { queueLiveDetailRefresh(); return; }
+      const resource = editorResource;
+      const object = editorObject;
+      const cursor = object.resourceVersion;
+      liveDetailReading = true;
+      try {
+        const detail = await invokeRead<ResourceDetail>('get_resource_detail', { request: {
+          kubeconfigPath: activeKubeconfigPath || kubeconfigPath || null, context: activeCluster,
+          group: resource.group, version: resource.version, kind: resource.kind, plural: resource.plural,
+          namespaced: resource.namespaced, namespace: objectNamespace(object) || null, name: object.name,
+        } });
+        if (watchId !== resourceWatchId || editorResource !== resource || !editorObject || editorObject.name !== object.name || editorObject.namespace !== object.namespace || editorObject.uid !== object.uid || savingEditor || String(yamlMode) === 'edit') return;
+        editorManifest = detail.manifest;
+        editorCertificate = detail.certificate;
+        if (yamlObject?.name === object.name && yamlObject.namespace === object.namespace && yamlMode === 'view') {
+          yamlText = detail.yaml;
+          yamlOriginal = detail.yaml;
+        }
+        if (editorObject.resourceVersion !== cursor) queueLiveDetailRefresh();
+      } catch {
+        // Preserve the last readable details. The collection watch remains live.
+      } finally {
+        liveDetailReading = false;
+      }
+    }, 1_000);
+  }
+
+  async function refreshLivePodMetrics(resource: ResourceDescriptor, watchId: string) {
+    if (watchId !== resourceWatchId) return;
+    const capturedRows = new Map(liveResourceStore.rows().map((row) => [`${row.namespace || ''}\u0000${row.name}`, row.uid]));
+    try {
+      const metrics = await invokeRead<{ name: string; namespace: string; cpuUsage?: string; memoryUsage?: string }[]>('read_pod_metrics', { request: resourceWatchRequest(resource) });
+      if (watchId !== resourceWatchId) return;
+      const currentMetrics = metrics.filter((metric) => liveResourceStore.get(metric)?.uid === capturedRows.get(`${metric.namespace}\u0000${metric.name}`));
+      if (liveResourceStore.applyMetrics(currentMetrics)) publishLiveRows();
+    } catch { /* Metrics API availability does not interrupt resource updates. */ }
+  }
+
   function scheduleResourceWatchRefresh(signal: ResourceWatchSignal) {
-    if (
-      signal.watchId !== resourceWatchId
-      || !resourceWatchClusterId
-      || resourceWatchClusterId !== activeClusterId
-      || resourceWatchView !== activeView
-      || resourceWatchDataKey !== activeLiveDataKey()
-    ) return;
+    if (signal.watchId !== resourceWatchId || resourceWatchClusterId !== activeClusterId || resourceWatchView !== activeView || resourceWatchDataKey !== activeLiveDataKey()) return;
+    if (signal.sequence <= resourceWatchSequence) return;
+    if (signal.sequence !== resourceWatchSequence + 1) {
+      // IPC loss is repaired with a new atomic snapshot, never an incomplete list.
+      resourceSnapshotVersions.delete(resourceWatchDataKey);
+      startLiveObjectRefresh();
+      return;
+    }
+    resourceWatchSequence = signal.sequence;
+    if (signal.resourceVersion) {
+      liveStoreVersion = signal.resourceVersion;
+      // With nothing waiting to publish, the cached rows already match this cursor.
+      if (!liveListPublishTimer && !['resetBegin', 'resetChunk'].includes(signal.action)) resourceSnapshotVersions.set(resourceWatchDataKey, liveStoreVersion);
+    }
+    if (signal.action === 'resetBegin') { liveResourceStore.beginReset(); return; }
+    if (signal.action === 'resetChunk') { liveResourceStore.stage(signal.items || []); return; }
+    if (signal.action === 'resetEnd') {
+      if (liveResourceStore.finishReset()) publishLiveRows();
+      return;
+    }
     if (signal.action === 'connected') {
-      const reconnected = resourceWatchStatus === 'reconnecting';
       resourceWatchStatus = 'connected';
-      resourceWatchErrorNotified = false;
-      if (resourceWatchDataKey && liveDataUpdatedAt.has(resourceWatchDataKey)) {
-        liveDataStatus = 'live';
-        liveDataStatusMessage = '';
-      }
-      if (reconnected) {
-        markResourceWatchRefreshPending();
-        if (hasProtectedWorkflow()) markLiveDataPaused('Connected again · preserving your open work');
-        else void refreshVisibleObjectList();
-      }
+      liveDataStatus = 'live';
+      liveDataStatusMessage = '';
       return;
     }
-    if (signal.error && !resourceWatchErrorNotified) {
-      resourceWatchErrorNotified = true;
-      resourceWatchStatus = 'reconnecting';
-      markLiveDataUnavailable('Live updates paused; refresh is available', {
-        clusterId: resourceWatchClusterId,
-        view: resourceWatchView,
-        dataKey: resourceWatchDataKey,
-      });
-      notify(`Live updates paused: ${signal.error}`);
-    }
-    if (signal.error) resourceWatchStatus = 'reconnecting';
-    if (!['added', 'modified', 'deleted'].includes(signal.action)) return;
-    markResourceWatchRefreshPending();
-    if (hasProtectedWorkflow()) {
-      markLiveDataPaused();
+    if (signal.action === 'reconnecting' || signal.action === 'forbidden') {
+      liveResourceStore.abortReset();
+      resourceWatchStatus = signal.action === 'forbidden' ? 'error' : 'reconnecting';
+      liveDataStatus = 'loaded';
+      liveDataStatusMessage = signal.action === 'forbidden' ? 'Watch is not permitted · refreshing every 30 seconds' : 'Reconnecting in the background; showing the last snapshot';
+      if (signal.action === 'forbidden') startSnapshotPolling();
       return;
     }
-    // Throttle rather than debounce: a busy cluster changes constantly, which would
-    // either starve a debounce or re-list thousands of rows on every event.
-    if (resourceWatchRefreshTimer) return;
-    const rowCount = activeView === 'Workloads' ? workloadObjects.length : resourceObjects.length;
-    const delay = rowCount > 1_000 ? 3_000 : rowCount > 200 ? 1_000 : 150;
-    resourceWatchRefreshTimer = window.setTimeout(() => {
-      resourceWatchRefreshTimer = undefined;
-      resourceWatchRefreshPending = false;
-      if (!resumeRecoveryPending) resumeRecoveryContext = null;
-      void refreshVisibleObjectList();
-    }, delay);
+    if (signal.action === 'delta' && liveResourceStore.apply(signal.changes || [])) {
+      if (!liveListPublishTimer) liveListPublishTimer = window.setTimeout(publishLiveRows, 50);
+    }
   }
 
   async function setupResourceWatchListener() {
@@ -1860,10 +1969,7 @@
     try {
       const { listen } = await import('@tauri-apps/api/event');
       resourceWatchUnlisten = await listen<ResourceWatchSignal>('kuberniva://resource-watch', ({ payload }) => {
-        if (payload.watchId !== resourceWatchId) {
-          resourceWatchSignalBuffer.set(payload.watchId, payload);
-          return;
-        }
+        if (payload.watchId !== resourceWatchId) return;
         scheduleResourceWatchRefresh(payload);
       });
     } catch {
@@ -2031,6 +2137,46 @@
     };
     window.addEventListener('pointermove', resize);
     window.addEventListener('pointerup', stopResize, { once: true });
+  }
+
+  function setWorkloadPanePercent(percent: number) {
+    workloadListPercent = panePercent(percent);
+    savePaneSize(workloadPaneStorageKey, workloadListPercent);
+  }
+
+  function resizeWorkloadPaneWithKeyboard(event: KeyboardEvent) {
+    const next = event.key === 'Home' ? 25 : event.key === 'End' ? 70
+      : event.key === 'ArrowLeft' ? workloadListPercent - 2
+        : event.key === 'ArrowRight' ? workloadListPercent + 2 : null;
+    if (next === null) return;
+    event.preventDefault();
+    setWorkloadPanePercent(next);
+  }
+
+  function startWorkloadPaneResize(event: PointerEvent) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    stopWorkloadPaneResize?.();
+    const handle = event.currentTarget as HTMLElement;
+    const grid = handle.closest('.workload-grid');
+    if (!grid) return;
+    handle.setPointerCapture(event.pointerId);
+    const move = (pointer: PointerEvent) => {
+      const bounds = grid.getBoundingClientRect();
+      workloadListPercent = panePercent(100 * (pointer.clientX - bounds.left) / bounds.width);
+    };
+    const stop = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', stop);
+      window.removeEventListener('pointercancel', stop);
+      if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId);
+      savePaneSize(workloadPaneStorageKey, workloadListPercent);
+      stopWorkloadPaneResize = undefined;
+    };
+    stopWorkloadPaneResize = stop;
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', stop, { once: true });
+    window.addEventListener('pointercancel', stop, { once: true });
   }
 
   function toggleSidebar() {
@@ -2867,7 +3013,7 @@
     if (!silent) loadingWorkloads = true;
     try {
       const { invoke } = await import('@tauri-apps/api/core');
-      const response = await invokeRead<ResourceObject[]>('list_resource_objects', {
+      const snapshot = await invokeRead<ResourceSnapshot>('list_resource_snapshot', {
         request: {
           kubeconfigPath: activeKubeconfigPath || kubeconfigPath || null,
           context: activeCluster,
@@ -2879,6 +3025,7 @@
           namespace: requestNamespace,
         },
       });
+      const response = snapshot.items;
       if (requestGeneration !== workloadRequestGeneration
         || requestClusterId !== activeClusterId
         || requestNamespace !== namespace
@@ -2887,6 +3034,7 @@
         || resourceKey(workloadResource) !== requestResourceKey) return;
       workloadObjects = response;
       resourceObjectCache.set(cacheKey, response);
+      resourceSnapshotVersions.set(cacheKey, snapshot.resourceVersion);
       reconcileWorkloadObjectSelection(response);
       markLiveDataAvailable(resource, requestClusterId, requestNamespace, 'Workloads');
       if (
@@ -3075,9 +3223,17 @@
 
   // Each fact gets its own aligned column; namespace appears only when it varies (all
   // namespaces). With details open (focus mode) the list narrows to name and status.
-  function buildWorkloadColumns(pod: boolean, allNamespaces: boolean, detailOpen: boolean) {
+  /** Columns follow the list's width: compact beside open details, a middle tier when dragged wider, then everything. */
+  function buildWorkloadColumns(pod: boolean, allNamespaces: boolean, density: 'compact' | 'medium' | 'full') {
     const columns: { key: WorkloadColumnKey; label: string; width: string }[] = [{ key: 'name', label: 'Name', width: 'minmax(170px, 2fr)' }];
-    if (detailOpen) return [{ key: 'name', label: 'Name', width: 'minmax(0, 1fr)' }, { key: 'status', label: 'Status', width: '88px' }] as typeof columns;
+    if (density === 'compact') return [{ key: 'name', label: 'Name', width: 'minmax(0, 1fr)' }, { key: 'status', label: 'Status', width: '88px' }] as typeof columns;
+    if (density === 'medium') {
+      columns[0].width = 'minmax(0, 1fr)';
+      columns.push({ key: 'status', label: 'Status', width: '92px' });
+      if (pod) columns.push({ key: 'ready', label: 'Ready', width: '52px' }, { key: 'restarts', label: 'Restarts', width: '64px' });
+      columns.push({ key: 'age', label: 'Age', width: '44px' });
+      return columns;
+    }
     if (allNamespaces) columns.push({ key: 'namespace', label: 'Namespace', width: 'minmax(90px, .7fr)' });
     if (pod) columns.push({ key: 'node', label: 'Node', width: 'minmax(110px, 1.1fr)' });
     columns.push({ key: 'status', label: 'Status', width: '96px' });
@@ -5009,6 +5165,7 @@
   }
 
   onDestroy(() => {
+    stopWorkloadPaneResize?.();
     removeVisualQaRecoveryControl?.();
     rememberActiveClusterSession();
     persistWorkspace();
@@ -5037,6 +5194,7 @@
     updateCheckTimer = window.setTimeout(() => void checkForUpdates(true), 8_000);
     resourceNavigatorWidth = loadPaneSize(resourceNavigatorWidthStorageKey, 272, 220, 440);
     resourceObjectPaneWidth = loadPaneSize(resourceObjectPaneWidthStorageKey, 300, 180, 520);
+    workloadListPercent = loadPaneSize(workloadPaneStorageKey, 38, 25, 70);
     void restoreWorkspace();
     void setupWindowFocusListener();
     resourceWatchListenerReady = setupResourceWatchListener();
@@ -5629,7 +5787,7 @@
         throw new Error('Resource listing is available in the Kuberniva desktop app');
       } else {
         const { invoke } = await import('@tauri-apps/api/core');
-        const response = await invokeRead<ResourceObject[]>('list_resource_objects', {
+        const snapshot = await invokeRead<ResourceSnapshot>('list_resource_snapshot', {
           request: {
             kubeconfigPath: activeKubeconfigPath || kubeconfigPath || null,
             context: activeCluster,
@@ -5641,6 +5799,7 @@
             namespace: requestNamespace,
           },
         });
+        const response = snapshot.items;
         if (requestGeneration !== resourceRequestGeneration
           || requestClusterId !== activeClusterId
           || requestNamespace !== namespace
@@ -5649,6 +5808,7 @@
           || resourceKey(selectedResource) !== requestResourceKey) return;
         resourceObjects = response;
         resourceObjectCache.set(cacheKey, response);
+      resourceSnapshotVersions.set(cacheKey, snapshot.resourceVersion);
         reconcileResourceObjectSelection(response);
         markLiveDataAvailable(resource, requestClusterId, requestNamespace, 'Resources');
         if (!silent && activeView === 'Resources') startLiveObjectRefresh();
@@ -6370,7 +6530,7 @@
             {#if workloadResources.length > 1}
               <nav class="kind-tabs" aria-label="Workload types">{#each workloadResources as resource}<button type="button" aria-pressed={workloadResource !== null && resourceKey(workloadResource) === resourceKey(resource)} class:kind-tab-active={workloadResource !== null && resourceKey(workloadResource) === resourceKey(resource)} title={kindLabel(resource)} on:click={() => selectWorkloadResource(resource)}>{kindTabLabel(resource)}</button>{/each}</nav>
             {/if}
-            <div class:workload-detail-open={(editorResource?.category === 'Workloads' && editorObject !== null) || (workloadDetailMode === 'logs' && logTarget !== null)} class:workload-logs-open={workloadDetailMode === 'logs' && logTarget !== null} class="workload-grid grid min-h-[560px]">
+            <div class:workload-detail-open={(editorResource?.category === 'Workloads' && editorObject !== null) || (workloadDetailMode === 'logs' && logTarget !== null)} class:workload-logs-open={workloadDetailMode === 'logs' && logTarget !== null} style:--workload-list-percent={`${workloadListPercent}%`} class="workload-grid grid min-h-[560px]">
               <div class="workload-list-panel overflow-hidden rounded-2xl border border-white/10 bg-[#151924]/90 shadow-2xl shadow-black/10"><div class="workload-list-header flex items-center justify-between gap-4 border-b border-white/10 px-5 py-4"><div><div class="flex items-center gap-2"><Container size={18} class="text-cyan-300" /><h3 class="m-0 text-lg font-semibold text-white">{workloadResource?.kind || 'Select a type'}</h3></div><p class="mb-0 mt-1 text-xs text-slate-400">{namespace} · {workloadResource?.apiVersion || 'Kubernetes API'}{#if workloadResource?.kind === 'Pod'} · CPU/memory from Metrics API{/if}</p></div><span class:live-status-loading={liveDataStatus === 'loading'} class:live-status-loaded={liveDataStatus === 'loaded'} class:live-status-stale={liveDataStatus === 'stale'} class:live-status-paused={liveDataStatus === 'paused'} class:live-status-unavailable={liveDataStatus === 'unavailable'} class="live-list-status" title={liveDataStatusTooltip} aria-label={liveDataStatusTooltip} aria-live="polite"><i></i>{liveDataStatusText}</span><label class="flex h-10 w-72 items-center gap-2 rounded-lg border border-white/10 bg-black/20 px-3 text-slate-500 focus-within:border-indigo-400 focus-within:bg-black/30 focus-within:ring-2 focus-within:ring-indigo-500/20"><Search size={16} /><input class="min-w-0 flex-1 border-0 bg-transparent text-sm text-slate-100 outline-none placeholder:text-slate-500" bind:value={workloadSearch} placeholder={`Filter ${workloadResource?.plural || 'workloads'}`} /></label></div>
                 {#if loadingWorkloads}
                   <div class="grid min-h-96 place-items-center text-sm text-slate-400"><div class="flex items-center gap-3"><RefreshCw size={18} class="animate-spin text-cyan-300" />Loading {workloadResource?.plural || 'workloads'}…</div></div>
@@ -6418,6 +6578,8 @@
                   </div>
                 {/if}
               </div>
+              <!-- svelte-ignore a11y_no_noninteractive_tabindex a11y_no_noninteractive_element_interactions -->
+              {#if workloadDetailOpen}<div class="workload-pane-resizer" role="separator" tabindex="0" aria-label="Resize workload list and details" aria-orientation="vertical" aria-valuemin="25" aria-valuemax="70" aria-valuenow={Math.round(workloadListPercent)} aria-valuetext={`${Math.round(workloadListPercent)}% workload list`} on:pointerdown={startWorkloadPaneResize} on:keydown={resizeWorkloadPaneWithKeyboard} on:dblclick={() => setWorkloadPanePercent(38)}></div>{/if}
               {#if workloadDetailMode === 'logs' && logTarget}
                 <aside class="workload-inspector workload-log-inspector" aria-label={`${logTarget.pod} logs`}>
                   <div class="workload-inspector-heading workload-log-heading"><div><p class="eyebrow">Live logs</p><h3>{logTarget.pod}</h3><p>{activeCluster} · {logScopeLabel || 'Pod'} · {logTarget.namespace}</p></div><div class="workload-inspector-actions">{#if editorResource && editorObject}<button class="secondary workload-log-back" on:click={closeWorkloadLogs}>← Details</button>{/if}<button aria-label="Close logs" on:click={closeWorkloadLogs}>×</button></div></div>

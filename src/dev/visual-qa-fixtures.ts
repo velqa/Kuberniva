@@ -18,9 +18,10 @@ export async function readVisualQaRequest(command: string, args: Record<string, 
     const checks = (args.request as { checks: { key: string }[] }).checks;
     return checks.map((check) => ({ key: check.key, allowed: true, denied: false }));
   }
-  if (command === 'list_resource_objects') {
+  if (command === 'list_resource_objects' || command === 'list_resource_snapshot') {
     const request = args.request as { kind: string };
-    return request.kind === 'Pod' ? visualQaPods : request.kind === 'Deployment' ? visualQaDeployments : visualQaConfigMaps;
+    const items = request.kind === 'Pod' ? visualQaPods : request.kind === 'Deployment' ? visualQaDeployments : visualQaConfigMaps;
+    return command === 'list_resource_snapshot' ? { items, resourceVersion: 'fixture-snapshot' } : items;
   }
   if (command === 'read_cluster_overview') return visualQaOverview;
   if (command === 'read_cluster_events') return visualQaPodEvents;

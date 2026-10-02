@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@import "./live-workspace.css";
 
 @theme {
   --font-sans: "DM Sans Variable", ui-sans-serif, system-ui, sans-serif;

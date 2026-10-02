@@ -37,6 +37,8 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 use x509_parser::{parse_x509_certificate, pem::parse_x509_pem};
+mod live_resources;
+use live_resources::{run_resource_watch, ResourceSnapshot, ResourceWatchRequest};
 
 static KUBE_CLIENT_CACHE: OnceLock<Mutex<HashMap<String, Client>>> = OnceLock::new();
 static PORT_FORWARD_REGISTRY: OnceLock<Mutex<HashMap<String, PortForwardRuntime>>> =
@@ -132,15 +134,6 @@ struct AccessReviewDecision {
     denied: bool,
     reason: Option<String>,
     evaluation_error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ResourceWatchSignal {
-    watch_id: String,
-    action: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2421,126 +2414,34 @@ fn dynamic_api_for_request(client: Client, request: &ResourceRequest) -> Api<Dyn
     }
 }
 
-fn resource_watch_signal(
-    app: &tauri::AppHandle,
-    watch_id: &str,
-    action: &str,
-    error: Option<String>,
-) {
-    let _ = app.emit(
-        "kuberniva://resource-watch",
-        ResourceWatchSignal {
-            watch_id: watch_id.to_string(),
-            action: action.to_string(),
-            error,
-        },
-    );
-}
-
-async fn run_resource_watch(
-    app: tauri::AppHandle,
-    watch_id: String,
-    request: ResourceRequest,
-    mut stop_rx: oneshot::Receiver<()>,
-) {
-    let mut retry_delay = std::time::Duration::from_secs(1);
-    loop {
-        let client =
-            match client_for(request.kubeconfig_path.clone(), request.context.clone()).await {
-                Ok(client) => client,
-                Err(error) => {
-                    resource_watch_signal(&app, &watch_id, "error", Some(error));
-                    tokio::select! {
-                        _ = &mut stop_rx => return,
-                        _ = tokio::time::sleep(retry_delay) => {}
-                    }
-                    retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(30));
-                    continue;
-                }
-            };
-        let api = dynamic_api_for_request(client, &request);
-        // The UI only needs change signals, so watch metadata from the current
-        // version: no replay of every object as ADDED, no full objects on the wire.
-        let start_version = match api.list_metadata(&ListParams::default().limit(1)).await {
-            Ok(list) => list
-                .metadata
-                .resource_version
-                .unwrap_or_else(|| "0".to_string()),
-            Err(_) => "0".to_string(),
-        };
-        let watch_params = WatchParams::default().timeout(290);
-        let stream = match api.watch_metadata(&watch_params, &start_version).await {
-            Ok(stream) => {
-                retry_delay = std::time::Duration::from_secs(1);
-                resource_watch_signal(&app, &watch_id, "connected", None);
-                stream
-            }
-            Err(error) => {
-                resource_watch_signal(&app, &watch_id, "error", Some(error.to_string()));
-                let _ = invalidate_cluster_client(
-                    request.kubeconfig_path.clone(),
-                    request.context.clone(),
-                );
-                tokio::select! {
-                    _ = &mut stop_rx => return,
-                    _ = tokio::time::sleep(retry_delay) => {}
-                }
-                retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(30));
-                continue;
-            }
-        };
-        futures_util::pin_mut!(stream);
-
-        loop {
-            tokio::select! {
-                _ = &mut stop_rx => return,
-                event = stream.next() => {
-                    match event {
-                        Some(Ok(WatchEvent::Added(_))) => resource_watch_signal(&app, &watch_id, "added", None),
-                        Some(Ok(WatchEvent::Modified(_))) => resource_watch_signal(&app, &watch_id, "modified", None),
-                        Some(Ok(WatchEvent::Deleted(_))) => resource_watch_signal(&app, &watch_id, "deleted", None),
-                        Some(Ok(WatchEvent::Bookmark(_))) => {}
-                        Some(Ok(WatchEvent::Error(status))) => {
-                            resource_watch_signal(&app, &watch_id, "error", Some(status.to_string()));
-                            break;
-                        }
-                        Some(Err(error)) => {
-                            resource_watch_signal(&app, &watch_id, "error", Some(error.to_string()));
-                            break;
-                        }
-                        None => break,
-                    }
-                }
-            }
-        }
-
-        // A watch can survive a laptop sleep long enough to return a stale
-        // transport. Rebuild the client before reconnecting instead of
-        // retrying the dead HTTP connection forever.
-        let _ = invalidate_cluster_client(request.kubeconfig_path.clone(), request.context.clone());
-        tokio::select! {
-            _ = &mut stop_rx => return,
-            _ = tokio::time::sleep(retry_delay) => {}
-        }
-        retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(30));
-    }
-}
-
 #[tauri::command]
 async fn start_resource_watch(
     app: tauri::AppHandle,
-    request: ResourceRequest,
+    request: ResourceWatchRequest,
+    watch_id: Option<String>,
 ) -> Result<String, String> {
-    let watch_id = format!(
-        "resource-watch-{}",
-        NEXT_RESOURCE_WATCH_ID.fetch_add(1, Ordering::Relaxed)
-    );
+    let watch_id = watch_id.unwrap_or_else(|| {
+        format!(
+            "resource-watch-{}",
+            NEXT_RESOURCE_WATCH_ID.fetch_add(1, Ordering::Relaxed)
+        )
+    });
+    if watch_id.is_empty() || watch_id.len() > 128 {
+        return Err("Invalid watch identifier".into());
+    }
     let (stop_tx, stop_rx) = oneshot::channel();
-    RESOURCE_WATCH_REGISTRY
+    let mut registry = RESOURCE_WATCH_REGISTRY
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .map_err(|_| "Kuberniva's resource watch registry is unavailable".to_string())?
-        .insert(watch_id.clone(), stop_tx);
+        .map_err(|_| "Kuberniva's resource watch registry is unavailable".to_string())?;
+    if registry.contains_key(&watch_id) {
+        return Err("Watch identifier is already active".into());
+    }
+    if registry.len() >= 16 {
+        return Err("Too many active resource watches".into());
+    }
+    registry.insert(watch_id.clone(), stop_tx);
+    drop(registry);
     let task_watch_id = watch_id.clone();
     tokio::spawn(async move {
         run_resource_watch(app, task_watch_id.clone(), request, stop_rx).await;
@@ -2573,6 +2474,47 @@ async fn list_resource_objects(request: ResourceRequest) -> Result<Vec<ResourceO
         cluster_read_timeout(&request.kubeconfig_path, &request.context, 35),
         list_resource_objects_inner(request),
     )
+    .await
+}
+
+#[tauri::command]
+async fn list_resource_snapshot(request: ResourceRequest) -> Result<ResourceSnapshot, String> {
+    bounded_cluster_read(
+        "Reading resource snapshot",
+        cluster_read_timeout(&request.kubeconfig_path, &request.context, 60),
+        live_resources::snapshot(request),
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PodMetricRow {
+    name: String,
+    namespace: String,
+    cpu_usage: String,
+    memory_usage: String,
+}
+
+#[tauri::command]
+async fn read_pod_metrics(request: ResourceRequest) -> Result<Vec<PodMetricRow>, String> {
+    // The client is built inside the bound so an expired SSO token cannot hang this read.
+    let timeout = cluster_read_timeout(&request.kubeconfig_path, &request.context, 10);
+    bounded_cluster_read("Reading pod metrics", timeout, async {
+        let client = client_for(request.kubeconfig_path.clone(), request.context.clone()).await?;
+        Ok(pod_usage_map(client, request.namespace.as_deref())
+            .await
+            .into_iter()
+            .map(
+                |((namespace, name), (cpu_usage, memory_usage))| PodMetricRow {
+                    name,
+                    namespace,
+                    cpu_usage,
+                    memory_usage,
+                },
+            )
+            .collect())
+    })
     .await
 }
 
@@ -5174,6 +5116,8 @@ pub fn run() {
             stop_resource_watch,
             check_resource_permissions,
             list_resource_objects,
+            list_resource_snapshot,
+            read_pod_metrics,
             list_resource_manifests,
             argocd_application_action,
             read_object_events,
