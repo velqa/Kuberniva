@@ -9,6 +9,36 @@ export const visualQaCluster = {
   kubeconfigPath: '/tmp/kuberniva-visual-qa.yaml',
 };
 
+/** Read-only transport for exercising sleep recovery without any real cluster. */
+export async function readVisualQaRequest(command: string, args: Record<string, unknown>, stall = false): Promise<unknown> {
+  if (stall) return new Promise(() => {});
+  await new Promise((resolve) => setTimeout(resolve, 550));
+  if (command === 'discover_cluster_catalog') return { context: visualQaCluster.name, namespaces: ['platform', 'payments'], resources: visualQaResources };
+  if (command === 'check_resource_permissions') {
+    const checks = (args.request as { checks: { key: string }[] }).checks;
+    return checks.map((check) => ({ key: check.key, allowed: true, denied: false }));
+  }
+  if (command === 'list_resource_objects') {
+    const request = args.request as { kind: string };
+    return request.kind === 'Pod' ? visualQaPods : request.kind === 'Deployment' ? visualQaDeployments : visualQaConfigMaps;
+  }
+  if (command === 'read_cluster_overview') return visualQaOverview;
+  if (command === 'read_cluster_events') return visualQaPodEvents;
+  throw new Error(`Unsupported visual QA read: ${command}`);
+}
+
+export function installRecoveryControl(container: HTMLElement, onResume: () => void) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.textContent = 'Simulate one hour away';
+  button.addEventListener('click', onResume);
+  container.append(button);
+  return () => {
+    button.removeEventListener('click', onResume);
+    button.remove();
+  };
+}
+
 export const visualQaFavoriteClusters = [
   visualQaCluster,
   { ...visualQaCluster, id: 'visual-qa-staging', name: 'payments-staging', status: 'Not connected', tone: 'gray', namespace: 'payments' },
@@ -201,6 +231,25 @@ export const visualQaPodManifest = {
   },
 };
 
+// A realistic mix of cluster events for designing the Events page.
+const eventAt = (secondsAgo: number) => new Date(Date.now() - secondsAgo * 1000).toISOString();
+export const visualQaClusterEvents = [
+  { name: 'e1', namespace: 'platform', eventType: 'Warning', reason: 'BackOff', message: 'Back-off pulling image "example.invalid/platform/api:3.8.2"', involvedKind: 'Pod', involvedName: 'api-7d8496f6d9-2wkd8', count: 14, source: 'kubelet', lastObserved: eventAt(20) },
+  { name: 'e2', namespace: 'platform', eventType: 'Warning', reason: 'Failed', message: 'Failed to pull image "example.invalid/platform/api:3.8.2": manifest unknown', involvedKind: 'Pod', involvedName: 'api-7d8496f6d9-2wkd8', count: 14, source: 'kubelet', lastObserved: eventAt(25) },
+  { name: 'e3', namespace: 'platform', eventType: 'Normal', reason: 'Pulling', message: 'Pulling image "example.invalid/platform/api:3.8.2"', involvedKind: 'Pod', involvedName: 'api-7d8496f6d9-2wkd8', count: 15, source: 'kubelet', lastObserved: eventAt(30) },
+  { name: 'e4', namespace: 'payments', eventType: 'Warning', reason: 'Unhealthy', message: 'Readiness probe failed: HTTP probe failed with statuscode: 503', involvedKind: 'Pod', involvedName: 'payments-worker-6c9d7-xk2lp', count: 6, source: 'kubelet', lastObserved: eventAt(70) },
+  { name: 'e5', namespace: 'platform', eventType: 'Normal', reason: 'ScalingReplicaSet', message: 'Scaled up replica set api-7d8496f6d9 to 3', involvedKind: 'Deployment', involvedName: 'api', count: 1, source: 'deployment-controller', lastObserved: eventAt(140) },
+  { name: 'e6', namespace: 'platform', eventType: 'Normal', reason: 'SuccessfulCreate', message: 'Created pod: api-7d8496f6d9-jg6h4', involvedKind: 'ReplicaSet', involvedName: 'api-7d8496f6d9', count: 1, source: 'replicaset-controller', lastObserved: eventAt(145) },
+  { name: 'e7', namespace: '', eventType: 'Warning', reason: 'NodeNotReady', message: 'Node worker-b-2 status is now: NodeNotReady', involvedKind: 'Node', involvedName: 'worker-b-2', count: 1, source: 'node-controller', lastObserved: eventAt(320) },
+  { name: 'e8', namespace: 'platform', eventType: 'Normal', reason: 'Scheduled', message: 'Successfully assigned platform/api-7d8496f6d9-jg6h4 to worker-2', involvedKind: 'Pod', involvedName: 'api-7d8496f6d9-jg6h4', count: 1, source: 'default-scheduler', lastObserved: eventAt(150) },
+  { name: 'e9', namespace: 'platform', eventType: 'Normal', reason: 'Started', message: 'Started container api', involvedKind: 'Pod', involvedName: 'api-7d8496f6d9-jg6h4', count: 1, source: 'kubelet', lastObserved: eventAt(130) },
+  { name: 'e10', namespace: 'payments', eventType: 'Warning', reason: 'FailedScheduling', message: '0/8 nodes are available: 1 node(s) were unschedulable, 7 Insufficient memory. preemption: 0/8 nodes are available.', involvedKind: 'Pod', involvedName: 'payments-batch-29381-qz8v4', count: 3, source: 'default-scheduler', lastObserved: eventAt(410) },
+  { name: 'e11', namespace: 'platform', eventType: 'Normal', reason: 'Killing', message: 'Stopping container worker', involvedKind: 'Pod', involvedName: 'worker-6ff5d79c75-8zq7t', count: 1, source: 'kubelet', lastObserved: eventAt(900) },
+  { name: 'e12', namespace: 'platform', eventType: 'Normal', reason: 'Pulled', message: 'Successfully pulled image "example.invalid/platform/worker:1.4.0" in 1.204s', involvedKind: 'Pod', involvedName: 'worker-6ff5d79c75-wf5kp', count: 1, source: 'kubelet', lastObserved: eventAt(1100) },
+  { name: 'e13', namespace: 'observability', eventType: 'Normal', reason: 'SuccessfulRescale', message: 'New size: 4; reason: cpu resource utilization (percentage of request) above target', involvedKind: 'HorizontalPodAutoscaler', involvedName: 'collector', count: 2, source: 'horizontal-pod-autoscaler', lastObserved: eventAt(1500) },
+  { name: 'e14', namespace: 'platform', eventType: 'Normal', reason: 'Sync', message: 'Scheduled for sync', involvedKind: 'Ingress', involvedName: 'api-public', count: 3, source: 'nginx-ingress-controller', lastObserved: eventAt(2400) },
+];
+
 export const visualQaPodEvents = [
   { name: 'api-pull', namespace: 'platform', eventType: 'Normal', reason: 'Pulling', message: 'Pulling image "example.invalid/platform/api:3.8.2"', involvedKind: 'Pod', involvedName: 'api-7d8496f6d9-2wkd8', count: 1, lastObserved: new Date(Date.now() - 90_000).toISOString() },
   { name: 'api-failed', namespace: 'platform', eventType: 'Warning', reason: 'Failed', message: 'Failed to pull image: manifest unknown', involvedKind: 'Pod', involvedName: 'api-7d8496f6d9-2wkd8', count: 4, lastObserved: new Date(Date.now() - 45_000).toISOString() },
@@ -296,6 +345,39 @@ const nodeBase = {
   allocatable: [{ key: 'cpu', value: '7.8 cores' }, { key: 'memory', value: '30Gi' }, { key: 'pods', value: '110' }],
 };
 
+// Eight nodes with mixed health and load, for designing overview layouts at a realistic scale.
+const largeNodeSpecs: [string, string[], number, number, Record<string, unknown>][] = [
+  ['control-plane-1', ['control-plane'], 22, 41, {}],
+  ['control-plane-2', ['control-plane'], 18, 38, {}],
+  ['worker-a-1', ['worker'], 64, 71, {}],
+  ['worker-a-2', ['worker'], 81, 88, { conditions: [{ type: 'Ready', status: 'True', reason: 'KubeletReady', message: 'kubelet is posting ready status' }, { type: 'MemoryPressure', status: 'True', reason: 'KubeletHasInsufficientMemory', message: 'kubelet has insufficient memory available' }] }],
+  ['worker-b-1', ['worker'], 37, 52, {}],
+  ['worker-b-2', ['worker'], 0, 0, { ready: false, conditions: [{ type: 'Ready', status: 'Unknown', reason: 'NodeStatusUnknown', message: 'Kubelet stopped posting node status.' }] }],
+  ['worker-gpu-1', ['worker', 'gpu'], 46, 63, {}],
+  ['worker-spot-1', ['worker', 'spot'], 12, 24, { unschedulable: true, taints: [{ key: 'node.kubernetes.io/unschedulable', effect: 'NoSchedule' }] }],
+];
+export const visualQaLargeOverview = {
+  nodes: largeNodeSpecs.map(([name, roles, cpu, memory, extra], index) => ({
+    ...nodeBase,
+    ...extra,
+    name,
+    roles,
+    uid: `visual-large-node-${index}`,
+    addresses: [{ type: 'InternalIP', address: `10.0.20.${11 + index}` }],
+    providerId: `qa://${name}`,
+    creationTimestamp: new Date(Date.now() - (30 - index * 3) * 86_400_000).toISOString(),
+    cpuCapacity: '8 cores',
+    memoryCapacity: '32Gi',
+    cpuUsage: cpu ? `${(cpu * 0.08).toFixed(2)} cores` : undefined,
+    memoryUsage: memory ? `${(memory * 0.32).toFixed(1)}Gi` : undefined,
+    cpuUsagePercent: cpu || undefined,
+    memoryUsagePercent: memory || undefined,
+  })),
+  totals: { cpuCapacity: '64 cores', memoryCapacity: '256Gi', storageCapacity: '1.9Ti', cpuUsage: '28.0 cores', memoryUsage: '121.6Gi', cpuUsagePercent: 44, memoryUsagePercent: 48, metricNodes: 7 },
+  metricsAvailable: true,
+  observedAt: new Date().toISOString(),
+};
+
 export const visualQaOverview = {
   nodes: [
     { ...nodeBase, name: 'worker-1', uid: 'visual-node-1', addresses: [{ type: 'InternalIP', address: '10.0.12.21' }], providerId: 'qa://worker-1', creationTimestamp: new Date(Date.now() - 14 * 86_400_000).toISOString(), cpuCapacity: '8 cores', memoryCapacity: '32Gi', cpuUsage: '3.12 cores', memoryUsage: '14.6Gi', cpuUsagePercent: 39, memoryUsagePercent: 46 },
@@ -305,3 +387,109 @@ export const visualQaOverview = {
   metricsAvailable: true,
   observedAt: new Date().toISOString(),
 };
+
+/** 3,000 Pods across 30 namespaces, for measuring large-cluster rendering. */
+export const visualQaLargePods = Array.from({ length: 3_000 }, (_, index) => {
+  const statuses = ['Running', 'Running', 'Running', 'Running', 'Running', 'Running', 'Running', 'Pending', 'CrashLoopBackOff', 'Completed'];
+  const status = statuses[index % statuses.length];
+  const totalContainers = (index % 3) + 1;
+  return {
+    name: `service-${String(Math.floor(index / 4)).padStart(4, '0')}-7d8496f6d9-${(index * 7919).toString(36).slice(-5)}`,
+    namespace: `team-${String(index % 30).padStart(2, '0')}`,
+    uid: `visual-large-pod-${index}`,
+    resourceVersion: `${90_000 + index}`,
+    createdAt: new Date(Date.now() - ((index % 600) + 1) * 60_000).toISOString(),
+    status,
+    readyContainers: status === 'Running' ? totalContainers : 0,
+    totalContainers,
+    restarts: status === 'CrashLoopBackOff' ? 12 : index % 17 === 0 ? 1 : 0,
+    cpuUsage: `${((index % 50) / 100).toFixed(3)} cores`,
+    memoryUsage: `${64 + (index % 40) * 16}Mi`,
+    nodeName: `worker-${(index % 24) + 1}`,
+  };
+});
+
+export const visualQaExtraResources = [
+  { group: 'gateway.networking.k8s.io', version: 'v1', apiVersion: 'gateway.networking.k8s.io/v1', kind: 'Gateway', plural: 'gateways', namespaced: true, category: 'Gateway APIs', custom: true, crd: true },
+  { group: 'admissionregistration.k8s.io', version: 'v1', apiVersion: 'admissionregistration.k8s.io/v1', kind: 'ValidatingAdmissionPolicy', plural: 'validatingadmissionpolicies', namespaced: false, category: 'Admission Policies', custom: false, crd: false },
+  { group: 'admissionregistration.k8s.io', version: 'v1', apiVersion: 'admissionregistration.k8s.io/v1', kind: 'ValidatingAdmissionPolicyBinding', plural: 'validatingadmissionpolicybindings', namespaced: false, category: 'Admission Policies', custom: false, crd: false },
+  { group: 'argoproj.io', version: 'v1alpha1', apiVersion: 'argoproj.io/v1alpha1', kind: 'Application', plural: 'applications', namespaced: true, category: 'Custom Resources', custom: true, crd: true },
+];
+
+export const visualQaGateway = {
+  apiVersion: 'gateway.networking.k8s.io/v1', kind: 'Gateway',
+  metadata: { name: 'public-edge', namespace: 'platform' },
+  spec: { gatewayClassName: 'istio', listeners: [
+    { name: 'https', protocol: 'HTTPS', port: 443, hostname: '*.shop.example.com', tls: { mode: 'Terminate' }, allowedRoutes: { namespaces: { from: 'All' } } },
+    { name: 'http-redirect', protocol: 'HTTP', port: 80, allowedRoutes: { namespaces: { from: 'Same' } } },
+    { name: 'grpc', protocol: 'HTTPS', port: 8443, hostname: 'api.shop.example.com', tls: { mode: 'Terminate' } },
+  ] },
+  status: {
+    addresses: [{ type: 'IPAddress', value: '34.120.18.44' }],
+    conditions: [{ type: 'Accepted', status: 'True' }, { type: 'Programmed', status: 'True' }],
+    listeners: [
+      { name: 'https', attachedRoutes: 3, conditions: [{ type: 'Programmed', status: 'True' }] },
+      { name: 'http-redirect', attachedRoutes: 1, conditions: [{ type: 'Programmed', status: 'True' }] },
+      { name: 'grpc', attachedRoutes: 0, conditions: [{ type: 'Programmed', status: 'False', reason: 'InvalidCertificateRef' }] },
+    ],
+  },
+};
+
+export const visualQaGatewayRoutes = [
+  { kind: 'HTTPRoute', name: 'storefront', namespace: 'payments', hostnames: ['www.shop.example.com'], parents: ['platform/public-edge'] },
+  { kind: 'HTTPRoute', name: 'checkout-api', namespace: 'payments', hostnames: ['api.shop.example.com'], parents: ['platform/public-edge'] },
+  { kind: 'HTTPRoute', name: 'status-page', namespace: 'platform', hostnames: [], parents: ['platform/public-edge'] },
+];
+
+export const visualQaHttpRoute = {
+  apiVersion: 'gateway.networking.k8s.io/v1', kind: 'HTTPRoute',
+  metadata: { name: 'checkout-api', namespace: 'platform' },
+  spec: {
+    parentRefs: [{ name: 'public-edge', namespace: 'platform', sectionName: 'https' }],
+    hostnames: ['api.shop.example.com', 'checkout.shop.example.com'],
+    rules: [
+      { matches: [{ path: { type: 'PathPrefix', value: '/v2/checkout' }, method: 'POST' }], backendRefs: [{ name: 'checkout', port: 8080, weight: 90 }, { name: 'checkout-canary', port: 8080, weight: 10 }] },
+      { matches: [{ path: { type: 'PathPrefix', value: '/v2' }, headers: [{ name: 'x-tenant', value: 'beta' }] }], filters: [{ type: 'RequestHeaderModifier' }], backendRefs: [{ name: 'api-beta', namespace: 'beta', port: 8080 }] },
+      { backendRefs: [{ name: 'api', port: 8080 }] },
+    ],
+  },
+  status: { parents: [{ parentRef: { name: 'public-edge', namespace: 'platform', sectionName: 'https' }, conditions: [{ type: 'Accepted', status: 'True' }, { type: 'ResolvedRefs', status: 'False', reason: 'RefNotPermitted', message: 'ReferenceGrant missing for beta/api-beta' }] }] },
+};
+
+export const visualQaAdmissionPolicy = {
+  apiVersion: 'admissionregistration.k8s.io/v1', kind: 'ValidatingAdmissionPolicy',
+  metadata: { name: 'replica-limits' },
+  spec: {
+    failurePolicy: 'Fail',
+    paramKind: { apiVersion: 'v1', kind: 'ConfigMap' },
+    matchConstraints: { resourceRules: [{ apiGroups: ['apps'], apiVersions: ['v1'], operations: ['CREATE', 'UPDATE'], resources: ['deployments', 'statefulsets'] }] },
+    matchConditions: [{ name: 'exclude-system', expression: "!object.metadata.namespace.startsWith('kube-')" }],
+    variables: [{ name: 'maxReplicas', expression: "int(params.data['maxReplicas'])" }],
+    validations: [
+      { expression: 'object.spec.replicas <= variables.maxReplicas', messageExpression: "'replicas must be at most ' + string(variables.maxReplicas)", reason: 'Invalid' },
+      { expression: "has(object.metadata.labels) && 'team' in object.metadata.labels", message: 'Every workload needs a team label', reason: 'Forbidden' },
+    ],
+    auditAnnotations: [{ key: 'high-replica-count', valueExpression: "object.spec.replicas > 10 ? 'replicas: ' + string(object.spec.replicas) : null" }],
+  },
+  status: { typeChecking: { expressionWarnings: [{ fieldRef: 'spec.validations[0].expression', warning: 'params may be absent when the binding omits paramRef' }] } },
+};
+
+const argoApp = (name: string, project: string, sync: string, health: string, phase: string, extra: Record<string, unknown> = {}) => ({
+  metadata: { name, namespace: 'argocd' },
+  spec: { project, source: { repoURL: 'https://github.com/acme/deploy.git', path: `apps/${name}`, targetRevision: 'main' }, destination: { server: 'https://kubernetes.default.svc', namespace: name }, syncPolicy: name.startsWith('billing') ? {} : { automated: { prune: true, selfHeal: true } } },
+  status: { sync: { status: sync, revision: '4f2a91c0d1e2' }, health: { status: health }, operationState: { phase, message: phase === 'Failed' ? 'one or more synchronization tasks completed unsuccessfully' : 'successfully synced (all tasks run)' }, reconciledAt: new Date(Date.now() - 4 * 60_000).toISOString(), resources: [
+    { kind: 'Deployment', name, namespace: name, status: sync, health: { status: health } },
+    { kind: 'Service', name, namespace: name, status: 'Synced', health: { status: 'Healthy' } },
+    { kind: 'ConfigMap', name: `${name}-config`, namespace: name, status: 'Synced' },
+  ], ...extra },
+});
+
+export const visualQaArgoApps = [
+  argoApp('billing-api', 'payments', 'OutOfSync', 'Degraded', 'Failed', { conditions: [{ type: 'SyncError', message: 'Deployment billing-api: container image pull back-off' }] }),
+  argoApp('checkout', 'payments', 'Synced', 'Healthy', 'Succeeded'),
+  argoApp('storefront', 'web', 'Synced', 'Progressing', 'Running'),
+  argoApp('search', 'web', 'OutOfSync', 'Healthy', 'Succeeded'),
+  argoApp('ingress-nginx', 'platform', 'Synced', 'Healthy', 'Succeeded'),
+  argoApp('cert-manager', 'platform', 'Synced', 'Healthy', 'Succeeded'),
+  argoApp('observability', 'platform', 'Synced', 'Healthy', 'Succeeded'),
+];

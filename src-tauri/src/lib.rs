@@ -7,8 +7,8 @@ use k8s_openapi::api::authorization::v1::{
 use k8s_openapi::api::core::v1::{Event, Namespace, Node, Pod};
 use kube::{
     api::{
-        Api, AttachParams, DeleteParams, DynamicObject, ListParams, LogParams, PostParams,
-        Preconditions, WatchEvent, WatchParams,
+        Api, AttachParams, DeleteParams, DynamicObject, ListParams, LogParams, Patch, PatchParams,
+        PostParams, Preconditions, WatchEvent, WatchParams,
     },
     config::{KubeConfigOptions, Kubeconfig},
     core::ApiResource,
@@ -1064,6 +1064,10 @@ fn category_for(group: &str, plural: &str) -> (String, bool, bool) {
     // resource bucket so Gateways and Routes are immediately discoverable.
     let category = if group == "gateway.networking.k8s.io" {
         "Gateway APIs"
+    } else if group == "admissionregistration.k8s.io"
+        && (plural.ends_with("admissionpolicies") || plural.ends_with("admissionpolicybindings"))
+    {
+        "Admission Policies"
     } else if crd {
         "Custom Resources"
     } else if matches!(
@@ -1238,6 +1242,17 @@ async fn ensure_resource_access(client: Client, check: AccessReviewCheck) -> Res
 
 #[tauri::command]
 async fn check_resource_permissions(
+    request: AccessReviewRequest,
+) -> Result<Vec<AccessReviewDecision>, String> {
+    bounded_cluster_read(
+        "Checking your access",
+        cluster_read_timeout(&request.kubeconfig_path, &request.context, 35),
+        check_resource_permissions_inner(request),
+    )
+    .await
+}
+
+async fn check_resource_permissions_inner(
     request: AccessReviewRequest,
 ) -> Result<Vec<AccessReviewDecision>, String> {
     if request.checks.len() > 256 {
@@ -1786,8 +1801,64 @@ fn read_kubeconfig_contexts(kubeconfig_path: Option<String>) -> Result<Kubeconfi
     })
 }
 
+/// Contexts that authenticate through an exec plugin or auth provider can open a
+/// browser sign-in when their token expires, so reads wait long enough for it.
+const INTERACTIVE_AUTH_READ_TIMEOUT_SECS: u64 = 300;
+
+fn uses_interactive_auth(kubeconfig: &Kubeconfig, context: Option<&str>) -> bool {
+    let context_name = context.or(kubeconfig.current_context.as_deref());
+    let user = kubeconfig
+        .contexts
+        .iter()
+        .find(|named| Some(named.name.as_str()) == context_name)
+        .and_then(|named| named.context.as_ref())
+        .and_then(|context| context.user.as_deref());
+    matches!(
+        auth_method_for(kubeconfig, user).as_str(),
+        "OIDC / exec" | "OIDC provider"
+    )
+}
+
+fn cluster_read_timeout(
+    kubeconfig_path: &Option<String>,
+    context: &Option<String>,
+    base_secs: u64,
+) -> std::time::Duration {
+    let interactive = load_kubeconfig(kubeconfig_path.as_deref())
+        .map(|kubeconfig| uses_interactive_auth(&kubeconfig, context.as_deref()))
+        .unwrap_or(false);
+    let secs = if interactive {
+        base_secs.max(INTERACTIVE_AUTH_READ_TIMEOUT_SECS)
+    } else {
+        base_secs
+    };
+    std::time::Duration::from_secs(secs)
+}
+
+async fn bounded_cluster_read<T>(
+    label: &str,
+    timeout: std::time::Duration,
+    request: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    tokio::time::timeout(timeout, request)
+        .await
+        .map_err(|_| format!("{label} timed out. Reconnect and try again."))?
+}
+
 #[tauri::command]
 async fn discover_cluster_catalog(
+    kubeconfig_path: Option<String>,
+    context: Option<String>,
+) -> Result<ClusterCatalog, String> {
+    bounded_cluster_read(
+        "Connecting to the cluster",
+        cluster_read_timeout(&kubeconfig_path, &context, 90),
+        discover_cluster_catalog_inner(kubeconfig_path, context),
+    )
+    .await
+}
+
+async fn discover_cluster_catalog_inner(
     kubeconfig_path: Option<String>,
     context: Option<String>,
 ) -> Result<ClusterCatalog, String> {
@@ -1807,8 +1878,7 @@ async fn discover_cluster_catalog(
     };
     let namespace_api = Api::<Namespace>::all(client.clone());
     let namespace_params = ListParams::default();
-    let (discovery, namespace_list) =
-        tokio::join!(discover, namespace_api.list(&namespace_params));
+    let (discovery, namespace_list) = tokio::join!(discover, namespace_api.list(&namespace_params));
     let discovery = discovery.map_err(|error| error.to_string())?;
 
     let mut resources = discovery
@@ -1858,6 +1928,18 @@ async fn discover_cluster_catalog(
 
 #[tauri::command]
 async fn read_cluster_overview(
+    kubeconfig_path: Option<String>,
+    context: Option<String>,
+) -> Result<ClusterOverview, String> {
+    bounded_cluster_read(
+        "Reading node metrics",
+        cluster_read_timeout(&kubeconfig_path, &context, 35),
+        read_cluster_overview_inner(kubeconfig_path, context),
+    )
+    .await
+}
+
+async fn read_cluster_overview_inner(
     kubeconfig_path: Option<String>,
     context: Option<String>,
 ) -> Result<ClusterOverview, String> {
@@ -2169,6 +2251,18 @@ async fn read_cluster_events(
     kubeconfig_path: Option<String>,
     context: Option<String>,
 ) -> Result<Vec<ClusterEvent>, String> {
+    bounded_cluster_read(
+        "Reading cluster events",
+        cluster_read_timeout(&kubeconfig_path, &context, 35),
+        read_cluster_events_inner(kubeconfig_path, context),
+    )
+    .await
+}
+
+async fn read_cluster_events_inner(
+    kubeconfig_path: Option<String>,
+    context: Option<String>,
+) -> Result<Vec<ClusterEvent>, String> {
     let client = client_for(kubeconfig_path, context).await?;
     let params = ListParams {
         limit: Some(250),
@@ -2283,8 +2377,14 @@ async fn run_resource_watch(
                 }
             };
         let api = dynamic_api_for_request(client, &request);
+        // The UI only needs change signals, so watch metadata from the current
+        // version: no replay of every object as ADDED, no full objects on the wire.
+        let start_version = match api.list_metadata(&ListParams::default().limit(1)).await {
+            Ok(list) => list.metadata.resource_version.unwrap_or_else(|| "0".to_string()),
+            Err(_) => "0".to_string(),
+        };
         let watch_params = WatchParams::default().timeout(290);
-        let stream = match api.watch(&watch_params, "0").await {
+        let stream = match api.watch_metadata(&watch_params, &start_version).await {
             Ok(stream) => {
                 retry_delay = std::time::Duration::from_secs(1);
                 resource_watch_signal(&app, &watch_id, "connected", None);
@@ -2383,6 +2483,17 @@ fn stop_resource_watch(watch_id: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn list_resource_objects(request: ResourceRequest) -> Result<Vec<ResourceObject>, String> {
+    bounded_cluster_read(
+        "Reading resources",
+        cluster_read_timeout(&request.kubeconfig_path, &request.context, 35),
+        list_resource_objects_inner(request),
+    )
+    .await
+}
+
+async fn list_resource_objects_inner(
+    request: ResourceRequest,
+) -> Result<Vec<ResourceObject>, String> {
     let client = client_for(request.kubeconfig_path, request.context).await?;
     if request.kind == "Pod" {
         let namespace = request
@@ -2439,8 +2550,9 @@ async fn list_resource_objects(request: ResourceRequest) -> Result<Vec<ResourceO
     } else {
         Api::all_with(client, &resource)
     };
+    // Rows only show metadata; skip transferring and decoding full objects.
     let mut objects = api
-        .list(&ListParams::default())
+        .list_metadata(&ListParams::default())
         .await
         .map_err(|error| error.to_string())?
         .items
@@ -2471,8 +2583,128 @@ async fn list_resource_objects(request: ResourceRequest) -> Result<Vec<ResourceO
     Ok(objects)
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArgoApplicationActionRequest {
+    kubeconfig_path: Option<String>,
+    context: Option<String>,
+    version: String,
+    namespace: String,
+    name: String,
+    action: String,
+}
+
+/// The merge patch Argo CD's own CLI applies: an annotation for refresh, an
+/// `operation` for sync. Refuses to queue a sync while one is still running.
+fn argocd_action_patch(action: &str, application: &Value) -> Result<Value, String> {
+    match action {
+        "refresh" | "hard-refresh" => {
+            let mode = if action == "hard-refresh" { "hard" } else { "normal" };
+            Ok(serde_json::json!({
+                "metadata": { "annotations": { "argocd.argoproj.io/refresh": mode } }
+            }))
+        }
+        "sync" => {
+            if application["status"]["operationState"]["phase"].as_str() == Some("Running")
+                || application.get("operation").is_some_and(|operation| !operation.is_null())
+            {
+                return Err("A sync is already in progress for this application".to_string());
+            }
+            let mut sync = serde_json::json!({ "syncStrategy": { "hook": {} } });
+            if let Some(revision) = application["spec"]["source"]["targetRevision"].as_str() {
+                sync["revision"] = Value::String(revision.to_string());
+            }
+            Ok(serde_json::json!({
+                "operation": {
+                    "initiatedBy": { "username": "kuberniva" },
+                    "sync": sync
+                }
+            }))
+        }
+        other => Err(format!("Unsupported Argo CD action: {other}")),
+    }
+}
+
+#[tauri::command]
+async fn argocd_application_action(request: ArgoApplicationActionRequest) -> Result<(), String> {
+    let client = client_for(request.kubeconfig_path.clone(), request.context.clone()).await?;
+    let resource = api_resource(
+        "argoproj.io".to_string(),
+        request.version.clone(),
+        "Application".to_string(),
+        "applications".to_string(),
+    );
+    let api: Api<DynamicObject> = Api::namespaced_with(client, &request.namespace, &resource);
+    let current = api
+        .get(&request.name)
+        .await
+        .map_err(|error| error.to_string())?;
+    let current = serde_json::to_value(current).map_err(|error| error.to_string())?;
+    let patch = argocd_action_patch(&request.action, &current)?;
+    api.patch(
+        &request.name,
+        &PatchParams::default(),
+        &Patch::Merge(&patch),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Full objects of one type, for structured views that read spec and status
+/// (Gateway routes, admission policies, Argo CD applications).
+#[tauri::command]
+async fn list_resource_manifests(request: ResourceRequest) -> Result<Vec<serde_json::Value>, String> {
+    bounded_cluster_read(
+        "Reading resources",
+        cluster_read_timeout(&request.kubeconfig_path, &request.context, 35),
+        list_resource_manifests_inner(request),
+    )
+    .await
+}
+
+async fn list_resource_manifests_inner(
+    request: ResourceRequest,
+) -> Result<Vec<serde_json::Value>, String> {
+    if request.group.is_empty() && request.plural == "secrets" {
+        return Err("Secret values are only read one object at a time".to_string());
+    }
+    let client = client_for(request.kubeconfig_path.clone(), request.context.clone()).await?;
+    let api = dynamic_api_for_request(client, &request);
+    let mut objects = api
+        .list(&ListParams::default())
+        .await
+        .map_err(|error| error.to_string())?
+        .items
+        .into_iter()
+        .map(|mut object| {
+            object.metadata.managed_fields = None;
+            serde_json::to_value(object).map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let key = |value: &serde_json::Value| {
+        (
+            value["metadata"]["namespace"].as_str().unwrap_or_default().to_string(),
+            value["metadata"]["name"].as_str().unwrap_or_default().to_string(),
+        )
+    };
+    objects.sort_by_key(key);
+    Ok(objects)
+}
+
 #[tauri::command]
 async fn get_resource_detail(request: ResourceObjectRequest) -> Result<ResourceDetail, String> {
+    bounded_cluster_read(
+        "Reading resource details",
+        cluster_read_timeout(&request.kubeconfig_path, &request.context, 35),
+        get_resource_detail_inner(request),
+    )
+    .await
+}
+
+async fn get_resource_detail_inner(
+    request: ResourceObjectRequest,
+) -> Result<ResourceDetail, String> {
     let client = client_for(request.kubeconfig_path, request.context).await?;
     let resource = api_resource(request.group, request.version, request.kind, request.plural);
     let object: DynamicObject = if request.namespaced {
@@ -2600,6 +2832,17 @@ async fn save_resource_yaml(request: SaveResourceYamlRequest) -> Result<(), Stri
 
 #[tauri::command]
 async fn list_workload_pods(request: WorkloadPodRequest) -> Result<Vec<ResourceObject>, String> {
+    bounded_cluster_read(
+        "Finding workload Pods",
+        cluster_read_timeout(&request.kubeconfig_path, &request.context, 35),
+        list_workload_pods_inner(request),
+    )
+    .await
+}
+
+async fn list_workload_pods_inner(
+    request: WorkloadPodRequest,
+) -> Result<Vec<ResourceObject>, String> {
     let client = client_for(request.kubeconfig_path, request.context).await?;
     let api_version = if request.group.is_empty() {
         request.version.clone()
@@ -2645,6 +2888,15 @@ async fn list_workload_pods(request: WorkloadPodRequest) -> Result<Vec<ResourceO
 
 #[tauri::command]
 async fn read_pod_logs(request: PodLogRequest) -> Result<PodLogResponse, String> {
+    bounded_cluster_read(
+        "Reading pod logs",
+        cluster_read_timeout(&request.kubeconfig_path, &request.context, 35),
+        read_pod_logs_inner(request),
+    )
+    .await
+}
+
+async fn read_pod_logs_inner(request: PodLogRequest) -> Result<PodLogResponse, String> {
     let client = client_for(request.kubeconfig_path, request.context).await?;
     ensure_resource_access(
         client.clone(),
@@ -2806,6 +3058,15 @@ fn pod_runtime_info(pod: &Pod) -> PodRuntimeInfo {
 
 #[tauri::command]
 async fn get_pod_runtime(request: PodRuntimeRequest) -> Result<PodRuntimeInfo, String> {
+    bounded_cluster_read(
+        "Inspecting Pod containers",
+        cluster_read_timeout(&request.kubeconfig_path, &request.context, 35),
+        get_pod_runtime_inner(request),
+    )
+    .await
+}
+
+async fn get_pod_runtime_inner(request: PodRuntimeRequest) -> Result<PodRuntimeInfo, String> {
     let client = client_for(request.kubeconfig_path, request.context).await?;
     let pod = Api::<Pod>::namespaced(client, &request.namespace)
         .get(&request.pod)
@@ -3044,7 +3305,8 @@ fn prepare_cluster_process(request: &KubeCliRequest) -> Result<(TokioCommand, St
     let mut process;
     if request.shell {
         // Shell mode runs the text as typed, so apply the `get pods` shorthand there too.
-        let shell_input = if !first_token_is_tool && is_kubectl_shorthand(&cli_tokens(command)?[0]) {
+        let shell_input = if !first_token_is_tool && is_kubectl_shorthand(&cli_tokens(command)?[0])
+        {
             format!("kubectl {command}")
         } else {
             command.to_string()
@@ -3202,7 +3464,13 @@ async fn start_cluster_command<R: tauri::Runtime>(
             }
         }
         if !batch.is_empty() {
-            let _ = pump_app.emit("kuberniva://cli-output", CliOutputEvent { run_id: pump_run_id, chunks: batch });
+            let _ = pump_app.emit(
+                "kuberniva://cli-output",
+                CliOutputEvent {
+                    run_id: pump_run_id,
+                    chunks: batch,
+                },
+            );
         }
     });
 
@@ -3238,7 +3506,13 @@ async fn start_cluster_command<R: tauri::Runtime>(
         };
         let _ = app.emit(
             "kuberniva://cli-exit",
-            CliExitEvent { run_id: exit_run_id, exit_code, success, cancelled, error },
+            CliExitEvent {
+                run_id: exit_run_id,
+                exit_code,
+                success,
+                cancelled,
+                error,
+            },
         );
     });
     Ok(run_id)
@@ -3436,6 +3710,75 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[tokio::test]
+    async fn stalled_cluster_reads_return_a_retryable_error() {
+        let result: Result<(), String> = bounded_cluster_read(
+            "Reading pods",
+            std::time::Duration::from_millis(10),
+            std::future::pending(),
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err(),
+            "Reading pods timed out. Reconnect and try again."
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_cluster_reads_keep_success_and_authorization_errors() {
+        let timeout = std::time::Duration::from_millis(100);
+        let success = bounded_cluster_read("Reading pods", timeout, async { Ok(3) }).await;
+        assert_eq!(success.unwrap(), 3);
+        let denied: Result<(), String> = bounded_cluster_read("Reading secrets", timeout, async {
+            Err("Forbidden".to_string())
+        })
+        .await;
+        assert_eq!(denied.unwrap_err(), "Forbidden");
+    }
+
+    #[test]
+    fn interactive_auth_contexts_get_time_for_browser_sign_in() {
+        let path = std::env::temp_dir().join(format!(
+            "kuberniva-auth-timeout-{}.yaml",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            r#"apiVersion: v1
+kind: Config
+current-context: sso
+clusters:
+- name: c
+  cluster: {server: "https://127.0.0.1:6443"}
+contexts:
+- name: sso
+  context: {cluster: c, user: oidc}
+- name: token
+  context: {cluster: c, user: robot}
+users:
+- name: oidc
+  user:
+    exec: {apiVersion: client.authentication.k8s.io/v1, command: kubelogin, interactiveMode: IfAvailable}
+- name: robot
+  user: {token: abc}
+"#,
+        )
+        .unwrap();
+        let config = Some(path.to_string_lossy().into_owned());
+        let secs = |context: Option<&str>| {
+            cluster_read_timeout(&config, &context.map(str::to_string), 35).as_secs()
+        };
+        assert_eq!(secs(Some("sso")), 300);
+        assert_eq!(secs(None), 300, "falls back to the current context");
+        assert_eq!(secs(Some("token")), 35);
+        assert_eq!(secs(Some("missing")), 35);
+        assert_eq!(
+            cluster_read_timeout(&Some("/nonexistent/kubeconfig".into()), &None, 35).as_secs(),
+            35
+        );
+        std::fs::remove_file(path).ok();
+    }
+
     fn cli_request(kubeconfig_path: &Path, namespace: &str, command: &str) -> KubeCliRequest {
         KubeCliRequest {
             kubeconfig_path: Some(kubeconfig_path.to_string_lossy().into_owned()),
@@ -3448,10 +3791,18 @@ mod tests {
 
     fn cli_kubeconfig_file() -> Option<PathBuf> {
         configure_desktop_exec_path();
-        if std::process::Command::new("kubectl").arg("version").arg("--client").output().is_err() {
+        if std::process::Command::new("kubectl")
+            .arg("version")
+            .arg("--client")
+            .output()
+            .is_err()
+        {
             return None; // kubectl is not installed on this machine.
         }
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let path = env::temp_dir().join(format!("kuberniva-cli-test-{nanos}.yaml"));
         fs::write(&path, kubeconfig("cli")).unwrap();
         Some(path)
@@ -3459,7 +3810,9 @@ mod tests {
 
     #[tokio::test]
     async fn cli_shorthand_runs_kubectl_in_the_selected_namespace() {
-        let Some(path) = cli_kubeconfig_file() else { return };
+        let Some(path) = cli_kubeconfig_file() else {
+            return;
+        };
         let response = run_cluster_command(cli_request(
             &path,
             "team-a",
@@ -3474,7 +3827,9 @@ mod tests {
 
     #[tokio::test]
     async fn cli_namespace_flag_overrides_the_selected_namespace() {
-        let Some(path) = cli_kubeconfig_file() else { return };
+        let Some(path) = cli_kubeconfig_file() else {
+            return;
+        };
         let response = run_cluster_command(cli_request(
             &path,
             "team-a",
@@ -3513,8 +3868,14 @@ mod tests {
             .unwrap();
 
         let wait = std::time::Duration::from_secs(10);
-        let (is_exit, first) = tokio::time::timeout(wait, receiver.recv()).await.unwrap().unwrap();
-        assert!(!is_exit, "output should stream before the command exits: {first}");
+        let (is_exit, first) = tokio::time::timeout(wait, receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !is_exit,
+            "output should stream before the command exits: {first}"
+        );
         assert!(first.contains("first-line"), "{first}");
 
         cancel_cluster_command("run-stream".to_string()).unwrap();
@@ -3951,6 +4312,48 @@ mod tests {
     }
 
     #[test]
+    fn argocd_actions_build_cli_compatible_patches() {
+        let idle = serde_json::json!({
+            "spec": { "source": { "targetRevision": "main" } },
+            "status": { "operationState": { "phase": "Succeeded" } }
+        });
+        let refresh = argocd_action_patch("refresh", &idle).unwrap();
+        assert_eq!(
+            refresh["metadata"]["annotations"]["argocd.argoproj.io/refresh"],
+            "normal"
+        );
+        let sync = argocd_action_patch("sync", &idle).unwrap();
+        assert_eq!(sync["operation"]["sync"]["revision"], "main");
+        assert_eq!(sync["operation"]["initiatedBy"]["username"], "kuberniva");
+
+        let multi_source = serde_json::json!({ "spec": { "sources": [{}, {}] } });
+        let sync = argocd_action_patch("sync", &multi_source).unwrap();
+        assert!(sync["operation"]["sync"].get("revision").is_none());
+
+        let running = serde_json::json!({ "status": { "operationState": { "phase": "Running" } } });
+        assert!(argocd_action_patch("sync", &running).is_err());
+        assert!(argocd_action_patch("refresh", &running).is_ok());
+        assert!(argocd_action_patch("delete", &idle).is_err());
+    }
+
+    #[test]
+    fn groups_admission_policies_but_not_webhooks() {
+        for plural in [
+            "validatingadmissionpolicies",
+            "validatingadmissionpolicybindings",
+            "mutatingadmissionpolicies",
+            "mutatingadmissionpolicybindings",
+        ] {
+            let (category, custom, _) = category_for("admissionregistration.k8s.io", plural);
+            assert_eq!(category, "Admission Policies", "{plural}");
+            assert!(!custom);
+        }
+        let (webhooks, _, _) =
+            category_for("admissionregistration.k8s.io", "validatingwebhookconfigurations");
+        assert_eq!(webhooks, "Cluster");
+    }
+
+    #[test]
     fn builds_label_selectors_from_labels_and_match_expressions() {
         let manifest = serde_json::json!({
             "spec": {
@@ -4135,6 +4538,8 @@ pub fn run() {
             stop_resource_watch,
             check_resource_permissions,
             list_resource_objects,
+            list_resource_manifests,
+            argocd_application_action,
             get_resource_detail,
             delete_resource_object,
             save_resource_detail,

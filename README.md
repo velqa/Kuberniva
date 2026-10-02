@@ -24,12 +24,16 @@ Kuberniva is an open-source, local-first Kubernetes desktop app. It opens instan
 | | What you can do |
 | --- | --- |
 | ⚡ **Fast launch** | Opens straight to your last workspace with no network wait. Clusters you have opened before appear instantly from a local catalog cache and refresh in the background. |
+| 🔌 **Connection recovery** | Shows progress while reading data, verifies connections after a long absence, and times out stalled reads with a retry action. Open editors stay intact while recovery is deferred. |
 | 🗂️ **Clusters** | Add kubeconfig files or folders, merge contexts, switch clusters from the top selector, and connect lazily only when a cluster is opened. |
-| 🔐 **Authentication** | Use OIDC `exec`, OIDC auth-provider, bearer-token, and client-certificate kubeconfigs. |
+| 🔐 **Authentication** | Use OIDC `exec`, OIDC auth-provider, bearer-token, and client-certificate kubeconfigs. SSO clusters get time to finish a browser sign-in when a token expires. |
 | 🛡️ **Authorization** | Respect Kubernetes RBAC per cluster, namespace, API, object, verb, and subresource; hide unavailable APIs and keep read-only identities free of mutation controls. |
 | ⭐ **Shortcuts** | Pin up to 10 clusters, rename their shortcuts, and keep them across restarts. |
 | 📊 **Overview** | See cluster-wide CPU, memory, and node storage totals first, then select any node for its capacity, allocation, network, and live usage. |
 | 🛎️ **Events** | Browse recent Kubernetes Events with warning/normal filters and search. |
+| 🐙 **Argo CD** | When Argo CD is installed, see every Application's sync and health, filter to what needs attention, inspect source and managed resources, and Refresh or Sync after a confirmation. |
+| 🚪 **Gateway API** | Gateways show listeners, addresses, and attached routes; HTTPRoutes and GRPCRoutes show hostnames, parent status, and rules with weighted backends; Services list the routes that target them. |
+| 🛡️ **Admission Policies** | ValidatingAdmissionPolicy, MutatingAdmissionPolicy, and bindings get their own group with structured properties and highlighted CEL expressions. |
 | 🧭 **Resources** | Browse API types Lens-style: Resources and Custom APIs expand into trees right in the sidebar, grouped by Configuration, Access Control, Network, Storage, and Cluster. Or start from a searchable directory with your recently opened types on top. Tables use the full width until you open an object. |
 | 🚀 **Workloads** | Switch between Deployments, StatefulSets, DaemonSets, Jobs, CronJobs, Pods, and other workload types from the tabs on top. Compact, single-line tables show status, readiness, restarts, CPU, and memory at a glance. |
 | 🔎 **Details** | Open any workload for a compact Logs / Shell / YAML / Delete toolbar, an ordered Properties list, diagnostics, containers, and configuration. Empty sections stay hidden. |
@@ -173,6 +177,7 @@ Without that file, releases are ad-hoc signed and need the first-launch override
 ~~~bash
 npm run check
 npm run build
+npm test
 cargo test --manifest-path src-tauri/Cargo.toml
 ~~~
 
