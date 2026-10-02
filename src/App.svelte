@@ -5,7 +5,9 @@
   import { argoApplication, argoApplicationSet, argoProject, argoTone, isForbidden, resourcesByKind, summarizeArgo, type ArgoApp, type ArgoAppSet, type ArgoProject, type ArgoResource } from './lib/argocd';
   import { conditions as gatewayConditions, gatewayAddresses, gatewayListeners, routeHostnames, routeParents, routeRules, routesAttachedToGateway, routesTargetingService, type RouteSummary } from './lib/gateway-api';
   import { cpuLabel, memoryLabel, percentLabel, resourceQuantityLabel } from './lib/quantity';
-  import { readDeadlineMs, shouldRecoverAfterResume, usesInteractiveAuth, withRequestDeadline } from './lib/request-recovery';
+  import { matchesSearch, searchTokens } from './lib/object-search';
+  import { parseReleaseNotes, type Inline } from './lib/release-notes';
+  import { readDeadlineMs, resumeAction, usesInteractiveAuth, withRequestDeadline } from './lib/request-recovery';
   import { Bell, Blocks, Boxes, Check, ChevronDown, ChevronRight, Command, Container, Copy, Database, Download, FileText, GitBranch, Ghost, HardDrive, Heart, HeartCrack, Pause, CircleCheck, CircleArrowUp, CircleQuestionMark, Undo2, Ban, Clock, ArrowLeft, Zap, KeyRound, LayoutDashboard, LoaderCircle, Menu, Moon, Network, RefreshCw, Search, ScrollText, Server, Settings2, Shield, ShieldCheck, Star, Sun, Terminal, WifiOff, Workflow } from '@lucide/svelte';
 
   type View = 'Clusters' | 'Favorites' | 'Overview' | 'Events' | 'Argo CD' | 'Resources' | 'Workloads' | 'Explore' | 'Logs' | 'Settings';
@@ -222,6 +224,7 @@
   let loadingWorkloads = false;
   let workloadRequestGeneration = 0;
   let workloadSearch = '';
+  let resourceObjectSearch = '';
   let sidebarHidden = false;
   let persistedClusterNamespaces: Record<string, string> = {};
   let favoriteClusterIds: string[] = [];
@@ -334,7 +337,7 @@
   $: groupedClusterEvents = groupEventsByObject(visibleClusterEvents);
   $: visibleClusterEvents = namespaceClusterEvents.filter((event) =>
     (eventTypeFilter === 'All' || event.eventType === eventTypeFilter) &&
-    `${event.reason || ''} ${event.message || ''} ${event.involvedKind || ''} ${event.involvedName || ''} ${event.namespace || ''}`.toLowerCase().includes(eventSearch.toLowerCase()),
+    matchesSearch(searchTokens(eventSearch), [event.eventType, event.reason, event.message, event.involvedKind, event.involvedName, event.namespace]),
   );
   $: accessibleCatalogResources = catalog.resources.filter((resource) => resourceVisibleForCurrentScope(resource, accessDecisions, catalogPermissionsReady));
   $: resourceWorkspaceResources = accessibleCatalogResources.filter((resource) => resource.category !== 'Workloads' && resource.category !== 'Custom Resources');
@@ -347,11 +350,12 @@
   // Sets keep selection checks O(1) per row; thousands of rows made array lookups quadratic.
   $: selectedResourceKeySet = new Set(selectedResourceObjectKeys);
   $: selectedWorkloadKeySet = new Set(selectedWorkloadObjectKeys);
-  $: selectedResourceObjects = resourceObjects.filter((object) => selectedResourceKeySet.has(resourceObjectSelectionKey(object)));
-  $: allResourceObjectsSelected = resourceObjects.length > 0 && selectedResourceObjects.length === resourceObjects.length;
+  // Selection and bulk actions apply only to rows the current search shows.
+  $: selectedResourceObjects = visibleResourceObjects.filter((object) => selectedResourceKeySet.has(resourceObjectSelectionKey(object)));
+  $: allResourceObjectsSelected = visibleResourceObjects.length > 0 && selectedResourceObjects.length === visibleResourceObjects.length;
   $: resourceObjectsSelectionPartial = selectedResourceObjects.length > 0 && !allResourceObjectsSelected;
-  $: selectedWorkloadObjects = workloadObjects.filter((object) => selectedWorkloadKeySet.has(resourceObjectSelectionKey(object)));
-  $: allWorkloadObjectsSelected = workloadObjects.length > 0 && selectedWorkloadObjects.length === workloadObjects.length;
+  $: selectedWorkloadObjects = visibleWorkloadObjects.filter((object) => selectedWorkloadKeySet.has(resourceObjectSelectionKey(object)));
+  $: allWorkloadObjectsSelected = visibleWorkloadObjects.length > 0 && selectedWorkloadObjects.length === visibleWorkloadObjects.length;
   $: workloadObjectsSelectionPartial = selectedWorkloadObjects.length > 0 && !allWorkloadObjectsSelected;
   $: liveDataStatusText = liveDataStatus === 'loading' ? 'Loading'
     : liveDataStatus === 'paused' ? 'Paused'
@@ -457,15 +461,15 @@
   // A list dragged wider than the details gets its full columns back.
   $: workloadColumns = buildWorkloadColumns(workloadResource?.kind === 'Pod', namespace === 'all namespaces', !workloadDetailOpen || workloadListPercent >= 62 ? 'full' : workloadListPercent >= 46 ? 'medium' : 'compact');
   $: workloadGridColumns = `${workloadColumns.map((column) => column.width).join(' ')} 18px`;
-  $: workloadSearchNeedle = workloadSearch.toLowerCase();
-  $: visibleWorkloadObjects = workloadSearchNeedle
-    ? workloadObjects.filter((workload) => `${workload.name} ${workload.namespace || ''}`.toLowerCase().includes(workloadSearchNeedle))
-    : workloadObjects;
+  $: workloadSearchNeedle = workloadSearch.trim().toLowerCase();
+  $: visibleWorkloadObjects = filterObjects(workloadObjects, workloadSearchNeedle);
+  $: visibleResourceObjects = filterObjects(resourceObjects, resourceObjectSearch.trim().toLowerCase());
   // Large lists render in batches as you scroll, so thousands of rows never hit the DOM at once.
   $: workloadRenderLimit = resetRenderLimit(workloadResource, workloadSearchNeedle, namespace, activeClusterId);
-  $: resourceRenderLimit = resetRenderLimit(selectedResource, namespace, activeClusterId);
+  $: resourceRenderLimit = resetRenderLimit(selectedResource, namespace, activeClusterId, resourceObjectSearch);
+  $: resourceObjectSearch = resetObjectSearch(selectedResource, activeClusterId);
   $: renderedWorkloadObjects = visibleWorkloadObjects.slice(0, workloadRenderLimit);
-  $: renderedResourceObjects = resourceObjects.slice(0, resourceRenderLimit);
+  $: renderedResourceObjects = visibleResourceObjects.slice(0, resourceRenderLimit);
   $: selectedPodEvents = editorResource?.kind === 'Pod' && editorObject
     ? clusterEvents.filter((event) => event.involvedKind === 'Pod'
       && event.involvedName === editorObject?.name
@@ -539,6 +543,17 @@
 
   function isOpeningLogs(kind: string, object: ResourceObject) {
     return openingLogsTarget?.key === logOpeningKey(kind, object);
+  }
+
+  /** Matches name, namespace, status (Running, Failed, …), and node, ignoring case. */
+  function filterObjects(objects: ResourceObject[], query: string) {
+    const tokens = searchTokens(query);
+    if (!tokens.length) return objects;
+    return objects.filter((object) => matchesSearch(tokens, [object.name, object.namespace, object.status ? workloadStatusLabel(object) : '', object.nodeName]));
+  }
+
+  function resetObjectSearch(..._dependencies: unknown[]) {
+    return '';
   }
 
   function workloadStatusLabel(object: ResourceObject) {
@@ -638,7 +653,7 @@
   $: visibleArgoProjects = argoProjects.filter((project) => `${project.name} ${project.description}`.toLowerCase().includes(argoSearch.toLowerCase()));
   $: argoSummary = summarizeArgo(argoApps);
   $: visibleArgoApps = (argoFilter === 'attention' ? argoSummary.attention : argoApps)
-    .filter((app) => `${app.name} ${app.project} ${app.destination}`.toLowerCase().includes(argoSearch.toLowerCase()));
+    .filter((app) => matchesSearch(searchTokens(argoSearch), [app.name, app.project, app.destination, app.health, app.sync, app.operation, app.source]));
   $: selectedArgoApp = argoApps.find((app) => argoKey(app) === selectedArgoKey) || null;
   $: if (activeView === 'Argo CD' && activeClusterId && !loadingCatalog && !argoApplicationResource && catalog.resources.length) void navigateTo('Overview');
 
@@ -732,13 +747,13 @@
   }
 
   function filterArgoResources(resources: ArgoResource[], filter: typeof argoResourceFilter, search: string) {
-    const query = search.trim().toLowerCase();
+    const tokens = searchTokens(search);
     return resources.filter((resource) => (
       filter === 'all'
       || (filter === 'outofsync' && resource.sync === 'OutOfSync')
       || (filter === 'unhealthy' && ['Degraded', 'Missing', 'Progressing', 'Suspended'].includes(resource.health))
       || (filter === 'prune' && resource.requiresPruning)
-    ) && (!query || `${resource.kind} ${resource.name} ${resource.namespace}`.toLowerCase().includes(query)));
+    ) && matchesSearch(tokens, [resource.kind, resource.name, resource.namespace, resource.health, resource.sync, resource.requiresPruning ? 'prune' : '']));
   }
 
   function argoResourceKey(resource: ArgoResource) {
@@ -1199,7 +1214,7 @@
   function toggleAllResourceObjects() {
     selectedResourceObjectKeys = allResourceObjectsSelected
       ? []
-      : resourceObjects.map(resourceObjectSelectionKey);
+      : visibleResourceObjects.map(resourceObjectSelectionKey);
   }
 
   function clearWorkloadObjectSelection() {
@@ -1225,7 +1240,7 @@
   function toggleAllWorkloadObjects() {
     selectedWorkloadObjectKeys = allWorkloadObjectsSelected
       ? []
-      : workloadObjects.map(resourceObjectSelectionKey);
+      : visibleWorkloadObjects.map(resourceObjectSelectionKey);
   }
 
   function activeLiveDataKey() {
@@ -1481,7 +1496,7 @@
   async function restoreVisualQaScenario() {
     if (!import.meta.env.DEV) return false;
     const scenario = new URLSearchParams(window.location.search).get('visual-qa');
-    if (!scenario || (!visualQaRecoveryEnabled && !['overview', 'workloads', 'workloads-first-open', 'workload-details', 'pod-details', 'workload-logs', 'workload-yaml', 'resources', 'custom-apis', 'resources-directory', 'custom-directory', 'overview-large', 'events', 'workloads-large', 'argocd', 'gateway', 'httproute', 'admission-policy', 'workload-terminal', 'configuration', 'configuration-many', 'secret', 'permissions-readonly'].includes(scenario))) return false;
+    if (!scenario || (!visualQaRecoveryEnabled && !['overview', 'workloads', 'workloads-first-open', 'workload-details', 'pod-details', 'workload-logs', 'workload-yaml', 'resources', 'custom-apis', 'resources-directory', 'custom-directory', 'overview-large', 'events', 'workloads-large', 'argocd', 'gateway', 'httproute', 'admission-policy', 'workload-terminal', 'update-available', 'configuration', 'configuration-many', 'secret', 'permissions-readonly'].includes(scenario))) return false;
     const fixtures = await import('./dev/visual-qa-fixtures');
     const qaCluster = fixtures.visualQaCluster as Cluster;
     const directoryScenario = scenario === 'resources-directory' || scenario === 'custom-directory';
@@ -1503,7 +1518,11 @@
     seedVisualQaPermissions(scenarioResources, scenario === 'permissions-readonly');
     catalogError = '';
     loadingCatalog = false;
-    if (scenario === 'events') {
+    if (scenario === 'update-available') {
+      activeView = 'Settings';
+      updateState = 'available';
+      pendingUpdate = { version: '0.5.3', body: fixtures.visualQaReleaseNotes, downloadAndInstall: async () => undefined };
+    } else if (scenario === 'events') {
       activeView = 'Events';
       namespace = 'all namespaces';
       clusterEvents = fixtures.visualQaClusterEvents as ClusterEvent[];
@@ -1980,15 +1999,18 @@
   function startOverviewRefresh() {
     stopOverviewRefresh();
     if (!activeClusterId || activeView !== 'Overview') return;
-    overviewRefreshTimer = window.setInterval(() => void loadClusterOverview(), 60_000);
+    overviewRefreshTimer = window.setInterval(() => void loadClusterOverview(false, true), 60_000);
   }
 
-  async function loadClusterOverview(force = false) {
+  /** `quiet` refreshes keep the current numbers on screen with no activity pill and no error banner. */
+  async function loadClusterOverview(force = false, quiet = false) {
     if (!activeClusterId || (loadingOverview && !force)) return;
     const overviewClusterId = activeClusterId;
     const requestGeneration = ++overviewRequestGeneration;
-    loadingOverview = true;
-    overviewError = '';
+    if (!quiet) {
+      loadingOverview = true;
+      overviewError = '';
+    }
     try {
       const { invoke } = await import('@tauri-apps/api/core');
       const response = await invokeRead<ClusterOverview>('read_cluster_overview', {
@@ -1997,23 +2019,26 @@
       });
       if (requestGeneration === overviewRequestGeneration && overviewClusterId === activeClusterId) {
         clusterOverview = response;
+        overviewError = '';
         lastConnectionVerifiedAt = Date.now();
         selectedNodeName = response.nodes.some((node) => node.name === selectedNodeName) ? selectedNodeName : response.nodes[0]?.name || '';
       }
     } catch (error) {
-      if (requestGeneration === overviewRequestGeneration && overviewClusterId === activeClusterId) overviewError = String(error);
+      if (requestGeneration === overviewRequestGeneration && overviewClusterId === activeClusterId && !quiet) overviewError = String(error);
     } finally {
       if (requestGeneration === overviewRequestGeneration && overviewClusterId === activeClusterId) loadingOverview = false;
     }
   }
 
-  async function loadClusterEvents(force = false) {
+  async function loadClusterEvents(force = false, quiet = false) {
     if (!activeClusterId || (loadingEvents && !force)) return;
     if (!force && clusterEvents.length && eventsObservedAt && activeClusterId === eventsClusterId) return;
     const requestClusterId = activeClusterId;
     const requestGeneration = ++eventsRequestGeneration;
-    loadingEvents = true;
-    eventsError = '';
+    if (!quiet) {
+      loadingEvents = true;
+      eventsError = '';
+    }
     try {
       const { invoke } = await import('@tauri-apps/api/core');
       const response = await invokeRead<ClusterEvent[]>('read_cluster_events', {
@@ -2022,12 +2047,13 @@
       });
       if (requestGeneration === eventsRequestGeneration && requestClusterId === activeClusterId) {
         clusterEvents = response;
+        eventsError = '';
         lastConnectionVerifiedAt = Date.now();
         eventsClusterId = requestClusterId;
         eventsObservedAt = new Date().toISOString();
       }
     } catch (error) {
-      if (requestGeneration === eventsRequestGeneration && requestClusterId === activeClusterId) eventsError = String(error);
+      if (requestGeneration === eventsRequestGeneration && requestClusterId === activeClusterId && !quiet) eventsError = String(error);
     } finally {
       if (requestGeneration === eventsRequestGeneration && requestClusterId === activeClusterId) loadingEvents = false;
     }
@@ -2472,27 +2498,49 @@
     void refreshVisibleObjectList();
   }
 
-  function resetInterruptedReads() {
-    connectionRequestGeneration += 1;
-    refreshViewGeneration += 1;
+  /** After a system sleep, free snapshot reads that were stuck on dead connections. Live watches keep running. */
+  function resetSnapshotReadsAfterSleep() {
+    const listWasLoading = (loadingWorkloads && activeView === 'Workloads') || (loadingObjects && activeView === 'Resources');
     overviewRequestGeneration += 1;
     eventsRequestGeneration += 1;
-    resourceRequestGeneration += 1;
-    workloadRequestGeneration += 1;
-    loadingCatalog = false;
     loadingOverview = false;
     loadingEvents = false;
-    loadingObjects = false;
-    loadingWorkloads = false;
-    refreshingCluster = false;
-    stopLiveObjectRefresh();
+    if (listWasLoading) {
+      resourceRequestGeneration += 1;
+      workloadRequestGeneration += 1;
+      loadingObjects = false;
+      loadingWorkloads = false;
+      void refreshVisibleObjectList();
+    }
   }
 
-  function queueLiveResumeRecovery(hiddenDuration = 0) {
+  function handleSystemResumed() {
+    // The backend already dropped stale connections and resumed every live watch from its cursor.
+    resetSnapshotReadsAfterSleep();
+    if (activeView === 'Overview') void loadClusterOverview(true, true);
+    else if (activeView === 'Events') void loadClusterEvents(true, true);
+    else queueLiveResumeRecovery();
+  }
+
+  function snapshotAgeMs() {
+    const observed = activeView === 'Overview' ? clusterOverview?.observedAt : activeView === 'Events' ? eventsObservedAt : '';
+    const time = observed ? Date.parse(observed) : NaN;
+    return Number.isFinite(time) ? Date.now() - time : Number.POSITIVE_INFINITY;
+  }
+
+  function queueLiveResumeRecovery(_hiddenDuration = 0) {
     if (!activeClusterId || !['Overview', 'Events', 'Workloads', 'Resources', 'Logs'].includes(activeView)) return;
-    const disconnected = Boolean(catalogError) || ['error', 'reconnecting'].includes(resourceWatchStatus);
-    if (!shouldRecoverAfterResume(hiddenDuration, lastConnectionVerifiedAt, Date.now(), disconnected)) return;
-    if (hiddenDuration >= 30_000) resetInterruptedReads();
+    const action = resumeAction({ view: activeView, watchStatus: resourceWatchStatus, connectionFailed: Boolean(catalogError), snapshotAgeMs: snapshotAgeMs() });
+    if (action === 'none') return;
+    if (action === 'quiet-refresh') {
+      if (activeView === 'Overview') void loadClusterOverview(false, true);
+      else void loadClusterEvents(true, true);
+      return;
+    }
+    if (action === 'restart-watch') {
+      if (!hasProtectedWorkflow()) startLiveObjectRefresh();
+      return;
+    }
     if (refreshingCluster || loadingCatalog) return;
     if (liveDataStatus !== 'unavailable') markLiveDataStale('Live data is stale; refresh is available');
     if (hasProtectedWorkflow()) {
@@ -5182,7 +5230,7 @@
     if (import.meta.env.DEV && visualQaRecoveryEnabled) {
       void import('./dev/visual-qa-fixtures').then((fixtures) => {
         const statusbar = document.querySelector<HTMLElement>('.workspace-statusbar');
-        if (statusbar) removeVisualQaRecoveryControl = fixtures.installRecoveryControl(statusbar, () => queueLiveResumeRecovery(3_600_000));
+        if (statusbar) removeVisualQaRecoveryControl = fixtures.installRecoveryControl(statusbar, () => handleSystemResumed());
       });
     }
     applyTheme(loadThemePreference());
@@ -5271,16 +5319,19 @@
       lastHiddenAt = 0;
       queueLiveResumeRecovery(hiddenDuration);
     };
-    const handleNetworkOnline = () => queueLiveResumeRecovery();
-    // macOS can sleep and wake without changing the webview's focus. Observe
-    // clock gaps locally; this timer makes no Kubernetes requests on its own.
-    let lastAwakeCheckAt = Date.now();
-    const wakeCheckTimer = window.setInterval(() => {
-      const now = Date.now();
-      const elapsed = now - lastAwakeCheckAt;
-      lastAwakeCheckAt = now;
-      if (elapsed >= 45_000 && document.visibilityState === 'visible') queueLiveResumeRecovery(elapsed);
-    }, 15_000);
+    const handleNetworkOnline = () => {
+      if ('__TAURI_INTERNALS__' in window) void import('@tauri-apps/api/core').then(({ invoke }) => invoke('resume_live_connections')).catch(() => undefined);
+      queueLiveResumeRecovery();
+    };
+    // Sleep is detected by the backend from its clocks; a throttled background
+    // webview timer would report false wake-ups.
+    let stopSystemResumeListening: (() => void) | undefined;
+    if ('__TAURI_INTERNALS__' in window) {
+      void import('@tauri-apps/api/event')
+        .then(({ listen }) => listen('kuberniva://system-resumed', () => handleSystemResumed()))
+        .then((unlisten) => (stopSystemResumeListening = unlisten))
+        .catch(() => undefined);
+    }
     document.addEventListener('visibilitychange', handleVisibilityChange);
     window.addEventListener('focus', handleWindowFocus);
     window.addEventListener('online', handleNetworkOnline);
@@ -5291,7 +5342,7 @@
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       window.removeEventListener('focus', handleWindowFocus);
       window.removeEventListener('online', handleNetworkOnline);
-      window.clearInterval(wakeCheckTimer);
+      stopSystemResumeListening?.();
       if (resumeRecoveryTimer) window.clearTimeout(resumeRecoveryTimer);
       resumeRecoveryTimer = undefined;
       if (updateCheckTimer) window.clearTimeout(updateCheckTimer);
@@ -5843,6 +5894,8 @@
   }
 </script>
 
+{#snippet noteInline(parts: Inline[])}{#each parts as part}{#if part.bold}<strong>{part.text}</strong>{:else if part.code}<code>{part.text}</code>{:else}{part.text}{/if}{/each}{/snippet}
+
 {#snippet celSection(title: string, subtitle: string, entries: CelEntry[])}
   {#if entries.length}
     <section class="gw-card">
@@ -5980,7 +6033,7 @@
             <p class="eyebrow">Updates</p>
             <h2>{updateState === 'available' && pendingUpdate ? `Kuberniva ${pendingUpdate.version} is available` : updateState === 'downloading' ? 'Downloading update…' : updateState === 'ready' ? 'Update installed' : `Kuberniva ${appVersion || ''}`.trim()}</h2>
             <p class="settings-update-copy">{#if updateState === 'available'}You have {appVersion || 'an older version'}. The update downloads in the background and applies when Kuberniva restarts.{:else if updateState === 'ready'}Restart Kuberniva to finish updating.{:else if updateState === 'current'}You're on the latest version. Checked at {updateCheckedAt}.{:else if updateState === 'error'}{updateError}{:else if updateState === 'checking'}Checking GitHub for a newer version…{:else if updateState === 'downloading'}Keep Kuberniva open until the download finishes.{:else}Kuberniva checks for updates each time it starts.{/if}</p>
-            {#if updateState === 'available' && pendingUpdate?.body}<details class="update-notes"><summary>What's new</summary><pre>{pendingUpdate.body}</pre></details>{/if}
+            {#if updateState === 'available' && pendingUpdate?.body}<section class="update-notes" aria-label={`What's new in ${pendingUpdate.version}`}>{#each parseReleaseNotes(pendingUpdate.body) as block}{#if block.type === 'heading'}<h3>{block.text}</h3>{:else if block.type === 'label'}<h4>{block.text}</h4>{:else if block.type === 'list'}<ul>{#each block.items as item}<li>{@render noteInline(item)}</li>{/each}</ul>{:else}<p>{@render noteInline(block.inline)}</p>{/if}{/each}</section>{/if}
             {#if updateState === 'downloading'}<div class="update-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow={updateProgress === null ? undefined : Math.round(updateProgress * 100)}><i class:update-progress-indeterminate={updateProgress === null} style:width={updateProgress === null ? '35%' : `${Math.round(updateProgress * 100)}%`}></i></div>{/if}
           </div>
           {#if updateState === 'available'}<button class="primary" on:click={installUpdate}><Download size={15} /> Download and install</button>
@@ -6410,9 +6463,10 @@
               <aside class:resource-objects-single-namespace={Boolean(selectedResource && (namespace !== 'all namespaces' || !selectedResource.namespaced))} class="resource-object-browser" aria-label="Resource objects">
                 {#if selectedResource}
                   <div class="resource-object-heading resource-pane-heading"><button type="button" class="resource-directory-back" aria-label="Back to all resource types" title="All resource types" on:click={showResourceDirectory}>←</button><div><span class:custom={selectedResource.crd} class="resource-pane-icon"><svelte:component this={resourceIcon(selectedResource)} size={16} strokeWidth={1.8} /></span><div><strong>{selectedResource.kind} objects</strong><small>{selectedResource.apiVersion} · {selectedResource.namespaced ? (namespace === 'all namespaces' ? 'All namespaces' : namespace) : 'Cluster-wide'}</small></div></div><span class:live-status-loading={liveDataStatus === 'loading'} class:live-status-loaded={liveDataStatus === 'loaded'} class:live-status-stale={liveDataStatus === 'stale'} class:live-status-paused={liveDataStatus === 'paused'} class:live-status-unavailable={liveDataStatus === 'unavailable'} class="live-list-status resource-live-status" title={liveDataStatusTooltip} aria-label={liveDataStatusTooltip} aria-live="polite"><i></i></span><b>{resourceObjects.length}</b></div>
-                  <div class="resource-object-columns" role="row" aria-label="Select loaded resource objects">{#if selectedResourcePermissionSet.canDelete}<label class:resource-select-all-partial={resourceObjectsSelectionPartial} class="resource-select-all"><input type="checkbox" checked={allResourceObjectsSelected} disabled={deletingResource || loadingObjects || !resourceObjects.length} aria-checked={resourceObjectsSelectionPartial ? 'mixed' : allResourceObjectsSelected ? 'true' : 'false'} aria-label={`Select all loaded ${selectedResource.plural}`} on:change={toggleAllResourceObjects} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}<span>Name</span><span>Namespace</span><span>Age</span><span>Action</span></div>
+                  <label class="resource-object-search"><Search size={13} /><input bind:value={resourceObjectSearch} placeholder={`Filter ${selectedResource.plural} by name, namespace, or status`} aria-label={`Filter ${selectedResource.plural}`} spellcheck="false" />{#if resourceObjectSearch}<span>{visibleResourceObjects.length}/{resourceObjects.length}</span><button type="button" aria-label="Clear filter" on:click={() => (resourceObjectSearch = '')}>×</button>{/if}</label>
+                  <div class="resource-object-columns" role="row" aria-label="Select shown resource objects">{#if selectedResourcePermissionSet.canDelete}<label class:resource-select-all-partial={resourceObjectsSelectionPartial} class="resource-select-all"><input type="checkbox" checked={allResourceObjectsSelected} disabled={deletingResource || loadingObjects || !visibleResourceObjects.length} aria-checked={resourceObjectsSelectionPartial ? 'mixed' : allResourceObjectsSelected ? 'true' : 'false'} aria-label={`Select all shown ${selectedResource.plural}`} on:change={toggleAllResourceObjects} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}<span>Name</span><span>Namespace</span><span>Age</span><span>Action</span></div>
                   {#if selectedResourceObjects.length && selectedResourcePermissionSet.canDelete}<div class="resource-bulk-toolbar" role="region" aria-label="Bulk resource actions"><span><strong>{selectedResourceObjects.length}</strong> selected</span><button class="destructive" type="button" disabled={deletingResource || loadingEditor || savingEditor || loadingYaml || savingYaml} on:click={() => requestBulkResourceDeletion(selectedResource!)}>Delete {selectedResourceObjects.length}</button><button class="resource-bulk-clear" type="button" disabled={deletingResource} on:click={clearResourceObjectSelection}>Clear</button></div>{/if}
-                  {#if loadingObjects}<div class="drawer-state"><i></i>Listing {selectedResource.plural}…</div>{:else if resourceObjects.length === 0}<div class="resource-object-empty"><span>○</span><strong>No {selectedResource.plural} found</strong><p>Try another namespace or use Refresh in the top bar.</p></div>{:else}<div class="object-list">{#each renderedResourceObjects as object}<div class:resource-object-row-selected={isResourceObjectSelected(object, selectedResourceKeySet)} class="resource-object-row">{#if selectedResourcePermissionSet.canDelete}<label class="resource-object-select"><input type="checkbox" checked={isResourceObjectSelected(object, selectedResourceKeySet)} disabled={deletingResource} aria-label={`Select ${selectedResource.kind} ${object.name}`} on:change={() => toggleResourceObjectSelection(object)} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}<button type="button" disabled={!selectedResourceCanOpen} aria-busy={selectedResource.kind === 'Pod' && isOpeningLogs('Pod', object)} class:object-selected={editorObject?.name === object.name && editorObject?.namespace === object.namespace} on:click={() => openObject(selectedResource!, object)}><div class="resource-object-primary"><strong>{object.name}</strong></div><span class="resource-object-namespace">{object.namespace || 'cluster scoped'}</span><small class="resource-object-age">{object.createdAt ? resourceAge(object.createdAt) : '—'}</small><span class="resource-object-action">{selectedResourceCanOpen ? (selectedResource.kind === 'Pod' ? (isOpeningLogs('Pod', object) ? 'Opening…' : 'Logs →') : 'Open →') : ''}</span></button></div>{/each}{#if resourceObjects.length > resourceRenderLimit}<div class="list-reveal-sentinel" use:revealOnView={() => (resourceRenderLimit += LIST_RENDER_BATCH * 2)}>Showing {resourceRenderLimit.toLocaleString()} of {resourceObjects.length.toLocaleString()} · scroll for more</div>{/if}</div>{/if}
+                  {#if loadingObjects}<div class="drawer-state"><i></i>Listing {selectedResource.plural}…</div>{:else if resourceObjects.length === 0}<div class="resource-object-empty"><span>○</span><strong>No {selectedResource.plural} found</strong><p>Try another namespace or use Refresh in the top bar.</p></div>{:else if visibleResourceObjects.length === 0}<div class="resource-object-empty"><span>○</span><strong>No {selectedResource.plural} match “{resourceObjectSearch}”</strong><p>Search matches name, namespace, and status.</p></div>{:else}<div class="object-list">{#each renderedResourceObjects as object}<div class:resource-object-row-selected={isResourceObjectSelected(object, selectedResourceKeySet)} class="resource-object-row">{#if selectedResourcePermissionSet.canDelete}<label class="resource-object-select"><input type="checkbox" checked={isResourceObjectSelected(object, selectedResourceKeySet)} disabled={deletingResource} aria-label={`Select ${selectedResource.kind} ${object.name}`} on:change={() => toggleResourceObjectSelection(object)} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}<button type="button" disabled={!selectedResourceCanOpen} aria-busy={selectedResource.kind === 'Pod' && isOpeningLogs('Pod', object)} class:object-selected={editorObject?.name === object.name && editorObject?.namespace === object.namespace} on:click={() => openObject(selectedResource!, object)}><div class="resource-object-primary"><strong>{object.name}</strong></div><span class="resource-object-namespace">{object.namespace || 'cluster scoped'}</span><small class="resource-object-age">{object.createdAt ? resourceAge(object.createdAt) : '—'}</small><span class="resource-object-action">{selectedResourceCanOpen ? (selectedResource.kind === 'Pod' ? (isOpeningLogs('Pod', object) ? 'Opening…' : 'Logs →') : 'Open →') : ''}</span></button></div>{/each}{#if visibleResourceObjects.length > resourceRenderLimit}<div class="list-reveal-sentinel" use:revealOnView={() => (resourceRenderLimit += LIST_RENDER_BATCH * 2)}>Showing {resourceRenderLimit.toLocaleString()} of {visibleResourceObjects.length.toLocaleString()} · scroll for more</div>{/if}</div>{/if}
                 {:else}
                   <div class="resource-object-empty"><span>⌘</span><strong>Select a resource kind</strong><p>Choose a kind from the left. Kuberniva loads only that API.</p></div>
                 {/if}
@@ -6531,14 +6585,14 @@
               <nav class="kind-tabs" aria-label="Workload types">{#each workloadResources as resource}<button type="button" aria-pressed={workloadResource !== null && resourceKey(workloadResource) === resourceKey(resource)} class:kind-tab-active={workloadResource !== null && resourceKey(workloadResource) === resourceKey(resource)} title={kindLabel(resource)} on:click={() => selectWorkloadResource(resource)}>{kindTabLabel(resource)}</button>{/each}</nav>
             {/if}
             <div class:workload-detail-open={(editorResource?.category === 'Workloads' && editorObject !== null) || (workloadDetailMode === 'logs' && logTarget !== null)} class:workload-logs-open={workloadDetailMode === 'logs' && logTarget !== null} style:--workload-list-percent={`${workloadListPercent}%`} class="workload-grid grid min-h-[560px]">
-              <div class="workload-list-panel overflow-hidden rounded-2xl border border-white/10 bg-[#151924]/90 shadow-2xl shadow-black/10"><div class="workload-list-header flex items-center justify-between gap-4 border-b border-white/10 px-5 py-4"><div><div class="flex items-center gap-2"><Container size={18} class="text-cyan-300" /><h3 class="m-0 text-lg font-semibold text-white">{workloadResource?.kind || 'Select a type'}</h3></div><p class="mb-0 mt-1 text-xs text-slate-400">{namespace} · {workloadResource?.apiVersion || 'Kubernetes API'}{#if workloadResource?.kind === 'Pod'} · CPU/memory from Metrics API{/if}</p></div><span class:live-status-loading={liveDataStatus === 'loading'} class:live-status-loaded={liveDataStatus === 'loaded'} class:live-status-stale={liveDataStatus === 'stale'} class:live-status-paused={liveDataStatus === 'paused'} class:live-status-unavailable={liveDataStatus === 'unavailable'} class="live-list-status" title={liveDataStatusTooltip} aria-label={liveDataStatusTooltip} aria-live="polite"><i></i>{liveDataStatusText}</span><label class="flex h-10 w-72 items-center gap-2 rounded-lg border border-white/10 bg-black/20 px-3 text-slate-500 focus-within:border-indigo-400 focus-within:bg-black/30 focus-within:ring-2 focus-within:ring-indigo-500/20"><Search size={16} /><input class="min-w-0 flex-1 border-0 bg-transparent text-sm text-slate-100 outline-none placeholder:text-slate-500" bind:value={workloadSearch} placeholder={`Filter ${workloadResource?.plural || 'workloads'}`} /></label></div>
+              <div class="workload-list-panel overflow-hidden rounded-2xl border border-white/10 bg-[#151924]/90 shadow-2xl shadow-black/10"><div class="workload-list-header flex items-center justify-between gap-4 border-b border-white/10 px-5 py-4"><div><div class="flex items-center gap-2"><Container size={18} class="text-cyan-300" /><h3 class="m-0 text-lg font-semibold text-white">{workloadResource?.kind || 'Select a type'}</h3></div><p class="mb-0 mt-1 text-xs text-slate-400">{namespace} · {workloadResource?.apiVersion || 'Kubernetes API'}{#if workloadResource?.kind === 'Pod'} · CPU/memory from Metrics API{/if}</p></div><span class:live-status-loading={liveDataStatus === 'loading'} class:live-status-loaded={liveDataStatus === 'loaded'} class:live-status-stale={liveDataStatus === 'stale'} class:live-status-paused={liveDataStatus === 'paused'} class:live-status-unavailable={liveDataStatus === 'unavailable'} class="live-list-status" title={liveDataStatusTooltip} aria-label={liveDataStatusTooltip} aria-live="polite"><i></i>{liveDataStatusText}</span><label class="flex h-10 w-72 items-center gap-2 rounded-lg border border-white/10 bg-black/20 px-3 text-slate-500 focus-within:border-indigo-400 focus-within:bg-black/30 focus-within:ring-2 focus-within:ring-indigo-500/20"><Search size={16} /><input class="min-w-0 flex-1 border-0 bg-transparent text-sm text-slate-100 outline-none placeholder:text-slate-500" bind:value={workloadSearch} placeholder={`Filter ${workloadResource?.plural || 'workloads'} by name or status`} /></label></div>
                 {#if loadingWorkloads}
                   <div class="grid min-h-96 place-items-center text-sm text-slate-400"><div class="flex items-center gap-3"><RefreshCw size={18} class="animate-spin text-cyan-300" />Loading {workloadResource?.plural || 'workloads'}…</div></div>
                 {:else if visibleWorkloadObjects.length === 0}
                   <div class="grid min-h-96 place-items-center px-6 text-center"><div><div class="mx-auto grid h-12 w-12 place-items-center rounded-2xl bg-indigo-500/15 text-cyan-300"><Boxes size={22} /></div><h4 class="mb-0 mt-4 text-base font-semibold text-slate-100">{workloadObjects.length ? 'No matching workloads' : `No ${workloadResource?.plural || 'workloads'} found`}</h4><p class="mb-0 mt-2 text-sm text-slate-400">{workloadObjects.length ? 'Try a different name or namespace filter.' : `Nothing was returned for ${namespace}.`}</p></div></div>
                 {:else}
                   <div class="workload-object-list" aria-label={`${workloadResource?.kind || 'Workload'} list`}>
-                    <div class:workload-pod-row={workloadResource?.kind === 'Pod'} class="workload-object-list-header workload-selection-header" style:--workload-columns={`28px ${workloadGridColumns}`} aria-label="Workload columns">{#if workloadPermissionSet.canDelete}<label class:resource-select-all-partial={workloadObjectsSelectionPartial} class="resource-select-all"><input type="checkbox" checked={allWorkloadObjectsSelected} disabled={deletingResource || loadingWorkloads || !workloadObjects.length} aria-checked={workloadObjectsSelectionPartial ? 'mixed' : allWorkloadObjectsSelected ? 'true' : 'false'} aria-label={`Select all loaded ${workloadResource?.plural || 'workloads'}`} on:change={toggleAllWorkloadObjects} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}{#each workloadColumns as column}<span>{column.label}</span>{/each}<span></span></div>
+                    <div class:workload-pod-row={workloadResource?.kind === 'Pod'} class="workload-object-list-header workload-selection-header" style:--workload-columns={`28px ${workloadGridColumns}`} aria-label="Workload columns">{#if workloadPermissionSet.canDelete}<label class:resource-select-all-partial={workloadObjectsSelectionPartial} class="resource-select-all"><input type="checkbox" checked={allWorkloadObjectsSelected} disabled={deletingResource || loadingWorkloads || !visibleWorkloadObjects.length} aria-checked={workloadObjectsSelectionPartial ? 'mixed' : allWorkloadObjectsSelected ? 'true' : 'false'} aria-label={`Select all shown ${workloadResource?.plural || 'workloads'}`} on:change={toggleAllWorkloadObjects} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}{#each workloadColumns as column}<span>{column.label}</span>{/each}<span></span></div>
                     {#if selectedWorkloadObjects.length && workloadPermissionSet.canDelete}<div class="resource-bulk-toolbar workload-bulk-toolbar" role="region" aria-label="Bulk workload actions"><span><strong>{selectedWorkloadObjects.length}</strong> selected</span><button class="destructive" type="button" disabled={deletingResource || loadingEditor || savingEditor || loadingYaml || savingYaml} on:click={() => workloadResource && requestBulkResourceDeletion(workloadResource, selectedWorkloadObjects)}>Delete {selectedWorkloadObjects.length}</button><button class="resource-bulk-clear" type="button" disabled={deletingResource} on:click={clearWorkloadObjectSelection}>Clear</button></div>{/if}
                     {#each renderedWorkloadObjects as workload}
                       <div class:workload-pod-row={workloadResource?.kind === 'Pod'} class:resource-object-row-selected={isWorkloadObjectSelected(workload, selectedWorkloadKeySet)} class="resource-object-row workload-selection-row">

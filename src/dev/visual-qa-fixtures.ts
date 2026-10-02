@@ -1,3 +1,4 @@
+import releaseNotes from '../../docs/releases/v0.5.3.md?raw';
 export const visualQaCluster = {
   id: 'visual-qa-cluster',
   name: 'qa-production-west',
@@ -549,3 +550,5 @@ export const visualQaArgoProjects = [
   { metadata: { name: 'platform', namespace: 'argocd' }, spec: { description: 'Cluster add-ons', sourceRepos: ['*'], destinations: [{ server: '*', namespace: '*' }], clusterResourceWhitelist: [{ group: '*', kind: '*' }] } },
   { metadata: { name: 'web', namespace: 'argocd' }, spec: { sourceRepos: ['https://github.com/acme/web-*'], destinations: [{ name: 'prod', namespace: 'web' }] } },
 ];
+
+export const visualQaReleaseNotes = `${releaseNotes}\nDMG SHA-256: \`0000\`\n`;

@@ -24,7 +24,7 @@ Kuberniva is an open-source, local-first Kubernetes desktop app. It opens instan
 | | What you can do |
 | --- | --- |
 | ⚡ **Fast launch** | Opens straight to your last workspace with no network wait. Clusters you have opened before appear instantly from a local catalog cache and refresh in the background. |
-| 🔌 **Connection recovery** | Shows progress while reading data, verifies connections after a long absence, and times out stalled reads with a retry action. Open editors stay intact while recovery is deferred. |
+| 🔌 **Connection recovery** | Live lists keep streaming while the window is in the background. After the Mac sleeps, Kuberniva quietly resumes every live view where it left off; it only asks you to reconnect when a connection actually fails. Stalled reads time out with a retry action, and open editors stay intact. |
 | 🗂️ **Clusters** | Add kubeconfig files or folders, merge contexts, switch clusters from the top selector, and connect lazily only when a cluster is opened. |
 | 🔐 **Authentication** | Use OIDC `exec`, OIDC auth-provider, bearer-token, and client-certificate kubeconfigs. SSO clusters get time to finish a browser sign-in when a token expires. |
 | 🛡️ **Authorization** | Respect Kubernetes RBAC per cluster, namespace, API, object, verb, and subresource; hide unavailable APIs and keep read-only identities free of mutation controls. |
@@ -40,7 +40,7 @@ Kuberniva is an open-source, local-first Kubernetes desktop app. It opens instan
 | 📝 **Editors** | Edit ConfigMaps and Secrets as key/value data, reveal Secret values on demand, edit YAML, and view certificate expiry. |
 | 📜 **Logs & exec** | Switch between sibling Pods' logs, pick containers, search, copy, or download output, and run commands in any container. Kuberniva detects the container's shell, runs binaries directly in shell-less images, or attaches an ephemeral debug container from an image you choose (handy for air-gapped registries). |
 | ⌨️ **CLI** | A built-in terminal bound to the active cluster and namespace, with live streaming output. See the CLI section below. |
-| 🎨 **Workspace** | Warm ivory light theme and neutral charcoal dark theme, a collapsible sidebar, adjustable interface size, and persistent cluster context. |
+| 🎨 **Workspace** | Warm ivory light theme and neutral charcoal dark theme, a collapsible sidebar, adjustable interface size, and persistent cluster context. On macOS, closing the window keeps Kuberniva running; click the Dock icon to return, or quit with ⌘Q. |
 | 🔄 **Updates** | **Settings → Check for updates** downloads signed updates in the background and applies them on restart. Kuberniva also checks quietly at launch. |
 
 ## ⌨️ CLI

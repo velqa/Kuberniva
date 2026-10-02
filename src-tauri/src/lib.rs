@@ -38,7 +38,9 @@ use tokio::{
 };
 use x509_parser::{parse_x509_certificate, pem::parse_x509_pem};
 mod live_resources;
-use live_resources::{run_resource_watch, ResourceSnapshot, ResourceWatchRequest};
+use live_resources::{
+    run_resource_watch, spawn_sleep_monitor, ResourceSnapshot, ResourceWatchRequest,
+};
 
 static KUBE_CLIENT_CACHE: OnceLock<Mutex<HashMap<String, Client>>> = OnceLock::new();
 static PORT_FORWARD_REGISTRY: OnceLock<Mutex<HashMap<String, PortForwardRuntime>>> =
@@ -2475,6 +2477,12 @@ async fn list_resource_objects(request: ResourceRequest) -> Result<Vec<ResourceO
         list_resource_objects_inner(request),
     )
     .await
+}
+
+/// Called when the network changes: reopen live watches from their cursors.
+#[tauri::command]
+fn resume_live_connections() {
+    live_resources::resume_live_connections();
 }
 
 #[tauri::command]
@@ -5118,6 +5126,7 @@ pub fn run() {
             list_resource_objects,
             list_resource_snapshot,
             read_pod_metrics,
+            resume_live_connections,
             list_resource_manifests,
             argocd_application_action,
             read_object_events,
@@ -5140,6 +5149,32 @@ pub fn run() {
             list_port_forwards,
             stop_port_forward
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Kuberniva");
+        .setup(|app| {
+            spawn_sleep_monitor(app.handle().clone());
+            Ok(())
+        })
+        // On macOS, closing the window hides it like other Mac apps: live watches keep
+        // streaming in the background, the Dock icon brings it back, and ⌘Q quits.
+        .on_window_event(|window, event| {
+            #[cfg(target_os = "macos")]
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (window, event);
+        })
+        .build(tauri::generate_context!())
+        .expect("error while building Kuberniva")
+        .run(|app, event| {
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
+        });
 }

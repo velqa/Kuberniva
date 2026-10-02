@@ -4,6 +4,53 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ListMeta, ObjectMeta};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const PAGE_SIZE: u32 = 500;
+
+static RESUME_SIGNAL: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+
+fn resume_signal() -> &'static tokio::sync::Notify {
+    RESUME_SIGNAL.get_or_init(tokio::sync::Notify::new)
+}
+
+/// Drops pooled connections and makes every live watch reopen from its cursor.
+pub(super) fn resume_live_connections() {
+    if let Some(cache) = KUBE_CLIENT_CACHE.get() {
+        if let Ok(mut cache) = cache.lock() {
+            cache.clear();
+        }
+    }
+    resume_signal().notify_waiters();
+}
+
+/// How long the machine slept between two observations: wall-clock time advances during
+/// sleep while the monotonic clock (CLOCK_UPTIME_RAW / CLOCK_MONOTONIC) does not.
+pub(super) fn slept_between(
+    wall_elapsed: Duration,
+    monotonic_elapsed: Duration,
+) -> Option<Duration> {
+    wall_elapsed
+        .checked_sub(monotonic_elapsed)
+        .filter(|gap| *gap >= Duration::from_secs(15))
+}
+
+/// Watches for system sleep and resumes live connections on wake, so a minimized or
+/// hidden window keeps current data without the UI having to reconnect.
+pub(super) fn spawn_sleep_monitor(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut wall = SystemTime::now();
+        let mut monotonic = std::time::Instant::now();
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let (now_wall, now_monotonic) = (SystemTime::now(), std::time::Instant::now());
+            let wall_elapsed = now_wall.duration_since(wall).unwrap_or_default();
+            if let Some(slept) = slept_between(wall_elapsed, now_monotonic - monotonic) {
+                resume_live_connections();
+                let _ = app.emit("kuberniva://system-resumed", slept.as_millis() as u64);
+            }
+            wall = now_wall;
+            monotonic = now_monotonic;
+        }
+    });
+}
 const BATCH_SIZE: usize = 256;
 const BATCH_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -338,6 +385,12 @@ pub(super) async fn run_resource_watch(
             loop {
                 tokio::select! {
                     _ = &mut transport_deadline => return Err("Watch transport timed out".to_string()),
+                    // After sleep or a network change the socket may be dead without an error;
+                    // reopen now, resuming from the exact cursor (no snapshot, no UI reset).
+                    _ = resume_signal().notified() => {
+                        publisher.flush(&version);
+                        return Ok(());
+                    }
                     _ = flush.tick() => publisher.flush(&version),
                     event = stream.next() => match event {
                         Some(Ok(RowEvent::Upsert(row))) => {
@@ -410,6 +463,22 @@ pub(super) async fn run_resource_watch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sleep_is_the_gap_between_wall_and_monotonic_time() {
+        let secs = Duration::from_secs;
+        assert_eq!(slept_between(secs(3605), secs(5)), Some(secs(3600)));
+        assert_eq!(
+            slept_between(secs(6), secs(5)),
+            None,
+            "scheduling jitter is not sleep"
+        );
+        assert_eq!(
+            slept_between(secs(5), secs(30)),
+            None,
+            "a wall-clock step back is not sleep"
+        );
+    }
+
     #[test]
     fn snapshot_pages_must_share_the_collection_cursor() {
         let metadata = ListMeta {

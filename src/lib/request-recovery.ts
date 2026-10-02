@@ -13,8 +13,28 @@ export async function withRequestDeadline<T>(request: Promise<T>, label: string,
   }
 }
 
-export function shouldRecoverAfterResume(hiddenMs: number, lastVerifiedAt: number, now: number, disconnected: boolean) {
-  return hiddenMs >= 30_000 || disconnected || (lastVerifiedAt > 0 && now - lastVerifiedAt >= 120_000);
+export type ResumeState = {
+  view: string;
+  /** Live watch state for Workloads/Resources: the backend keeps it streaming while the window is hidden. */
+  watchStatus: 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'error';
+  connectionFailed: boolean;
+  /** Age of the visible snapshot for views without a watch (Overview, Events). */
+  snapshotAgeMs: number;
+};
+export type ResumeAction = 'none' | 'quiet-refresh' | 'restart-watch' | 'reconnect';
+
+/**
+ * Returning to the window is not a reason to reconnect. Only a real failure reconnects;
+ * snapshot views refresh quietly when old; healthy live watches need nothing.
+ */
+export function resumeAction(state: ResumeState): ResumeAction {
+  if (state.connectionFailed) return 'reconnect';
+  if (state.view === 'Workloads' || state.view === 'Resources') {
+    if (state.watchStatus === 'error') return 'restart-watch';
+    return 'none';
+  }
+  if ((state.view === 'Overview' || state.view === 'Events') && state.snapshotAgeMs >= 60_000) return 'quiet-refresh';
+  return 'none';
 }
 
 /** Exec and auth-provider credentials can open a browser sign-in; give it time (backend waits 300s). */

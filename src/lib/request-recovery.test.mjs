@@ -1,18 +1,25 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { readDeadlineMs, shouldRecoverAfterResume, withRequestDeadline } from './request-recovery.ts';
+import { readDeadlineMs, resumeAction, withRequestDeadline } from './request-recovery.ts';
 
-test('an hour of sleep requires recovery even when the old watch says connected', () => {
-  assert.equal(shouldRecoverAfterResume(3_600_000, 1_000, 3_601_000, false), true);
+const resume = (overrides) => resumeAction({ view: 'Workloads', watchStatus: 'connected', connectionFailed: false, snapshotAgeMs: 0, ...overrides });
+
+test('coming back to a healthy live list does nothing, however long the window was away', () => {
+  assert.equal(resume({}), 'none');
+  assert.equal(resume({ view: 'Resources', watchStatus: 'reconnecting' }), 'none');
 });
 
-test('brief focus changes preserve a current connection', () => {
-  assert.equal(shouldRecoverAfterResume(2_000, 10_000, 12_000, false), false);
+test('a watch that failed to start is restarted, and a real connection failure reconnects', () => {
+  assert.equal(resume({ watchStatus: 'error' }), 'restart-watch');
+  assert.equal(resume({ connectionFailed: true }), 'reconnect');
+  assert.equal(resume({ view: 'Overview', connectionFailed: true }), 'reconnect');
 });
 
-test('a disconnected or stale connection is recovered without a long sleep', () => {
-  assert.equal(shouldRecoverAfterResume(0, 10_000, 10_010, true), true);
-  assert.equal(shouldRecoverAfterResume(0, 10_000, 130_000, false), true);
+test('snapshot views refresh quietly only when their data is old', () => {
+  assert.equal(resume({ view: 'Overview', snapshotAgeMs: 30_000 }), 'none');
+  assert.equal(resume({ view: 'Overview', snapshotAgeMs: 61_000 }), 'quiet-refresh');
+  assert.equal(resume({ view: 'Events', snapshotAgeMs: 3_600_000 }), 'quiet-refresh');
+  assert.equal(resume({ view: 'Settings', snapshotAgeMs: 3_600_000 }), 'none');
 });
 
 test('a hung native request rejects and allows the loading workflow to finish', async () => {
