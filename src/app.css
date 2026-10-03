@@ -8262,7 +8262,7 @@ html body main:not(.theme-dark) .cel-function { color: #136a75; }
    Header cells and rows share one grid: the same template, padding, and gaps. Each
    header cell carries a handle that sits in the gap to its right, above its neighbour. */
 html body main .workloads-page .workload-object-list-header { grid-template-columns: 28px minmax(0, 1fr) !important; padding: 0 !important; column-gap: 0 !important; }
-html body main .workloads-page :is(.workload-header-cells, .workload-object-row) { display: grid; grid-template-columns: var(--workload-columns) !important; column-gap: 10px !important; padding-left: 10px !important; padding-right: 10px !important; align-items: center; }
+html body main .workloads-page :is(.workload-header-cells, .workload-object-row) { display: grid; grid-template-columns: var(--kv-workload-grid) !important; column-gap: 10px !important; padding-left: 10px !important; padding-right: 10px !important; align-items: center; }
 html body main .workloads-page .workload-header-cells { min-width: 0; }
 html body main .workloads-page .workload-object-list > :is(.workload-object-list-header, .workload-selection-row, .resource-bulk-toolbar) { min-width: var(--workload-table-min, 100%); }
 html body main .workloads-page .workload-object-list { overflow-x: auto; }
@@ -8292,3 +8292,39 @@ html body main .resource-header-cells :is([data-column="age"], [data-column="act
 html body main :is(.ov-table-head, .ov-row) { grid-template-columns: var(--ov-grid) !important; }
 html body main .argo-app-row { grid-template-columns: var(--argo-app-grid) !important; }
 html body main :is(.ov-table-head, .argo-row-head) .column-cell { text-transform: inherit; }
+/* Tables scroll sideways once their columns no longer fit; header and rows scroll together. */
+html body main .resource-workbench .resource-object-browser { overflow-x: auto; }
+html body main .resource-workbench .resource-object-browser > :is(.resource-object-columns, .object-list, .resource-bulk-toolbar) { min-width: var(--resource-table-min, 100%); }
+html body main .resource-workbench-inspecting .resource-object-browser > :is(.resource-object-columns, .object-list, .resource-bulk-toolbar) { min-width: 0; }
+html body main .ov-table { overflow-x: auto; }
+html body main .ov-table > :is(.ov-table-head, .ov-row) { min-width: var(--ov-table-min, 100%); }
+html body main .argo-table { overflow-x: auto; }
+html body main .argo-table > .argo-app-row { min-width: var(--argo-table-min, 100%); }
+.ov-freshness.ov-freshness-late { color: #8a5a10; }
+.ov-freshness.ov-freshness-late > i { background: #d49b2e; animation: none; }
+main.theme-dark .ov-freshness.ov-freshness-late { color: #f0c674; }
+
+/* Dark theme: cluster and namespace menus and other popovers. */
+html body main.theme-dark :is(.cluster-selector-menu, .namespace-menu, .favorite-context-menu, .sidebar-type-menu) { color: var(--ui-ink) !important; background: var(--ui-surface) !important; border-color: var(--ui-border-strong) !important; box-shadow: 0 18px 40px rgba(0, 0, 0, .5) !important; }
+html body main.theme-dark .cluster-selector-heading { color: var(--ui-muted) !important; }
+html body main.theme-dark .cluster-selector-heading b { color: var(--ui-ink) !important; background: var(--ui-surface-strong) !important; }
+html body main.theme-dark .cluster-selector-items button { color: var(--ui-copy) !important; background: transparent !important; border-color: transparent !important; }
+html body main.theme-dark .cluster-selector-items button:hover { background: var(--ui-surface-strong) !important; }
+html body main.theme-dark .cluster-selector-items button.chosen { color: var(--ui-ink) !important; background: var(--ui-active) !important; border-color: var(--ui-border-strong) !important; box-shadow: inset 2px 0 0 var(--ui-accent) !important; }
+html body main.theme-dark .cluster-selector-items button strong { color: var(--ui-ink) !important; }
+html body main.theme-dark .cluster-selector-items button small { color: var(--ui-muted) !important; }
+html body main.theme-dark .cluster-selector-items button i { color: var(--ui-accent) !important; }
+html body main.theme-dark .cluster-selector-manage { color: var(--ui-copy) !important; background: var(--ui-surface-muted) !important; border-color: var(--ui-border) !important; }
+html body main.theme-dark .cluster-selector-manage:hover { color: var(--ui-ink) !important; background: var(--ui-surface-strong) !important; }
+html body main.theme-dark .cluster-selector-empty { color: var(--ui-muted) !important; }
+html body main:not(.theme-dark) :is(.cluster-selector-items small, .command-modal kbd, .command-modal small) { color: #625e57 !important; }
+html body main:not(.theme-dark) .command-secondary-action { color: #6f4433 !important; }
+
+html body main .cluster-tile-current { color: #fff !important; background: #b5532f !important; }
+html body main.theme-dark .cluster-tile-current { color: #1a1310 !important; background: var(--ui-accent) !important; }
+html body main:not(.theme-dark) .cluster-tile-cta { color: #a3442a !important; }
+html body main.theme-dark :is(.command-input, .command-modal input) { color: var(--ui-ink) !important; background: var(--ui-surface-muted) !important; border-color: var(--ui-border-strong) !important; }
+html body main.theme-dark .command-modal { color: var(--ui-ink) !important; background: var(--ui-surface) !important; border-color: var(--ui-border-strong) !important; }
+html body main.theme-dark :is(.reveal-button, .workload-terminal-heading > button, .favorite-toggle) { color: var(--ui-copy) !important; background: var(--ui-surface-strong) !important; border-color: var(--ui-border-strong) !important; }
+html body main.theme-dark .favorite-toggle.favorite-toggle-active { color: #f0c674 !important; background: rgba(214, 160, 60, .14) !important; border-color: rgba(214, 160, 60, .4) !important; }
+html body main.theme-dark .resource-pane-heading > span { color: var(--ui-copy) !important; background: var(--ui-surface-strong) !important; border-color: var(--ui-border) !important; }

@@ -306,6 +306,37 @@ async fn run_keyed_feed(
     }
 }
 
+/// Learns how often metrics-server really publishes samples (its resolution can be 15 s to
+/// 60 s or more), from the gaps between successive sample timestamps.
+#[derive(Debug, Default)]
+pub(super) struct SampleCadence {
+    last: Option<chrono::DateTime<chrono::FixedOffset>>,
+    pub interval: Option<f64>,
+}
+
+impl SampleCadence {
+    pub fn observe(&mut self, sampled_at: Option<&str>) {
+        let Some(time) =
+            sampled_at.and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        else {
+            return;
+        };
+        if let Some(previous) = self.last {
+            let gap = (time - previous).num_milliseconds() as f64 / 1000.0;
+            if gap > 0.5 && gap < 600.0 {
+                // Smooth out jitter; a new resolution shows within a few samples.
+                self.interval = Some(match self.interval {
+                    Some(current) => ((current * 0.6 + gap * 0.4) * 10.0).round() / 10.0,
+                    None => (gap * 10.0).round() / 10.0,
+                });
+            }
+        }
+        if self.last.is_none_or(|previous| time > previous) {
+            self.last = Some(time);
+        }
+    }
+}
+
 /// The Overview without its timestamp, for change detection.
 fn overview_fingerprint(overview: &ClusterOverview) -> String {
     let mut value = serde_json::to_value(overview).unwrap_or_default();
@@ -329,8 +360,17 @@ async fn run_overview_feed(
             .map_err(|_| "Feed connection timed out".to_string())??;
             let nodes_api = Api::<Node>::all(client.clone());
             let list_params = ListParams::default();
+            // The first Overview never waits on a slow Metrics API; metrics follow on the next tick.
             let (metrics, listed) = tokio::join!(
-                read_node_metric_samples(client.clone()),
+                async {
+                    tokio::time::timeout(
+                        Duration::from_secs(4),
+                        read_node_metric_samples(client.clone()),
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+                },
                 nodes_api.list(&list_params)
             );
             let listed = listed.map_err(|error| {
@@ -348,18 +388,26 @@ async fn run_overview_feed(
                 .collect();
             let mut metrics = metrics;
             let mut last = String::new();
+            let mut cadence = SampleCadence::default();
+            cadence.observe(
+                metrics
+                    .as_ref()
+                    .and_then(|samples| samples.sampled_at.as_deref()),
+            );
             let mut publish = |nodes: &BTreeMap<String, Node>,
                                metrics: &Option<NodeMetricSamples>,
+                               interval: Option<f64>,
                                publisher: &mut FeedPublisher| {
-                let overview =
+                let mut overview =
                     overview_with_samples(nodes.values().cloned().collect(), metrics.as_ref());
+                overview.metrics_interval_seconds = interval;
                 let fingerprint = overview_fingerprint(&overview);
                 if fingerprint != last {
                     last = fingerprint;
                     publisher.emit("overview", serde_json::json!({ "overview": overview }));
                 }
             };
-            publish(&nodes, &metrics, publisher);
+            publish(&nodes, &metrics, cadence.interval, publisher);
             let mut stream = nodes_api
                 .watch(&WatchParams::default().timeout(290), &version)
                 .await
@@ -377,11 +425,12 @@ async fn run_overview_feed(
                 tokio::select! {
                     _ = &mut deadline => return Ok::<(), String>(()),
                     _ = resume_signal().notified() => return Ok(()),
-                    _ = flush.tick() => if dirty { dirty = false; publish(&nodes, &metrics, publisher); },
+                    _ = flush.tick() => if dirty { dirty = false; publish(&nodes, &metrics, cadence.interval, publisher); },
                     _ = metrics_tick.tick() => {
                         // Only a new sample from metrics-server changes anything; repeated reads are free.
                         if let Ok(Some(next)) = tokio::time::timeout(Duration::from_secs(10), read_node_metric_samples(client.clone())).await {
                             if metrics.as_ref().map(|current| current.fingerprint.as_str()) != Some(next.fingerprint.as_str()) {
+                                cadence.observe(next.sampled_at.as_deref());
                                 metrics = Some(next);
                                 dirty = true;
                             }
@@ -487,6 +536,25 @@ mod tests {
             overview_fingerprint(&first),
             overview_fingerprint(&with_metrics)
         );
+    }
+
+    #[test]
+    fn sample_cadence_learns_the_real_metrics_resolution() {
+        let mut cadence = SampleCadence::default();
+        cadence.observe(Some("2026-10-02T10:00:00Z"));
+        assert_eq!(cadence.interval, None);
+        cadence.observe(Some("2026-10-02T10:01:00Z"));
+        assert_eq!(cadence.interval, Some(60.0));
+        cadence.observe(Some("2026-10-02T10:01:00Z"));
+        assert_eq!(
+            cadence.interval,
+            Some(60.0),
+            "a repeated sample is not a new interval"
+        );
+        cadence.observe(Some("2026-10-02T10:02:00Z"));
+        assert_eq!(cadence.interval, Some(60.0));
+        cadence.observe(Some("not a time"));
+        assert_eq!(cadence.interval, Some(60.0));
     }
 
     #[test]

@@ -531,6 +531,9 @@ struct ClusterOverview {
     metrics_sampled_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     metrics_window_seconds: Option<f64>,
+    /// Observed time between new samples from metrics-server (its real resolution).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metrics_interval_seconds: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2070,8 +2073,17 @@ async fn read_cluster_overview_inner(
     // Metrics API never delays the cluster overview itself.
     let nodes_api = Api::<Node>::all(client.clone());
     let nodes_params = ListParams::default();
+    // A slow or missing Metrics API must never hold up the node list.
     let (samples, nodes_response) = tokio::join!(
-        read_node_metric_samples(client),
+        async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(4),
+                read_node_metric_samples(client),
+            )
+            .await
+            .ok()
+            .flatten()
+        },
         nodes_api.list(&nodes_params)
     );
     let node_items = nodes_response.map_err(|error| error.to_string())?.items;
@@ -2352,6 +2364,7 @@ pub(crate) fn build_cluster_overview(
         observed_at: Utc::now().to_rfc3339(),
         metrics_sampled_at: None,
         metrics_window_seconds: None,
+        metrics_interval_seconds: None,
     }
 }
 

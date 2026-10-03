@@ -4,7 +4,7 @@
   import { cubicOut } from 'svelte/easing';
   import { LiveResourceStore, panePercent, type RowChange } from './lib/live-resources';
   import { KeyedFeedStore, newestEvents, type FeedChange } from './lib/live-feed';
-  import { dragResize, percentOfContainer, widthFromDrag } from './lib/drag-resize';
+  import { columnFromDrag, dragResize, leftColumnWidths, percentOfContainer, widthFromDrag } from './lib/drag-resize';
   import { admissionPolicyView, isAdmissionPolicyKind, tokenizeCel, type CelEntry } from './lib/admission-policy';
   import { argoApplication, argoApplicationSet, argoProject, argoTone, isForbidden, resourcesByKind, summarizeArgo, type ArgoApp, type ArgoAppSet, type ArgoProject, type ArgoResource } from './lib/argocd';
   import { conditions as gatewayConditions, gatewayAddresses, gatewayListeners, routeHostnames, routeParents, routeRules, routesAttachedToGateway, routesTargetingService, type RouteSummary } from './lib/gateway-api';
@@ -58,7 +58,7 @@
   type NodeOverview = { name: string; ready: boolean; roles: string[]; labels: NodeProperty[]; annotations: NodeProperty[]; addresses: NodeAddress[]; conditions: NodeCondition[]; taints: NodeTaint[]; architecture?: string; operatingSystem?: string; osImage?: string; kernelVersion?: string; kubeletVersion?: string; containerRuntimeVersion?: string; podCidrs: string[]; providerId?: string; unschedulable: boolean; uid?: string; creationTimestamp?: string; capacity: NodeProperty[]; allocatable: NodeProperty[]; cpuCapacity?: string; memoryCapacity?: string; cpuUsage?: string; memoryUsage?: string; cpuUsagePercent?: number; memoryUsagePercent?: number };
   type ClusterTotals = { cpuCapacity?: string; memoryCapacity?: string; storageCapacity?: string; cpuUsage?: string; memoryUsage?: string; cpuUsagePercent?: number; memoryUsagePercent?: number; metricNodes: number };
   type NetworkFact = { label: string; value: string; tone: 'neutral' | 'primary' | 'external' };
-  type ClusterOverview = { nodes: NodeOverview[]; totals: ClusterTotals; metricsAvailable: boolean; observedAt: string; metricsSampledAt?: string; metricsWindowSeconds?: number };
+  type ClusterOverview = { nodes: NodeOverview[]; totals: ClusterTotals; metricsAvailable: boolean; observedAt: string; metricsSampledAt?: string; metricsWindowSeconds?: number; metricsIntervalSeconds?: number };
   type ClusterEvent = { name: string; namespace?: string; eventType: string; reason?: string; message?: string; involvedKind?: string; involvedName?: string; action?: string; count?: number; source?: string; firstObserved?: string; lastObserved?: string };
   type KubeContext = { name: string; cluster: string; namespace: string; authMethod: string; current: boolean; sourcePath?: string };
   type KubeconfigSummary = { contexts: KubeContext[]; currentContext?: string };
@@ -229,6 +229,9 @@
   let overviewClockTimer: ReturnType<typeof window.setInterval> | undefined;
   $: syncOverviewClock(activeView === 'Overview');
   $: metricsAgeSeconds = clusterOverview?.metricsSampledAt ? Math.max(0, Math.round((overviewClock - Date.parse(clusterOverview.metricsSampledAt)) / 1000)) : null;
+  // metrics-server's real cadence, learned from successive samples (falls back to its window).
+  $: metricsCadenceSeconds = clusterOverview?.metricsIntervalSeconds || clusterOverview?.metricsWindowSeconds || null;
+  $: metricsLate = metricsAgeSeconds !== null && metricsAgeSeconds > Math.max(30, (metricsCadenceSeconds || 15) * 2) + 5;
   // Draggable layout: Logs page split, Argo CD list/details, and Name columns (0 = automatic).
   let logSidebarWidth = 258;
   let argoListPercent = 60;
@@ -513,6 +516,8 @@
     : [];
   $: resourceListColumns = buildResourceListColumns(resourceServerColumns, Boolean(selectedResource?.namespaced && namespace === 'all namespaces'), columnWidths[resourceColumnScope]);
   $: resourceGridTemplate = resourceListColumns.map((column) => column.width).join(' ');
+  // list inset + checkbox + gap + button padding + column gaps + columns
+  $: resourceTableMinWidth = 10 + 28 + 3 + 16 + (resourceListColumns.length - 1) * 7 + resourceListColumns.reduce((total, column) => total + trackMinimum(column.width), 0);
   $: workloadSearchNeedle = workloadSearch.trim().toLowerCase();
   $: visibleWorkloadObjects = filterObjects(workloadObjects, workloadSearchNeedle);
   $: visibleResourceObjects = filterObjects(resourceObjects, resourceObjectSearch.trim().toLowerCase());
@@ -621,7 +626,7 @@
       { key: 'action', label: 'Action', width: '64px', resizable: false },
     ];
     // A dragged width is a preference: other columns keep their minimums before it shrinks.
-    return columns.map((column) => (widths[column.key] ? { ...column, width: `minmax(48px, ${widths[column.key]}px)` } : column));
+    return columns.map((column) => ({ ...column, auto: column.width, width: widths[column.key] ? `${widths[column.key]}px` : column.width }));
   }
 
   function rememberTableColumns(key: string, columns: TableColumn[] | undefined) {
@@ -1621,6 +1626,7 @@
             ...base,
             metricsSampledAt: new Date().toISOString(),
             metricsWindowSeconds: 15,
+            metricsIntervalSeconds: 3,
             totals: { ...base.totals, cpuUsagePercent: wave(0), memoryUsagePercent: wave(1.4) },
             nodes: base.nodes.map((node, index) => ({ ...node, cpuUsagePercent: wave(index), memoryUsagePercent: wave(index + 2) })),
           };
@@ -2386,10 +2392,9 @@
     window.addEventListener('pointerup', stopResize, { once: true });
   }
 
-  /** Drag from the current rendered width when the column is still automatic. */
-  function columnWidthFromDrag(event: PointerEvent, start: { value: number; x: number; node: HTMLElement }) {
-    const base = start.value || (start.node.parentElement?.getBoundingClientRect().width ?? 120);
-    return Math.max(48, widthFromDrag(event, { value: base, x: start.x }));
+  /** Column drags start from the rendered width and follow the pointer 1:1 at any zoom. */
+  function columnWidthFromDrag(event: { clientX: number }, start: Parameters<typeof columnFromDrag>[1]) {
+    return Math.max(48, columnFromDrag(event, start));
   }
 
   type GridColumn = { key: string; label: string; width: string };
@@ -2406,7 +2411,12 @@
 
   /** A grid template with dragged widths applied (other columns keep their minimums first). */
   function gridTemplate(columns: GridColumn[], widths: Record<string, number> = {}) {
-    return columns.map((column) => (widths[column.key] ? `minmax(48px, ${widths[column.key]}px)` : column.width)).join(' ');
+    return columns.map((column) => (widths[column.key] ? `${widths[column.key]}px` : column.width)).join(' ');
+  }
+
+  /** Narrowest a table can get before it scrolls sideways: padding + gaps + column minimums. */
+  function tableMinWidth(columns: GridColumn[], widths: Record<string, number> = {}, padding: number, gap: number) {
+    return padding + gap * (columns.length - 1) + columns.reduce((total, column) => total + (widths[column.key] || trackMinimum(column.width)), 0);
   }
 
   function loadColumnWidths() {
@@ -2416,6 +2426,15 @@
     } catch {
       return {};
     }
+  }
+
+  /** Keeps columns left of the dragged edge at their current width, so only the right side flexes. */
+  function freezeLeftColumns(scope: string) {
+    return (node: HTMLElement) => {
+      const frozen = leftColumnWidths(node);
+      if (!Object.keys(frozen).length) return;
+      columnWidths = { ...columnWidths, [scope]: { ...(columnWidths[scope] || {}), ...Object.fromEntries(Object.entries(frozen).map(([key, width]) => [key, Math.round(width)])) } };
+    };
   }
 
   function setColumnWidth(scope: string, key: string, width: number) {
@@ -6231,7 +6250,7 @@
   }
 </script>
 
-{#snippet resizableHeaderCells(columns: GridColumn[], scope: string)}{#each columns as column (column.key)}<span class="column-cell" data-column={column.key}><span class="column-label" title={column.label}>{column.label}</span><!-- svelte-ignore a11y_no_noninteractive_tabindex --><i class="column-resizer" role="separator" tabindex="0" aria-orientation="vertical" aria-label={`Resize the ${column.label} column`} title="Drag to resize · double-click to reset" use:dragResize={{ value: columnWidths[scope]?.[column.key] || 0, min: 0, max: 1200, reset: 0, step: 16, fromPointer: columnWidthFromDrag, onChange: (value) => setColumnWidth(scope, column.key, value), onCommit: saveColumnWidths }}></i></span>{/each}{/snippet}
+{#snippet resizableHeaderCells(columns: GridColumn[], scope: string)}{#each columns as column (column.key)}<span class="column-cell" data-column={column.key} data-min={columnWidths[scope]?.[column.key] || trackMinimum(column.width)}><span class="column-label" title={column.label}>{column.label}</span><!-- svelte-ignore a11y_no_noninteractive_tabindex --><i class="column-resizer" role="separator" tabindex="0" aria-orientation="vertical" aria-label={`Resize the ${column.label} column`} title="Drag to resize · double-click to reset" use:dragResize={{ value: columnWidths[scope]?.[column.key] || 0, min: 0, max: 1200, reset: 0, step: 16, onStart: freezeLeftColumns(scope), fromPointer: columnWidthFromDrag, onChange: (value) => setColumnWidth(scope, column.key, value), onCommit: saveColumnWidths }}></i></span>{/each}{/snippet}
 
 {#snippet noteInline(parts: Inline[])}{#each parts as part}{#if part.bold}<strong>{part.text}</strong>{:else if part.code}<code>{part.text}</code>{:else}{part.text}{/if}{/each}{/snippet}
 
@@ -6601,7 +6620,7 @@
             <div class="argo-empty"><GitBranch size={22} /><strong>{argoApps.length ? (argoFilter === 'attention' && !argoSearch ? 'No applications need attention' : 'No applications match') : 'No Argo CD applications found'}</strong><small>{argoApps.length ? 'Try another filter.' : 'Applications you can list will appear here.'}</small></div>
           {:else}
             <div class="argo-body">
-              <div class="argo-table" role="table" aria-label="Argo CD applications" style:--argo-app-grid={gridTemplate(argoAppColumns, columnWidths['argo:applications'])}>
+              <div class="argo-table" role="table" aria-label="Argo CD applications" style:--argo-app-grid={gridTemplate(argoAppColumns, columnWidths['argo:applications'])} style:--argo-table-min={`${tableMinWidth(argoAppColumns, columnWidths['argo:applications'], 32, 12)}px`}>
                 <div class="argo-row argo-app-row argo-row-head" role="row">{@render resizableHeaderCells(argoAppColumns, 'argo:applications')}</div>
                 {#each visibleArgoApps as app (argoKey(app))}
                   <button type="button" role="row" class="argo-row argo-app-row" on:click={() => openArgoApp(app)}>
@@ -6746,8 +6765,8 @@
               <div class="ov-kpi"><span>Memory</span><strong>{clusterOverview.totals.memoryUsagePercent === undefined ? '—' : percentLabel($memoryPercentTween)}<small>%</small></strong><em>{clusterOverview.totals.memoryUsage ? memoryLabel(clusterOverview.totals.memoryUsage) : 'No metrics'} of {memoryLabel(clusterOverview.totals.memoryCapacity)}</em><i class="ov-bar ov-bar-{usageTone(clusterOverview.totals.memoryUsagePercent)}"><b style:width={`${clusterOverview.totals.memoryUsagePercent || 0}%`}></b></i></div>
               <div class:ov-kpi-warn={overviewIssueNodes.length} class="ov-kpi"><span>Health</span><strong>{overviewIssueNodes.length ? overviewIssueNodes.length : 'OK'}</strong><em>{overviewIssueNodes.length ? `node${overviewIssueNodes.length === 1 ? '' : 's'} need attention` : 'No node conditions'}</em></div>
             </section>
-            <section class="ov-table panel" aria-label="Nodes" style:--ov-grid={gridTemplate(overviewNodeColumns, columnWidths['overview:nodes'])}>
-              <header><h2>Nodes</h2>{#if clusterOverview.metricsSampledAt}{#key clusterOverview.metricsSampledAt}<small class="ov-freshness" title={`metrics-server sampled at ${new Date(clusterOverview.metricsSampledAt).toLocaleTimeString()}`}><i></i>Metrics {metricsAgeLabel(metricsAgeSeconds)}{#if clusterOverview.metricsWindowSeconds}{` · metrics-server samples every ~${Math.round(clusterOverview.metricsWindowSeconds)}s`}{/if}</small>{/key}{:else}<small>Updated {new Date(clusterOverview.observedAt).toLocaleTimeString()}</small>{/if}</header>
+            <section class="ov-table panel" aria-label="Nodes" style:--ov-grid={gridTemplate(overviewNodeColumns, columnWidths['overview:nodes'])} style:--ov-table-min={`${tableMinWidth(overviewNodeColumns, columnWidths['overview:nodes'], 36, 14)}px`}>
+              <header><h2>Nodes</h2>{#if clusterOverview.metricsSampledAt}{#key clusterOverview.metricsSampledAt}<small class:ov-freshness-late={metricsLate} class="ov-freshness" title={`metrics-server sampled at ${new Date(clusterOverview.metricsSampledAt).toLocaleTimeString()}`}><i></i>Metrics {metricsAgeLabel(metricsAgeSeconds)}{metricsLate ? ' · waiting for metrics-server' : metricsCadenceSeconds ? ` · new samples about every ${Math.round(metricsCadenceSeconds)}s` : ''}</small>{/key}{:else}<small>Updated {new Date(clusterOverview.observedAt).toLocaleTimeString()}</small>{/if}</header>
               <div class="ov-table-head" role="row">{@render resizableHeaderCells(overviewNodeColumns, 'overview:nodes')}</div>
               {#each clusterOverview.nodes as node}
                 <button type="button" class:ov-row-active={node.name === selectedNode?.name} class="ov-row" on:click={() => { selectedNodeName = node.name; nodeDetailTab = 'Overview'; }}>
@@ -6801,11 +6820,11 @@
               </div>
             {:else}
             <div class:resource-workbench-inspecting={Boolean((editorObject || loadingEditor) && !configModalOpen)} class="resource-workbench-body resource-workbench-body-focused">
-              <aside class:resource-objects-single-namespace={Boolean(selectedResource && (namespace !== 'all namespaces' || !selectedResource.namespaced))} class:resource-object-table={resourceServerColumns.length > 0} style:--resource-row-grid={resourceGridTemplate} class="resource-object-browser" aria-label="Resource objects">
+              <aside class:resource-objects-single-namespace={Boolean(selectedResource && (namespace !== 'all namespaces' || !selectedResource.namespaced))} class:resource-object-table={resourceServerColumns.length > 0} style:--resource-row-grid={resourceGridTemplate} style:--resource-table-min={`${resourceTableMinWidth}px`} class="resource-object-browser" aria-label="Resource objects">
                 {#if selectedResource}
                   <div class="resource-object-heading resource-pane-heading"><button type="button" class="resource-directory-back" aria-label="Back to all resource types" title="All resource types" on:click={showResourceDirectory}>←</button><div><span class:custom={selectedResource.crd} class="resource-pane-icon"><svelte:component this={resourceIcon(selectedResource)} size={16} strokeWidth={1.8} /></span><div><strong>{selectedResource.kind} objects</strong><small>{selectedResource.apiVersion} · {selectedResource.namespaced ? (namespace === 'all namespaces' ? 'All namespaces' : namespace) : 'Cluster-wide'}</small></div></div><span class:live-status-loading={liveDataStatus === 'loading'} class:live-status-loaded={liveDataStatus === 'loaded'} class:live-status-stale={liveDataStatus === 'stale'} class:live-status-paused={liveDataStatus === 'paused'} class:live-status-unavailable={liveDataStatus === 'unavailable'} class:live-status-live={liveDataStatus === 'live'} class="live-list-status resource-live-status" title={liveDataStatusTooltip} aria-label={liveDataStatusTooltip} aria-live="polite"><i></i></span><b>{resourceObjects.length}</b></div>
                   <label class="resource-object-search"><Search size={13} /><input bind:value={resourceObjectSearch} placeholder={`Filter ${selectedResource.plural} by name, namespace, or status`} aria-label={`Filter ${selectedResource.plural}`} spellcheck="false" />{#if resourceObjectSearch}<span>{visibleResourceObjects.length}/{resourceObjects.length}</span><button type="button" aria-label="Clear filter" on:click={() => (resourceObjectSearch = '')}>×</button>{/if}</label>
-                  <div class="resource-object-columns" role="row" aria-label="Select shown resource objects">{#if selectedResourcePermissionSet.canDelete}<label class:resource-select-all-partial={resourceObjectsSelectionPartial} class="resource-select-all"><input type="checkbox" checked={allResourceObjectsSelected} disabled={deletingResource || loadingObjects || !visibleResourceObjects.length} aria-checked={resourceObjectsSelectionPartial ? 'mixed' : allResourceObjectsSelected ? 'true' : 'false'} aria-label={`Select all shown ${selectedResource.plural}`} on:change={toggleAllResourceObjects} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}<div class="table-header-cells resource-header-cells">{#each resourceListColumns as column (column.key)}<span class="column-cell" data-column={column.key}><span class="column-label" title={column.label}>{column.label}</span>{#if column.resizable}<!-- svelte-ignore a11y_no_noninteractive_tabindex --><i class="column-resizer" role="separator" tabindex="0" aria-orientation="vertical" aria-label={`Resize the ${column.label} column`} title="Drag to resize · double-click to reset" use:dragResize={{ value: columnWidths[resourceColumnScope]?.[column.key] || 0, min: 0, max: 1200, reset: 0, step: 16, fromPointer: columnWidthFromDrag, onChange: (value) => setColumnWidth(resourceColumnScope, column.key, value), onCommit: saveColumnWidths }}></i>{/if}</span>{/each}</div></div>
+                  <div class="resource-object-columns" role="row" aria-label="Select shown resource objects">{#if selectedResourcePermissionSet.canDelete}<label class:resource-select-all-partial={resourceObjectsSelectionPartial} class="resource-select-all"><input type="checkbox" checked={allResourceObjectsSelected} disabled={deletingResource || loadingObjects || !visibleResourceObjects.length} aria-checked={resourceObjectsSelectionPartial ? 'mixed' : allResourceObjectsSelected ? 'true' : 'false'} aria-label={`Select all shown ${selectedResource.plural}`} on:change={toggleAllResourceObjects} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}<div class="table-header-cells resource-header-cells">{#each resourceListColumns as column (column.key)}<span class="column-cell" data-column={column.key} data-min={columnWidths[resourceColumnScope]?.[column.key] || trackMinimum(column.auto)}><span class="column-label" title={column.label}>{column.label}</span>{#if column.resizable}<!-- svelte-ignore a11y_no_noninteractive_tabindex --><i class="column-resizer" role="separator" tabindex="0" aria-orientation="vertical" aria-label={`Resize the ${column.label} column`} title="Drag to resize · double-click to reset" use:dragResize={{ value: columnWidths[resourceColumnScope]?.[column.key] || 0, min: 0, max: 1200, reset: 0, step: 16, onStart: freezeLeftColumns(resourceColumnScope), fromPointer: columnWidthFromDrag, onChange: (value) => setColumnWidth(resourceColumnScope, column.key, value), onCommit: saveColumnWidths }}></i>{/if}</span>{/each}</div></div>
                   {#if selectedResourceObjects.length && selectedResourcePermissionSet.canDelete}<div class="resource-bulk-toolbar" role="region" aria-label="Bulk resource actions"><span><strong>{selectedResourceObjects.length}</strong> selected</span><button class="destructive" type="button" disabled={deletingResource || loadingEditor || savingEditor || loadingYaml || savingYaml} on:click={() => requestBulkResourceDeletion(selectedResource!)}>Delete {selectedResourceObjects.length}</button><button class="resource-bulk-clear" type="button" disabled={deletingResource} on:click={clearResourceObjectSelection}>Clear</button></div>{/if}
                   {#if loadingObjects}<div class="drawer-state"><i></i>Listing {selectedResource.plural}…</div>{:else if resourceObjects.length === 0}<div class="resource-object-empty"><span>○</span><strong>No {selectedResource.plural} found</strong><p>Try another namespace or use Refresh in the top bar.</p></div>{:else if visibleResourceObjects.length === 0}<div class="resource-object-empty"><span>○</span><strong>No {selectedResource.plural} match “{resourceObjectSearch}”</strong><p>Search matches name, namespace, and status.</p></div>{:else}<div class="object-list">{#each renderedResourceObjects as object}<div class:resource-object-row-selected={isResourceObjectSelected(object, selectedResourceKeySet)} class="resource-object-row">{#if selectedResourcePermissionSet.canDelete}<label class="resource-object-select"><input type="checkbox" checked={isResourceObjectSelected(object, selectedResourceKeySet)} disabled={deletingResource} aria-label={`Select ${selectedResource.kind} ${object.name}`} on:change={() => toggleResourceObjectSelection(object)} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}<button type="button" disabled={!selectedResourceCanOpen} aria-busy={selectedResource.kind === 'Pod' && isOpeningLogs('Pod', object)} class:object-selected={editorObject?.name === object.name && editorObject?.namespace === object.namespace} on:click={() => openObject(selectedResource!, object)}><div class="resource-object-primary"><strong>{object.name}</strong></div>{#each resourceServerColumns as column}<span class="resource-server-cell" title={object.cells?.[column.index] || ''}>{object.cells?.[column.index] || '—'}</span>{/each}<span class="resource-object-namespace">{object.namespace || 'cluster scoped'}</span><small class="resource-object-age">{object.createdAt ? resourceAge(object.createdAt) : '—'}</small><span class="resource-object-action">{selectedResourceCanOpen ? (selectedResource.kind === 'Pod' ? (isOpeningLogs('Pod', object) ? 'Opening…' : 'Logs →') : 'Open →') : ''}</span></button></div>{/each}{#if visibleResourceObjects.length > resourceRenderLimit}<div class="list-reveal-sentinel" use:revealOnView={() => (resourceRenderLimit += LIST_RENDER_BATCH * 2)}>Showing {resourceRenderLimit.toLocaleString()} of {visibleResourceObjects.length.toLocaleString()} · scroll for more</div>{/if}</div>{/if}
                 {:else}
@@ -6932,8 +6951,8 @@
                 {:else if visibleWorkloadObjects.length === 0}
                   <div class="grid min-h-96 place-items-center px-6 text-center"><div><div class="mx-auto grid h-12 w-12 place-items-center rounded-2xl bg-indigo-500/15 text-cyan-300"><Boxes size={22} /></div><h4 class="mb-0 mt-4 text-base font-semibold text-slate-100">{workloadObjects.length ? 'No matching workloads' : `No ${workloadResource?.plural || 'workloads'} found`}</h4><p class="mb-0 mt-2 text-sm text-slate-400">{workloadObjects.length ? 'Try a different name or namespace filter.' : `Nothing was returned for ${namespace}.`}</p></div></div>
                 {:else}
-                  <div style:--workload-table-min={`${workloadTableMinWidth}px`} class="workload-object-list" aria-label={`${workloadResource?.kind || 'Workload'} list`}>
-                    <div class:workload-pod-row={workloadResource?.kind === 'Pod'} class="workload-object-list-header workload-selection-header" aria-label="Workload columns">{#if workloadPermissionSet.canDelete}<label class:resource-select-all-partial={workloadObjectsSelectionPartial} class="resource-select-all"><input type="checkbox" checked={allWorkloadObjectsSelected} disabled={deletingResource || loadingWorkloads || !visibleWorkloadObjects.length} aria-checked={workloadObjectsSelectionPartial ? 'mixed' : allWorkloadObjectsSelected ? 'true' : 'false'} aria-label={`Select all shown ${workloadResource?.plural || 'workloads'}`} on:change={toggleAllWorkloadObjects} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}<div class="table-header-cells workload-header-cells" style:--workload-columns={workloadGridColumns}>{#each workloadColumns as column (column.key)}<span class="column-cell"><span class="column-label" title={column.label}>{column.label}</span><!-- svelte-ignore a11y_no_noninteractive_tabindex --><i class="column-resizer" role="separator" tabindex="0" aria-orientation="vertical" aria-label={`Resize the ${column.label} column`} title="Drag to resize · double-click to reset" use:dragResize={{ value: columnWidths[workloadColumnScope]?.[column.key] || 0, min: 0, max: 1200, reset: 0, step: 16, fromPointer: columnWidthFromDrag, onChange: (value) => setColumnWidth(workloadColumnScope, column.key, value), onCommit: saveColumnWidths }}></i></span>{/each}<span></span></div></div>
+                  <div style:--workload-table-min={`${workloadTableMinWidth}px`} style:--kv-workload-grid={workloadGridColumns} class="workload-object-list" aria-label={`${workloadResource?.kind || 'Workload'} list`}>
+                    <div class:workload-pod-row={workloadResource?.kind === 'Pod'} class="workload-object-list-header workload-selection-header" aria-label="Workload columns">{#if workloadPermissionSet.canDelete}<label class:resource-select-all-partial={workloadObjectsSelectionPartial} class="resource-select-all"><input type="checkbox" checked={allWorkloadObjectsSelected} disabled={deletingResource || loadingWorkloads || !visibleWorkloadObjects.length} aria-checked={workloadObjectsSelectionPartial ? 'mixed' : allWorkloadObjectsSelected ? 'true' : 'false'} aria-label={`Select all shown ${workloadResource?.plural || 'workloads'}`} on:change={toggleAllWorkloadObjects} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}<div class="table-header-cells workload-header-cells">{#each workloadColumns as column (column.key)}<span class="column-cell" data-column={column.key}><span class="column-label" title={column.label}>{column.label}</span><!-- svelte-ignore a11y_no_noninteractive_tabindex --><i class="column-resizer" role="separator" tabindex="0" aria-orientation="vertical" aria-label={`Resize the ${column.label} column`} title="Drag to resize · double-click to reset" use:dragResize={{ value: columnWidths[workloadColumnScope]?.[column.key] || 0, min: 0, max: 1200, reset: 0, step: 16, onStart: freezeLeftColumns(workloadColumnScope), fromPointer: columnWidthFromDrag, onChange: (value) => setColumnWidth(workloadColumnScope, column.key, value), onCommit: saveColumnWidths }}></i></span>{/each}<span></span></div></div>
                     {#if selectedWorkloadObjects.length && workloadPermissionSet.canDelete}<div class="resource-bulk-toolbar workload-bulk-toolbar" role="region" aria-label="Bulk workload actions"><span><strong>{selectedWorkloadObjects.length}</strong> selected</span><button class="destructive" type="button" disabled={deletingResource || loadingEditor || savingEditor || loadingYaml || savingYaml} on:click={() => workloadResource && requestBulkResourceDeletion(workloadResource, selectedWorkloadObjects)}>Delete {selectedWorkloadObjects.length}</button><button class="resource-bulk-clear" type="button" disabled={deletingResource} on:click={clearWorkloadObjectSelection}>Clear</button></div>{/if}
                     {#each renderedWorkloadObjects as workload}
                       <div class:workload-pod-row={workloadResource?.kind === 'Pod'} class:resource-object-row-selected={isWorkloadObjectSelected(workload, selectedWorkloadKeySet)} class="resource-object-row workload-selection-row">
@@ -6950,7 +6969,6 @@
                               && editorObject.namespace === workload.namespace)
                           )}
                           class="workload-object-row group"
-                          style:--workload-columns={workloadGridColumns}
                           disabled={!workloadPermissionSet.canGet}
                           on:click={() => workloadResource && openObject(workloadResource, workload)}
                         >
