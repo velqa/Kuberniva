@@ -30,18 +30,21 @@ Kuberniva is an open-source, local-first Kubernetes desktop app. It opens instan
 | 🛡️ **Authorization** | Respect Kubernetes RBAC per cluster, namespace, API, object, verb, and subresource; hide unavailable APIs and keep read-only identities free of mutation controls. |
 | ⭐ **Shortcuts** | Pin up to 10 clusters, rename their shortcuts, and keep them across restarts. |
 | 📊 **Overview** | See cluster-wide CPU, memory, and node storage totals first, then select any node for its capacity, allocation, network, and live usage. Node changes stream in live. |
+| 🕸️ **Topology** | See how everything connects, for one namespace or the whole cluster: Gateways and Ingresses → routes → Services → Deployments, StatefulSets, DaemonSets, and CronJobs → ReplicaSets and Jobs → Pods, plus the ConfigMaps, Secrets, and volume claims each workload uses. Failing objects, Services that select nothing, and references to objects that do not exist are flagged in red. Filter, show problems only, and click any object to open it. Secret values are never read. |
 | 🛎️ **Events** | Browse Kubernetes Events live, grouped by object, with warning/normal filters and search. |
-| 🐙 **Argo CD** | When Argo CD is installed, every Application gets a full page: health and sync at a glance, a resource tree with live Pods, the last sync's per-resource results, deployment history with rollback, and events. Sync with options (prune, dry run, revision, selected resources), toggle auto-sync, or terminate a running sync, each after a confirmation. ApplicationSets and Projects have their own tabs. |
+| 🐙 **Argo CD** | When Argo CD is installed, every Application gets a full page: health and sync at a glance, a **Graph** of the app's resources down to ReplicaSets and Pods like the Argo CD dashboard, a **Parameters** tab with Helm values and Kustomize options, a resource tree with live Pods, the last sync's per-resource results, deployment history with rollback, and events. Sync with options (prune, dry run, revision, selected resources), toggle auto-sync, or terminate a running sync, each after a confirmation. ApplicationSets and Projects have their own tabs. |
+| ⎈ **Helm** | A cluster-wide **Helm** page lists every release (read from Helm's own storage, no `helm` binary needed) with chart, app version, revision, and status. Open one for its values, notes, rendered manifest, and revision history, or prefill `helm upgrade`, `helm rollback`, and `helm history` in the CLI. |
+| 🌐 **Open Cluster Management** | On an OCM hub, an **OCM Hub** page shows managed clusters (availability, join and acceptance, claims, allocatable capacity, add-ons), cluster sets, placements with their decisions, ManifestWorks, and policy compliance. It only appears when the cluster serves the OCM APIs. |
 | 🚪 **Gateway API** | Gateways show listeners, addresses, and attached routes; HTTPRoutes and GRPCRoutes show hostnames, parent status, and rules with weighted backends; Services list the routes that target them. |
 | 🛡️ **Admission Policies** | ValidatingAdmissionPolicy, MutatingAdmissionPolicy, and bindings get their own group with structured properties and highlighted CEL expressions. |
-| 🧭 **Resources** | Browse API types Lens-style: Resources and Custom APIs expand into trees right in the sidebar, grouped by Configuration, Access Control, Network, Storage, and Cluster. Or start from a searchable directory with your recently opened types on top. Tables use the full width until you open an object and show the cluster's own columns (Type, Cluster-IP, Ready…), like `kubectl get`. |
+| 🧭 **Resources** | Browse API types Lens-style: Resources and Custom Resources expand into trees right in the sidebar, grouped by Configuration, Access Control, Network, Storage, and Cluster. Or start from a searchable directory with your recently opened types on top. Tables use the full width until you open an object and show the cluster's own columns (Type, Cluster-IP, Ready…), like `kubectl get`. |
 | 🚀 **Workloads** | Switch between Deployments, StatefulSets, DaemonSets, Jobs, CronJobs, Pods, and other workload types from the tabs on top. Compact, single-line tables show status, readiness, restarts, CPU, and memory at a glance. |
 | 🔎 **Details** | Open any workload for a compact Logs / Shell / YAML / Delete toolbar, an ordered Properties list, diagnostics, containers, and configuration. Empty sections stay hidden. |
 | 📝 **Editors** | Edit ConfigMaps and Secrets as key/value data, reveal Secret values on demand, edit YAML, and view certificate expiry. |
 | 📜 **Logs & exec** | Switch between sibling Pods' logs, pick containers, search, copy, or download output, and run commands in any container. Kuberniva detects the container's shell, runs binaries directly in shell-less images, or attaches an ephemeral debug container from an image you choose (handy for air-gapped registries). |
 | ⌨️ **CLI** | A built-in terminal bound to the active cluster and namespace, with live streaming output. See the CLI section below. |
 | 🎨 **Workspace** | Warm ivory light theme and neutral charcoal dark theme, a collapsible sidebar, adjustable interface size, and persistent cluster context. On macOS, closing the window keeps Kuberniva running; click the Dock icon to return, or quit with ⌘Q. |
-| 🔄 **Updates** | **Settings → Check for updates** downloads signed updates in the background and applies them on restart. Kuberniva also checks quietly at launch. |
+| 🔄 **Updates** | **Kuberniva → Check for Updates…** in the macOS menu bar, or **Settings → Check for updates**, downloads signed updates and applies them on restart. Kuberniva also checks quietly at launch and every few hours, and shows a dialog with the release notes when a new version is out. |
 
 ## ⌨️ CLI
 
@@ -76,7 +79,7 @@ Each user adds their own kubeconfig sources after installation.
 
 ### Updating
 
-From 0.3.20 on, open **Settings → Check for updates**, then choose **Download and install** and **Restart now**. Kuberniva also checks at launch and marks **Settings** with a dot when an update is waiting. Every update is signed, and Kuberniva verifies the signature before installing it.
+From 0.3.20 on, open **Settings → Check for updates** (or, from 0.6.0, **Kuberniva → Check for Updates…** in the menu bar), then choose **Download and install** and **Restart now**. Kuberniva also checks at launch and marks **Settings** with a dot when an update is waiting. Every update is signed, and Kuberniva verifies the signature before installing it.
 
 Versions 0.3.19 and earlier have no updater; install the latest `.dmg` once by hand.
 
@@ -116,7 +119,7 @@ flowchart LR
     CONFIG --> CLIENT["Cached kube client"]
     CLIENT --> DISCOVERY["Discovery + CRDs"]
     CLIENT --> API["Kubernetes APIs"]
-    API --> FEATURES["Overview · Events · Resources · Custom APIs · Workloads · Logs · CLI"]
+    API --> FEATURES["Overview · Events · Resources · Custom Resources · Workloads · Logs · CLI"]
     UI --> PREFS["Local preferences + catalog cache"]
 ```
 

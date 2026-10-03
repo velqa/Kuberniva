@@ -1,7 +1,7 @@
 {
   "name": "kuberniva",
   "private": true,
-  "version": "0.5.6",
+  "version": "0.6.0",
   "description": "A fast, native desktop workspace for people who operate many Kubernetes clusters.",
   "license": "MIT",
   "author": "Vijay Kumar Sevakula",

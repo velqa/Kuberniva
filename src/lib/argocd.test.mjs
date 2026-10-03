@@ -86,7 +86,7 @@ test('applications expose sources, history, last sync results, and ordered resou
       operationState: { phase: 'Failed', message: 'one or more objects failed to apply', startedAt: '2026-09-03T00:00:00Z', finishedAt: '2026-09-03T00:00:20Z', operation: { initiatedBy: { username: 'vijay' }, sync: { revision: '1.4.0', prune: true } }, syncResult: { revision: '1.4.0', resources: [{ kind: 'Deployment', name: 'shop', namespace: 'shop', status: 'SyncFailed', message: 'admission webhook denied the request', syncPhase: 'Sync' }] } },
     },
   });
-  assert.deepEqual(app.sources[0], { repoURL: 'https://github.com/acme/charts.git', repo: 'github.com/acme/charts', path: '', chart: 'shop', targetRevision: '1.4.0', type: 'Helm', parameters: [{ name: 'releaseName', value: 'shop' }, { name: 'replicas', value: '3' }], valueFiles: ['values-prod.yaml'] });
+  assert.deepEqual(app.sources[0], { repoURL: 'https://github.com/acme/charts.git', repo: 'github.com/acme/charts', path: '', chart: 'shop', targetRevision: '1.4.0', type: 'Helm', parameters: [{ name: 'releaseName', value: 'shop' }, { name: 'replicas', value: '3' }], valueFiles: ['values-prod.yaml'], values: '', options: [] });
   assert.equal(app.inCluster, true);
   assert.deepEqual(app.automated, { prune: false, selfHeal: true });
   assert.deepEqual(app.syncOptions, ['CreateNamespace=true']);
@@ -98,4 +98,14 @@ test('applications expose sources, history, last sync results, and ordered resou
   assert.equal(app.resources[2].healthMessage, 'Deployment exceeded its progress deadline');
   assert.deepEqual(resourcesByKind(app.resources).map(([kind, items]) => [kind, items.length]), [['ConfigMap', 1], ['Service', 1], ['Deployment', 1]]);
   assert.equal(argoApplication({ spec: { destination: { name: 'prod' } } }).inCluster, false);
+});
+
+test('sources expose inline Helm values and Kustomize options for the Parameters tab', () => {
+  const helmApp = argoApplication({ spec: { source: { repoURL: 'r', chart: 'c', helm: { values: 'replicaCount: 3\n', skipCrds: true, version: 'v3' } } } });
+  assert.equal(helmApp.sources[0].values, 'replicaCount: 3\n');
+  assert.deepEqual(helmApp.sources[0].options, [{ label: 'Helm version', value: 'v3' }, { label: 'Skip CRDs', value: 'Yes' }]);
+  const objectValues = argoApplication({ spec: { source: { repoURL: 'r', chart: 'c', helm: { valuesObject: { image: { tag: '1.2' } } } } } });
+  assert.match(objectValues.sources[0].values, /"tag": "1.2"/);
+  const kustomizeApp = argoApplication({ spec: { source: { repoURL: 'r', path: 'p', kustomize: { namePrefix: 'prod-', commonLabels: { team: 'web' }, images: ['api=ghcr.io/acme/api:2'], patches: [{}, {}] } } } });
+  assert.deepEqual(kustomizeApp.sources[0].options, [{ label: 'Name prefix', value: 'prod-' }, { label: 'Common labels', value: 'team=web' }, { label: 'Patches', value: '2 patches' }]);
 });

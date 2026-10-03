@@ -4,6 +4,9 @@
   import { cubicOut } from 'svelte/easing';
   import { LiveResourceStore, panePercent, type RowChange } from './lib/live-resources';
   import { KeyedFeedStore, newestEvents, type FeedChange } from './lib/live-feed';
+  import { layoutGraph, type GraphInput } from './lib/argo-graph';
+  import { layoutTopology, PROBLEM_HEALTH, type Topology, type PlacedNode } from './lib/topology';
+  import { clusterSet as ocmClusterSet, managedCluster, manifestWork as ocmManifestWork, ocmTone, placement as ocmPlacement, policy as ocmPolicy, type OcmCluster } from './lib/ocm';
   import { columnFromDrag, dragResize, leftColumnWidths, percentOfContainer, widthFromDrag } from './lib/drag-resize';
   import { admissionPolicyView, isAdmissionPolicyKind, tokenizeCel, type CelEntry } from './lib/admission-policy';
   import { argoApplication, argoApplicationSet, argoProject, argoTone, isForbidden, resourcesByKind, summarizeArgo, type ArgoApp, type ArgoAppSet, type ArgoProject, type ArgoResource } from './lib/argocd';
@@ -12,9 +15,9 @@
   import { matchesSearch, searchTokens } from './lib/object-search';
   import { parseReleaseNotes, type Inline } from './lib/release-notes';
   import { readDeadlineMs, resumeAction, usesInteractiveAuth, withRequestDeadline } from './lib/request-recovery';
-  import { Bell, Blocks, Boxes, Check, ChevronDown, ChevronRight, Command, Container, Copy, Database, Download, FileText, GitBranch, Ghost, HardDrive, Heart, HeartCrack, Pause, CircleCheck, CircleArrowUp, CircleQuestionMark, Undo2, Ban, Clock, ArrowLeft, Zap, KeyRound, LayoutDashboard, LoaderCircle, Menu, Moon, Network, RefreshCw, Search, ScrollText, Server, Settings2, Shield, ShieldCheck, Star, Sun, Terminal, WifiOff, Workflow } from '@lucide/svelte';
+  import { Bell, Blocks, Boxes, Check, ChevronDown, ChevronRight, Command, Container, Copy, Database, Download, FileText, GitBranch, Ghost, HardDrive, Heart, HeartCrack, Pause, CircleCheck, CircleArrowUp, CircleQuestionMark, Undo2, Ban, Clock, ArrowLeft, Zap, Package, Network as NetworkIcon, Globe, KeyRound, LayoutDashboard, LoaderCircle, Menu, Moon, Network, RefreshCw, Search, ScrollText, Server, Settings2, Shield, ShieldCheck, Star, Sun, Terminal, WifiOff, Workflow, Waypoints } from '@lucide/svelte';
 
-  type View = 'Clusters' | 'Favorites' | 'Overview' | 'Events' | 'Argo CD' | 'Resources' | 'Workloads' | 'Explore' | 'Logs' | 'Settings';
+  type View = 'Clusters' | 'Favorites' | 'Overview' | 'Topology' | 'Events' | 'Argo CD' | 'Helm' | 'OCM' | 'Resources' | 'Workloads' | 'Explore' | 'Logs' | 'Settings';
   type ThemeMode = 'light' | 'dark';
   type NodeDetailTab = 'Overview' | 'Allocation' | 'Network' | 'Health' | 'Metadata';
   type ResourceCategory = 'Workloads' | 'Configuration' | 'Access Control' | 'Network' | 'Gateway APIs' | 'Admission Policies' | 'Storage' | 'Cluster' | 'Custom Resources';
@@ -404,7 +407,7 @@
           : liveDataStatus === 'unavailable' ? 'Unavailable' : 'Live';
   $: pageLive = ['Workloads', 'Resources'].includes(activeView)
     ? { state: liveDataStatus === 'live' ? 'live' : liveDataStatus === 'loading' ? 'loading' : liveDataStatus === 'unavailable' ? 'error' : ['stale', 'paused'].includes(liveDataStatus) ? 'warn' : 'idle', text: liveDataStatusText, tooltip: liveDataStatusTooltip }
-    : ['Overview', 'Events', 'Argo CD'].includes(activeView)
+    : ['Overview', 'Events', 'Argo CD', 'OCM'].includes(activeView)
       ? { state: liveFeedStatus === 'live' ? 'live' : liveFeedStatus === 'connecting' ? 'loading' : liveFeedStatus === 'reconnecting' ? 'warn' : liveFeedStatus === 'unavailable' ? 'idle' : 'idle', text: liveFeedStatus === 'live' ? 'Live' : liveFeedStatus === 'connecting' ? 'Connecting' : liveFeedStatus === 'reconnecting' ? 'Reconnecting' : liveFeedStatus === 'unavailable' ? 'Snapshot' : 'Loaded', tooltip: liveFeedStatus === 'live' ? 'Streaming changes from the cluster' : liveFeedStatus === 'reconnecting' ? 'Reconnecting in the background; showing the last data' : liveFeedStatus === 'unavailable' ? 'Live updates are not available here; data refreshes periodically' : 'Connecting to live updates' }
       : null;
   $: liveDataStatusTooltip = liveDataStatusMessage
@@ -429,11 +432,17 @@
   $: recentDirectoryResources = resourceDirectorySearch.trim()
     ? []
     : recentResourceKeys.map((key) => activeResourceCatalog.find((resource) => resourceKey(resource) === key)).filter((resource): resource is ResourceDescriptor => Boolean(resource)).slice(0, 6);
-  $: activeViewTitle = customApiWorkspace ? 'Custom APIs' : activeView;
-  $: resourceNavigatorLabel = customApiWorkspace ? 'Custom APIs' : 'Resources';
-  $: showClusterWorkspaceControls = Boolean(activeClusterId) && ['Overview', 'Events', 'Argo CD', 'Resources', 'Workloads', 'Logs'].includes(activeView);
+  $: activeViewTitle = customApiWorkspace ? 'Custom Resources' : activeView;
+  $: resourceNavigatorLabel = customApiWorkspace ? 'Custom Resources' : 'Resources';
+  $: showClusterWorkspaceControls = Boolean(activeClusterId) && ['Overview', 'Topology', 'Events', 'Argo CD', 'Helm', 'OCM', 'Resources', 'Workloads', 'Logs'].includes(activeView);
   $: refreshingCurrentView = refreshingCluster || loadingCatalog || (activeView === 'Overview'
     ? loadingOverview
+    : activeView === 'Helm'
+      ? loadingHelm
+    : activeView === 'Topology'
+      ? loadingTopology
+    : activeView === 'OCM'
+      ? loadingOcm
     : activeView === 'Argo CD'
       ? loadingArgo
     : activeView === 'Events'
@@ -682,6 +691,18 @@
   }
 
   async function invokeRead<T>(command: string, args: Record<string, unknown>): Promise<T> {
+    if (import.meta.env.DEV && visualQaRecoveryScenario === 'helm' && (command === 'list_helm_releases' || command === 'get_helm_release')) {
+      const fixtures = await import('./dev/visual-qa-fixtures');
+      return (command === 'list_helm_releases' ? fixtures.visualQaHelmReleases : fixtures.visualQaHelmDetail(args)) as T;
+    }
+    if (import.meta.env.DEV && visualQaRecoveryScenario === 'topology' && command === 'cluster_topology') {
+      const fixtures = await import('./dev/visual-qa-fixtures');
+      return fixtures.visualQaTopology(args) as T;
+    }
+    if (import.meta.env.DEV && visualQaRecoveryScenario === 'argocd' && command === 'argocd_resource_tree') {
+      const fixtures = await import('./dev/visual-qa-fixtures');
+      return fixtures.visualQaArgoTree(args) as T;
+    }
     if (import.meta.env.DEV && visualQaRecoveryEnabled) {
       const fixtures = await import('./dev/visual-qa-fixtures');
       return withRequestDeadline(fixtures.readVisualQaRequest(command, args, visualQaRecoveryScenario === 'recovery-timeout') as Promise<T>, 'Reading cluster data', visualQaRecoveryScenario === 'recovery-timeout' ? 150 : 3_000);
@@ -693,7 +714,8 @@
 
   // Argo CD: auto-detected from the catalog, like Lens' navigator entry.
   type ArgoAction = 'refresh' | 'hard-refresh' | 'sync' | 'rollback' | 'terminate' | 'set-auto-sync';
-  type ArgoAppTab = 'overview' | 'resources' | 'sync' | 'history' | 'events';
+  type ArgoAppTab = 'overview' | 'graph' | 'parameters' | 'resources' | 'sync' | 'history' | 'events';
+  type ArgoTreeNode = { id: string; parent: string; kind: string; name: string; namespace: string; health: string; info: string };
   type ArgoDialog = { action: ArgoAction; app: ArgoApp; historyId?: number; revision?: string; resources?: ArgoResource[]; enable?: boolean };
   let argoApps: ArgoApp[] = [];
   let argoSets: ArgoAppSet[] = [];
@@ -712,6 +734,15 @@
   let argoDialog: ArgoDialog | null = null;
   let runningArgoAction = false;
   let argoAppTab: ArgoAppTab = 'overview';
+  // Graph: managed resources from the Application plus their live children (ReplicaSets, Pods…).
+  let argoTreeNodes: ArgoTreeNode[] = [];
+  let argoTreeKey = '';
+  let argoTreeLoading = false;
+  let argoTreeError = '';
+  let argoGraphExpanded = new Set<string>();
+  let argoTreeTimer: ReturnType<typeof window.setInterval> | undefined;
+  $: argoGraph = selectedArgoApp ? layoutGraph(argoGraphInput(selectedArgoApp, argoTreeNodes), argoGraphExpanded) : null;
+  $: syncArgoTree(argoAppTab === 'graph' && selectedArgoApp ? selectedArgoApp : null);
   let argoResourceFilter: 'all' | 'outofsync' | 'unhealthy' | 'prune' = 'all';
   let argoResourceSearch = '';
   let collapsedArgoKinds: Record<string, boolean> = {};
@@ -738,6 +769,7 @@
     .filter((app) => matchesSearch(searchTokens(argoSearch), [app.name, app.project, app.destination, app.health, app.sync, app.operation, app.source]));
   $: selectedArgoApp = argoApps.find((app) => argoKey(app) === selectedArgoKey) || null;
   $: if (activeView === 'Argo CD' && activeClusterId && !loadingCatalog && !argoApplicationResource && catalog.resources.length) void navigateTo('Overview');
+  $: if (activeView === 'OCM' && activeClusterId && !loadingCatalog && !ocmClusterResource && catalog.resources.length) void navigateTo('Overview');
 
   function focusOnMount(node: HTMLElement) {
     node.focus();
@@ -807,6 +839,82 @@
     } finally {
       if (requestGeneration === argoRequestGeneration) loadingArgo = false;
     }
+  }
+
+  function argoNodeId(kind: string, namespace: string, name: string) {
+    return `${kind}/${namespace}/${name}`;
+  }
+
+  function argoGraphInput(app: ArgoApp, tree: ArgoTreeNode[]): GraphInput[] {
+    const managed = app.resources.map((resource) => ({
+      id: argoNodeId(resource.kind, resource.namespace, resource.name),
+      parent: 'app',
+      kind: resource.kind,
+      name: resource.name,
+      namespace: resource.namespace,
+      health: resource.health,
+      sync: resource.sync,
+      info: resource.healthMessage,
+      managed: true,
+    }));
+    return [
+      { id: 'app', parent: null, kind: 'Application', name: app.name, namespace: app.namespace, health: app.health, sync: app.sync, info: app.sources[0]?.targetRevision || '' },
+      ...managed,
+      ...tree.map((node) => ({ ...node, parent: node.parent })),
+    ];
+  }
+
+  function syncArgoTree(app: ArgoApp | null) {
+    const key = app ? `${activeClusterId}|${argoKey(app)}` : '';
+    if (key === argoTreeKey) return;
+    argoTreeKey = key;
+    argoTreeNodes = [];
+    argoTreeError = '';
+    argoGraphExpanded = new Set();
+    if (argoTreeTimer) window.clearInterval(argoTreeTimer);
+    argoTreeTimer = undefined;
+    if (!app || !app.inCluster) return;
+    void loadArgoTree(app, key);
+    // The Application feed is live; its Pods and ReplicaSets refresh every 10 seconds here.
+    argoTreeTimer = window.setInterval(() => {
+      if (!document.hidden && selectedArgoApp) void loadArgoTree(selectedArgoApp, key);
+    }, 10_000);
+  }
+
+  async function loadArgoTree(app: ArgoApp, key: string) {
+    if (argoTreeLoading && argoTreeNodes.length) return;
+    argoTreeLoading = true;
+    try {
+      const nodes = await invokeRead<ArgoTreeNode[]>('argocd_resource_tree', {
+        request: {
+          kubeconfigPath: activeKubeconfigPath || kubeconfigPath || null,
+          context: activeCluster,
+          roots: app.resources.filter((resource) => resource.namespace).map((resource) => ({ kind: resource.kind, name: resource.name, namespace: resource.namespace })),
+        },
+      });
+      if (argoTreeKey === key) {
+        argoTreeNodes = nodes;
+        argoTreeError = '';
+      }
+    } catch (error) {
+      if (argoTreeKey === key) argoTreeError = String(error).replace(/^Error:\s*/, '');
+    } finally {
+      argoTreeLoading = false;
+    }
+  }
+
+  function openArgoGraphNode(node: GraphInput) {
+    if (node.more) {
+      argoGraphExpanded = new Set([...argoGraphExpanded, node.parent || '']);
+      return;
+    }
+    if (!selectedArgoApp || node.id === 'app') return;
+    if (node.kind === 'Pod') {
+      void openPodLogs({ name: node.name, namespace: node.namespace }, [], `Argo CD · ${selectedArgoApp.name}`);
+      return;
+    }
+    const managed = selectedArgoApp.resources.find((resource) => argoNodeId(resource.kind, resource.namespace, resource.name) === node.id);
+    if (managed) void openArgoResource(managed);
   }
 
   function openArgoApp(app: ArgoApp) {
@@ -989,6 +1097,225 @@
       notify(`Could not ${dialog.action.replace(/-/g, ' ')} ${dialog.app.name}: ${String(error).replace(/^Error:\s*/, '')}`);
     } finally {
       runningArgoAction = false;
+    }
+  }
+
+  // Helm: releases read from Helm's own storage (Secrets labelled owner=helm).
+  type HelmRelease = { name: string; namespace: string; revision: number; status: string; chart: string; chartVersion: string; appVersion: string; updated: string; description: string };
+  type HelmReleaseDetail = { release: HelmRelease; notes: string; values: string; manifest: string; chartDescription: string; history: HelmRelease[] };
+  let helmReleases: HelmRelease[] = [];
+  let loadingHelm = false;
+  let helmError = '';
+  let helmClusterKey = '';
+  let helmSearch = '';
+  let selectedHelmKey = '';
+  let helmDetail: HelmReleaseDetail | null = null;
+  let loadingHelmDetail = false;
+  let helmDetailError = '';
+  let helmDetailTab: 'values' | 'notes' | 'manifest' | 'history' = 'values';
+  let helmListPercent = 58;
+  const helmColumns: GridColumn[] = [
+    { key: 'name', label: 'Release', width: 'minmax(150px, 1.2fr)' }, { key: 'namespace', label: 'Namespace', width: 'minmax(100px, .8fr)' },
+    { key: 'chart', label: 'Chart', width: 'minmax(120px, 1fr)' }, { key: 'appVersion', label: 'App version', width: '110px' },
+    { key: 'revision', label: 'Rev', width: '56px' }, { key: 'status', label: 'Status', width: '112px' }, { key: 'updated', label: 'Updated', width: '84px' },
+  ];
+  $: visibleHelmReleases = helmReleases.filter((release) => matchesSearch(searchTokens(helmSearch), [release.name, release.namespace, release.chart, release.chartVersion, release.appVersion, release.status]));
+  $: selectedHelmRelease = helmReleases.find((release) => helmKey(release) === selectedHelmKey) || null;
+  $: if (activeView === 'Helm' && activeClusterId && helmClusterKey && helmClusterKey !== `${activeClusterId}|${namespace}`) void loadHelmReleases(true);
+
+  let topology: Topology | null = null;
+  let topologyKey = '';
+  let loadingTopology = false;
+  let topologyError = '';
+  let topologySearch = '';
+  let topologyProblemsOnly = false;
+  let topologyExpanded = new Set<string>();
+  let topologyUpdatedAt = 0;
+  let topologyTimer: ReturnType<typeof window.setInterval> | undefined;
+  $: topologyLayout = topology ? layoutTopology(topology, { search: topologySearch, problemsOnly: topologyProblemsOnly, expanded: topologyExpanded }) : null;
+  $: topologyProblems = topology ? topology.nodes.filter((node) => PROBLEM_HEALTH.has(node.health)).length : 0;
+  $: if (activeView === 'Topology' && activeClusterId && topologyKey && topologyKey !== `${activeClusterId}|${namespace}`) void loadTopology(true);
+
+  async function loadTopology(force = false) {
+    if (!activeClusterId || (loadingTopology && !force)) return;
+    const key = `${activeClusterId}|${namespace}`;
+    if (topologyKey !== key) {
+      topology = null;
+      topologyExpanded = new Set();
+    }
+    topologyKey = key;
+    loadingTopology = true;
+    try {
+      const next = await invokeRead<Topology>('cluster_topology', { request: { kubeconfigPath: activeKubeconfigPath || kubeconfigPath || null, context: activeCluster, namespace } });
+      if (topologyKey === key) {
+        topology = next;
+        topologyError = '';
+        topologyUpdatedAt = Date.now();
+        lastConnectionVerifiedAt = Date.now();
+      }
+    } catch (error) {
+      if (topologyKey === key) topologyError = String(error).replace(/^Error:\s*/, '');
+    } finally {
+      if (topologyKey === key) loadingTopology = false;
+    }
+  }
+
+  /** The topology is a snapshot of many object types; it refreshes every 15 seconds while open. */
+  function startTopologyRefresh() {
+    if (topologyTimer) window.clearInterval(topologyTimer);
+    topologyTimer = window.setInterval(() => {
+      if (activeView !== 'Topology') {
+        window.clearInterval(topologyTimer);
+        topologyTimer = undefined;
+      } else if (!document.hidden && !loadingTopology) void loadTopology();
+    }, 15_000);
+  }
+
+  function openTopologyNode(node: PlacedNode) {
+    if (node.moreOf) {
+      topologyExpanded = new Set([...topologyExpanded, node.moreOf]);
+      return;
+    }
+    if (node.health === 'Missing') {
+      notify(`${node.kind} ${node.namespace}/${node.name} is referenced but could not be found in the cluster`);
+      return;
+    }
+    void openArgoResource({ group: node.group, version: '', kind: node.kind, name: node.name, namespace: node.namespace, sync: '', health: node.health, healthMessage: '', requiresPruning: false, hook: false });
+  }
+
+  const TOPOLOGY_ICONS: Record<string, typeof Globe> = {
+    Gateway: Globe, Ingress: Globe, HTTPRoute: Globe, GRPCRoute: Globe, Service: Network,
+    Deployment: Workflow, StatefulSet: Database, DaemonSet: Server, ReplicaSet: Blocks, CronJob: Clock, Job: Clock,
+    Pod: Container, ConfigMap: FileText, Secret: KeyRound, PersistentVolumeClaim: HardDrive,
+  };
+
+  function topologyTone(health: string) {
+    return health === 'Missing' ? 'bad' : argoTone(health);
+  }
+
+  function helmKey(release: { namespace: string; name: string }) {
+    return `${release.namespace}/${release.name}`;
+  }
+
+  function helmTone(status: string) {
+    return status === 'deployed' ? 'ok' : status === 'failed' ? 'bad' : status.startsWith('pending') || status === 'uninstalling' ? 'warn' : 'none';
+  }
+
+  async function loadHelmReleases(force = false) {
+    if (!activeClusterId || (loadingHelm && !force)) return;
+    const key = `${activeClusterId}|${namespace}`;
+    if (helmClusterKey !== key) {
+      helmReleases = [];
+      selectedHelmKey = '';
+      helmDetail = null;
+    }
+    helmClusterKey = key;
+    loadingHelm = true;
+    helmError = '';
+    try {
+      const releases = await invokeRead<HelmRelease[]>('list_helm_releases', { request: { kubeconfigPath: activeKubeconfigPath || kubeconfigPath || null, context: activeCluster, namespace } });
+      if (helmClusterKey === key) {
+        helmReleases = releases;
+        lastConnectionVerifiedAt = Date.now();
+        if (selectedHelmRelease) void loadHelmDetail(selectedHelmRelease);
+      }
+    } catch (error) {
+      if (helmClusterKey === key) helmError = String(error).replace(/^Error:\s*/, '');
+    } finally {
+      if (helmClusterKey === key) loadingHelm = false;
+    }
+  }
+
+  async function loadHelmDetail(release: HelmRelease, revision?: number) {
+    const key = helmKey(release);
+    selectedHelmKey = key;
+    loadingHelmDetail = true;
+    helmDetailError = '';
+    try {
+      const detail = await invokeRead<HelmReleaseDetail>('get_helm_release', { request: { kubeconfigPath: activeKubeconfigPath || kubeconfigPath || null, context: activeCluster, namespace: release.namespace, name: release.name, revision: revision ?? null } });
+      if (selectedHelmKey === key) helmDetail = detail;
+    } catch (error) {
+      if (selectedHelmKey === key) helmDetailError = String(error).replace(/^Error:\s*/, '');
+    } finally {
+      if (selectedHelmKey === key) loadingHelmDetail = false;
+    }
+  }
+
+  /** Puts a command in the built-in CLI for review; nothing runs until Enter. */
+  function prefillCli(command: string) {
+    if (!activeClusterId) return;
+    cliCommand = command;
+    cliOpen = true;
+    void tick().then(() => cliInput?.focus());
+  }
+
+  // Open Cluster Management hub: detected from the ManagedCluster API.
+  const ocmGroups = { cluster: 'cluster.open-cluster-management.io', work: 'work.open-cluster-management.io', policy: 'policy.open-cluster-management.io', addon: 'addon.open-cluster-management.io' };
+  $: ocmClusterResource = catalog.resources.find((resource) => resource.group === ocmGroups.cluster && resource.kind === 'ManagedCluster') || null;
+  $: ocmDescriptors = {
+    sets: catalog.resources.find((resource) => resource.group === ocmGroups.cluster && resource.kind === 'ManagedClusterSet') || null,
+    placements: catalog.resources.find((resource) => resource.group === ocmGroups.cluster && resource.kind === 'Placement') || null,
+    decisions: catalog.resources.find((resource) => resource.group === ocmGroups.cluster && resource.kind === 'PlacementDecision') || null,
+    works: catalog.resources.find((resource) => resource.group === ocmGroups.work && resource.kind === 'ManifestWork') || null,
+    policies: catalog.resources.find((resource) => resource.group === ocmGroups.policy && resource.kind === 'Policy') || null,
+    addons: catalog.resources.find((resource) => resource.group === ocmGroups.addon && resource.kind === 'ManagedClusterAddOn') || null,
+  };
+  type OcmTab = 'clusters' | 'sets' | 'placements' | 'works' | 'policies';
+  let ocmTab: OcmTab = 'clusters';
+  let ocmRaw: Record<string, Record<string, unknown>[]> = {};
+  let ocmClusterManifests: Record<string, unknown>[] = [];
+  let loadingOcm = false;
+  let ocmError = '';
+  let ocmClusterId = '';
+  let ocmSearch = '';
+  let selectedOcmCluster = '';
+  $: ocmClusters = ocmClusterManifests.map((manifest) => managedCluster(manifest)).sort((left, right) => left.name.localeCompare(right.name));
+  $: ocmSets = (ocmRaw.sets || []).map((manifest) => ocmClusterSet(manifest, ocmClusters));
+  $: ocmPlacements = (ocmRaw.placements || []).map((manifest) => ocmPlacement(manifest, ocmRaw.decisions || []));
+  $: ocmWorks = (ocmRaw.works || []).map((manifest) => ocmManifestWork(manifest));
+  $: ocmPolicies = (ocmRaw.policies || []).filter((manifest) => !String(((manifest.metadata as Record<string, unknown>)?.labels as Record<string, unknown> | undefined)?.['policy.open-cluster-management.io/root-policy'] || '')).map((manifest) => ocmPolicy(manifest));
+  $: ocmAddons = (ocmRaw.addons || []).map((manifest) => {
+    const metadata = (manifest.metadata || {}) as Record<string, unknown>;
+    const conditions = (((manifest.status || {}) as Record<string, unknown>).conditions || []) as Record<string, unknown>[];
+    return { name: String(metadata.name || ''), cluster: String(metadata.namespace || ''), available: String(conditions.find((condition) => condition.type === 'Available')?.status || 'Unknown') };
+  });
+  $: ocmSearchTokens = searchTokens(ocmSearch);
+  $: visibleOcmClusters = ocmClusters.filter((cluster) => matchesSearch(ocmSearchTokens, [cluster.name, cluster.health, cluster.clusterSet, cluster.kubernetes, ...cluster.claims.map((claim) => claim.value), ...cluster.labels.map(([key, value]) => `${key}=${value}`)]));
+  $: ocmSummary = { total: ocmClusters.length, healthy: ocmClusters.filter((cluster) => cluster.health === 'Healthy').length, degraded: ocmClusters.filter((cluster) => cluster.health === 'Degraded' || cluster.health === 'Unknown').length, pending: ocmClusters.filter((cluster) => cluster.health === 'Pending').length };
+  $: selectedOcm = ocmClusters.find((cluster) => cluster.name === selectedOcmCluster) || null;
+  const ocmClusterColumns: GridColumn[] = [
+    { key: 'name', label: 'Cluster', width: 'minmax(150px, 1.2fr)' }, { key: 'health', label: 'Status', width: '112px' },
+    { key: 'set', label: 'Cluster set', width: 'minmax(100px, .8fr)' }, { key: 'version', label: 'Kubernetes', width: '100px' },
+    { key: 'platform', label: 'Platform', width: 'minmax(90px, .7fr)' }, { key: 'cpu', label: 'CPU', width: '90px' }, { key: 'memory', label: 'Memory', width: '84px' },
+  ];
+
+  function ocmClaim(cluster: OcmCluster, ...names: string[]) {
+    return cluster.claims.find((claim) => names.includes(claim.name))?.value || '';
+  }
+
+  async function loadOcm(force = false) {
+    if (!activeClusterId || !ocmClusterResource || (loadingOcm && !force)) return;
+    const requestClusterId = activeClusterId;
+    if (ocmClusterId !== requestClusterId) { ocmRaw = {}; ocmClusterManifests = []; selectedOcmCluster = ''; }
+    loadingOcm = true;
+    ocmError = '';
+    const read = (resource: ResourceDescriptor | null) => resource
+      ? invokeRead<Record<string, unknown>[]>('list_resource_manifests', manifestListRequest(resource)).catch(() => [] as Record<string, unknown>[])
+      : Promise.resolve([] as Record<string, unknown>[]);
+    try {
+      const [clusters, sets, placements, decisions, works, policies, addons] = await Promise.all([
+        invokeRead<Record<string, unknown>[]>('list_resource_manifests', manifestListRequest(ocmClusterResource)),
+        read(ocmDescriptors.sets), read(ocmDescriptors.placements), read(ocmDescriptors.decisions), read(ocmDescriptors.works), read(ocmDescriptors.policies), read(ocmDescriptors.addons),
+      ]);
+      if (requestClusterId !== activeClusterId) return;
+      ocmClusterManifests = clusters;
+      ocmRaw = { sets, placements, decisions, works, policies, addons };
+      ocmClusterId = requestClusterId;
+      lastConnectionVerifiedAt = Date.now();
+    } catch (error) {
+      if (requestClusterId === activeClusterId) ocmError = String(error).replace(/^Error:\s*/, '');
+    } finally {
+      if (requestClusterId === activeClusterId) loadingOcm = false;
     }
   }
 
@@ -1578,7 +1905,7 @@
   async function restoreVisualQaScenario() {
     if (!import.meta.env.DEV) return false;
     const scenario = new URLSearchParams(window.location.search).get('visual-qa');
-    if (!scenario || (!visualQaRecoveryEnabled && !['overview', 'workloads', 'workloads-first-open', 'workload-details', 'pod-details', 'workload-logs', 'workload-yaml', 'resources', 'custom-apis', 'resources-directory', 'custom-directory', 'overview-large', 'events', 'workloads-large', 'argocd', 'gateway', 'httproute', 'admission-policy', 'workload-terminal', 'update-available', 'services', 'overview-live', 'configuration', 'configuration-many', 'secret', 'permissions-readonly'].includes(scenario))) return false;
+    if (!scenario || (!visualQaRecoveryEnabled && !['overview', 'workloads', 'workloads-first-open', 'workload-details', 'pod-details', 'workload-logs', 'workload-yaml', 'resources', 'custom-apis', 'resources-directory', 'custom-directory', 'overview-large', 'events', 'workloads-large', 'argocd', 'gateway', 'httproute', 'admission-policy', 'workload-terminal', 'update-available', 'services', 'overview-live', 'helm', 'ocm', 'topology', 'configuration', 'configuration-many', 'secret', 'permissions-readonly'].includes(scenario))) return false;
     const fixtures = await import('./dev/visual-qa-fixtures');
     const qaCluster = fixtures.visualQaCluster as Cluster;
     const directoryScenario = scenario === 'resources-directory' || scenario === 'custom-directory';
@@ -1600,10 +1927,30 @@
     seedVisualQaPermissions(scenarioResources, scenario === 'permissions-readonly');
     catalogError = '';
     loadingCatalog = false;
-    if (scenario === 'update-available') {
+    if (scenario === 'topology') {
+      activeView = 'Topology';
+      namespace = 'all namespaces';
+      void loadTopology(true);
+    } else if (scenario === 'ocm') {
+      catalog = { ...catalog, resources: [...catalog.resources, ...fixtures.visualQaOcmResources as ResourceDescriptor[]] };
+      seedVisualQaPermissions(catalog.resources, false);
+      activeView = 'OCM';
+      ocmClusterManifests = fixtures.visualQaOcm.clusters;
+      ocmRaw = { sets: fixtures.visualQaOcm.sets, placements: fixtures.visualQaOcm.placements, decisions: fixtures.visualQaOcm.decisions, works: fixtures.visualQaOcm.works, policies: fixtures.visualQaOcm.policies, addons: fixtures.visualQaOcm.addons };
+      ocmClusterId = qaCluster.id;
+      selectedOcmCluster = 'prod-ap-south';
+    } else if (scenario === 'helm') {
+      activeView = 'Helm';
+      namespace = 'all namespaces';
+      void loadHelmReleases(true).then(() => {
+        const failed = helmReleases.find((release) => release.status === 'failed');
+        if (failed) void loadHelmDetail(failed);
+      });
+    } else if (scenario === 'update-available') {
       activeView = 'Settings';
       updateState = 'available';
       pendingUpdate = { version: '0.5.3', body: fixtures.visualQaReleaseNotes, downloadAndInstall: async () => undefined };
+      if (new URLSearchParams(window.location.search).has('dialog')) updateDialogOpen = true;
     } else if (scenario === 'events') {
       activeView = 'Events';
       namespace = 'all namespaces';
@@ -1844,6 +2191,7 @@
     if (view === 'Overview') return 'overview';
     if (view === 'Events') return 'events';
     if (view === 'Argo CD' && argoApplicationResource) return 'manifests';
+    if (view === 'OCM' && ocmClusterResource) return 'manifests';
     return '';
   }
 
@@ -1871,8 +2219,8 @@
     liveFeedKind = kind;
     liveFeedClusterId = activeClusterId;
     liveFeedStatus = 'connecting';
-    const resource = kind === 'manifests' ? argoApplicationResource : null;
-    const scope = argoScopeNote ? (namespace !== 'all namespaces' ? namespace : 'argocd') : 'all namespaces';
+    const resource = kind === 'manifests' ? (activeView === 'OCM' ? ocmClusterResource : argoApplicationResource) : null;
+    const scope = activeView === 'Argo CD' && argoScopeNote ? (namespace !== 'all namespaces' ? namespace : 'argocd') : 'all namespaces';
     try {
       const { invoke } = await import('@tauri-apps/api/core');
       await invoke('start_live_feed', {
@@ -1909,6 +2257,10 @@
       eventsObservedAt = new Date().toISOString();
       eventsError = '';
       loadingEvents = false;
+    } else if (liveFeedKind === 'manifests' && activeView === 'OCM') {
+      ocmClusterManifests = keyedFeed.values() as Record<string, unknown>[];
+      ocmClusterId = activeClusterId;
+      loadingOcm = false;
     } else if (liveFeedKind === 'manifests') {
       argoApps = (keyedFeed.values() as Record<string, unknown>[]).map(argoApplication)
         .sort((left, right) => left.namespace.localeCompare(right.namespace) || left.name.localeCompare(right.name));
@@ -2722,6 +3074,21 @@
         }
         return;
       }
+      if (requestView === 'Helm') {
+        await loadHelmReleases(true);
+        return;
+      }
+      if (requestView === 'Topology') {
+        await loadTopology(true);
+        startTopologyRefresh();
+        return;
+      }
+      if (requestView === 'OCM') {
+        await loadOcm(true);
+        stopLiveFeed();
+        await syncLiveFeed();
+        return;
+      }
       if (requestView === 'Argo CD') {
         await loadArgoApps(true);
         stopLiveFeed();
@@ -2933,6 +3300,31 @@
     return message.replace(/^Error:\s*/, '');
   }
 
+  let updateDialogOpen = false;
+  let dismissedUpdateVersion = '';
+  let updatePollTimer: ReturnType<typeof window.setInterval> | undefined;
+  let stopUpdateMenuListening: (() => void) | undefined;
+
+  function dismissUpdateDialog() {
+    updateDialogOpen = false;
+    if (updateState === 'available' && pendingUpdate) dismissedUpdateVersion = pendingUpdate.version;
+  }
+
+  /** The Kuberniva menu's "Check for Updates…" and a quiet check every 6 hours. */
+  async function setupUpdateChecks() {
+    updatePollTimer = window.setInterval(() => void checkForUpdates(true), 6 * 60 * 60 * 1000);
+    if (!('__TAURI_INTERNALS__' in window)) return;
+    try {
+      const { listen } = await import('@tauri-apps/api/event');
+      stopUpdateMenuListening = await listen('kuberniva://check-for-updates', () => {
+        if (updateState === 'available' || updateState === 'downloading' || updateState === 'ready') updateDialogOpen = true;
+        else void checkForUpdates(false);
+      });
+    } catch {
+      stopUpdateMenuListening = undefined;
+    }
+  }
+
   async function checkForUpdates(silent = false) {
     if (!('__TAURI_INTERNALS__' in window) || updateState === 'checking' || updateState === 'downloading' || updateState === 'ready') return;
     updateState = 'checking';
@@ -2942,13 +3334,17 @@
       const update = await check();
       updateCheckedAt = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
       if (update) {
+        const isNew = pendingUpdate?.version !== update.version;
         pendingUpdate = update as unknown as PendingUpdate;
         updateState = 'available';
-        notify(`Kuberniva ${update.version} is available. Open Settings to update.`);
+        // A new version opens the update window once on its own; a manual check always does.
+        if (!silent || (isNew && dismissedUpdateVersion !== update.version)) updateDialogOpen = true;
       } else {
         pendingUpdate = null;
         updateState = 'current';
-        if (!silent) notify('Kuberniva is up to date.');
+        if (!silent) {
+          updateDialogOpen = true;
+        }
       }
     } catch (error) {
       // A quiet launch check never interrupts; a manual check explains what happened.
@@ -3325,6 +3721,22 @@
     if (view === 'Argo CD') {
       stopLiveObjectRefresh();
       void loadArgoApps(true).then(() => syncLiveFeed());
+      return;
+    }
+    if (view === 'Helm') {
+      stopLiveObjectRefresh();
+      void loadHelmReleases(true);
+      return;
+    }
+    if (view === 'Topology') {
+      stopLiveObjectRefresh();
+      void loadTopology(true);
+      startTopologyRefresh();
+      return;
+    }
+    if (view === 'OCM') {
+      stopLiveObjectRefresh();
+      void loadOcm(true).then(() => syncLiveFeed());
       return;
     }
     if (view === 'Resources') {
@@ -3775,7 +4187,7 @@
       : resources;
     const sections = new Map<string, ResourceDescriptor[]>();
     for (const resource of matches) {
-      // Custom APIs read best by owning API group; built-ins by operational area.
+      // Custom resources read best by owning API group; built-ins by operational area.
       const section = custom ? resource.group || 'core' : resource.category;
       sections.set(section, [...(sections.get(section) || []), resource]);
     }
@@ -3805,11 +4217,11 @@
   type TreeSection = { title: string; resources: ResourceDescriptor[] };
 
   function treeKeyFor(view: string) {
-    return view === 'Custom APIs' ? 'custom' : 'resources';
+    return view === 'Custom Resources' ? 'custom' : 'resources';
   }
 
   function treeSectionsFor(view: string) {
-    return view === 'Custom APIs' ? customTreeSections : resourceTreeSections;
+    return view === 'Custom Resources' ? customTreeSections : resourceTreeSections;
   }
 
   // Sections open on demand, and the one holding the selected kind opens by default.
@@ -5562,6 +5974,10 @@
     stopLiveObjectRefresh();
     resourceWatchUnlisten?.();
     liveFeedUnlisten?.();
+    stopUpdateMenuListening?.();
+    if (argoTreeTimer) window.clearInterval(argoTreeTimer);
+    if (topologyTimer) window.clearInterval(topologyTimer);
+    if (updatePollTimer) window.clearInterval(updatePollTimer);
     if (overviewClockTimer) window.clearInterval(overviewClockTimer);
     stopLiveFeed();
     resourceWatchUnlisten = undefined;
@@ -5583,6 +5999,7 @@
     cliHistory = loadCliHistory();
     void loadAppVersion();
     updateCheckTimer = window.setTimeout(() => void checkForUpdates(true), 8_000);
+    void setupUpdateChecks();
     resourceNavigatorWidth = loadPaneSize(resourceNavigatorWidthStorageKey, 272, 220, 440);
     resourceObjectPaneWidth = loadPaneSize(resourceObjectPaneWidthStorageKey, 300, 180, 520);
     workloadListPercent = loadPaneSize(workloadPaneStorageKey, 38, 25, 70);
@@ -5739,6 +6156,12 @@
       else void loadClusterEvents(true);
     } else if (activeView === 'Argo CD') {
       void loadArgoApps(true).then(() => syncLiveFeed());
+    } else if (activeView === 'Helm') {
+      void loadHelmReleases(true);
+    } else if (activeView === 'Topology') {
+      void loadTopology(true);
+    } else if (activeView === 'OCM') {
+      void loadOcm(true).then(() => syncLiveFeed());
     }
   }
 
@@ -6278,15 +6701,21 @@
 
     <nav aria-label="Cluster navigation">
       <p class="eyebrow">Cluster workspace</p>
-      {#each ['Overview', 'Events', 'Argo CD', 'Workloads', 'Resources', 'Custom APIs'] as view}
-        {#if view === 'Argo CD'}
+      {#each ['Overview', 'Topology', 'Events', 'Argo CD', 'Helm', 'OCM', 'Workloads', 'Resources', 'Custom Resources'] as view}
+        {#if view === 'Topology'}
+          {#if activeClusterId}<button class:active={activeView === 'Topology'} class="nav-item" type="button" on:click={() => navigateTo('Topology')}><span class="nav-icon"><Waypoints size={17} strokeWidth={1.8} /></span>Topology{#if topologyProblems && topologyKey.startsWith(activeClusterId)}<span class="count count-attention" title="Objects that are failing or missing">{topologyProblems}</span>{/if}</button>{/if}
+        {:else if view === 'Argo CD'}
           {#if activeClusterId && argoApplicationResource}<button class:active={activeView === 'Argo CD'} class="nav-item" type="button" on:click={() => navigateTo('Argo CD')}><span class="nav-icon"><GitBranch size={17} strokeWidth={1.8} /></span>Argo CD{#if argoClusterId === activeClusterId && argoSummary.attention.length}<span class="count count-attention" title="Applications that need attention">{argoSummary.attention.length}</span>{/if}</button>{/if}
+        {:else if view === 'OCM'}
+          {#if activeClusterId && ocmClusterResource}<button class:active={activeView === 'OCM'} class="nav-item" type="button" on:click={() => navigateTo('OCM')}><span class="nav-icon"><Globe size={17} strokeWidth={1.8} /></span>OCM Hub{#if ocmClusterId === activeClusterId && ocmSummary.degraded}<span class="count count-attention" title="Managed clusters that are unavailable">{ocmSummary.degraded}</span>{:else if ocmClusterId === activeClusterId && ocmSummary.total}<span class="count">{ocmSummary.total}</span>{/if}</button>{/if}
+        {:else if view === 'Helm'}
+          {#if activeClusterId}<button class:active={activeView === 'Helm'} class="nav-item" type="button" on:click={() => navigateTo('Helm')}><span class="nav-icon"><Package size={17} strokeWidth={1.8} /></span>Helm{#if helmReleases.length && helmClusterKey.startsWith(activeClusterId)}<span class="count">{helmReleases.length}</span>{/if}</button>{/if}
         {:else if view === 'Workloads'}
           <button class:active={activeView === 'Workloads'} class="nav-item" type="button" on:click={() => navigateTo('Workloads')}><span class="nav-icon"><Workflow size={17} strokeWidth={1.8} /></span>Workloads{#if workloadObjects.length}<span class="count">{workloadObjects.length}</span>{/if}</button>
-        {:else if view === 'Resources' || view === 'Custom APIs'}
+        {:else if view === 'Resources' || view === 'Custom Resources'}
           <div class="sidebar-tree-group">
             <div class="sidebar-tree-trigger">
-              <button class:active={activeView === 'Resources' && customApiWorkspace === (view === 'Custom APIs')} class="nav-item" type="button" on:click={() => openResourcesHome(view === 'Custom APIs')}><span class="nav-icon">{#if view === 'Custom APIs'}<Boxes size={17} strokeWidth={1.8} />{:else}<Database size={17} strokeWidth={1.8} />{/if}</span>{view}<span class="count">{activeClusterId ? (view === 'Custom APIs' ? customApiResources.length : resourceWorkspaceResources.length) : 0}</span></button>
+              <button class:active={activeView === 'Resources' && customApiWorkspace === (view === 'Custom Resources')} class="nav-item" type="button" on:click={() => openResourcesHome(view === 'Custom Resources')}><span class="nav-icon">{#if view === 'Custom Resources'}<Boxes size={17} strokeWidth={1.8} />{:else}<Database size={17} strokeWidth={1.8} />{/if}</span>{view}<span class="count">{activeClusterId ? (view === 'Custom Resources' ? customApiResources.length : resourceWorkspaceResources.length) : 0}</span></button>
               {#if activeClusterId && treeSectionsFor(view).length}<button class:sidebar-tree-toggle-open={sidebarTreeOpen[treeKeyFor(view)]} class="sidebar-tree-toggle" type="button" aria-label={`${sidebarTreeOpen[treeKeyFor(view)] ? 'Collapse' : 'Expand'} ${view}`} aria-expanded={sidebarTreeOpen[treeKeyFor(view)]} on:click={() => (sidebarTreeOpen = { ...sidebarTreeOpen, [treeKeyFor(view)]: !sidebarTreeOpen[treeKeyFor(view)] })}><ChevronDown size={14} /></button>{/if}
             </div>
             {#if activeClusterId && sidebarTreeOpen[treeKeyFor(view)]}
@@ -6492,7 +6921,7 @@
                 <div class="argo-status-card argo-tone-{argoTone(app.operation)}"><span class="argo-status-icon">{#if app.operation === 'Running'}<LoaderCircle size={20} class="animate-spin" />{:else}<Clock size={20} />{/if}</span><div><small>Last sync</small><strong>{app.operation || 'Never synced'}</strong><em>{app.lastOperation ? `${app.lastOperation.finishedAt ? `${resourceAge(app.lastOperation.finishedAt)} ago` : 'in progress'} · by ${app.lastOperation.initiatedBy}${app.lastOperation.dryRun ? ' · dry run' : ''}` : 'No operation recorded'}</em></div></div>
               </div>
               <div class="argo-app-tabs" role="tablist" aria-label="Application sections">
-                {#each [['overview', 'Overview'], ['resources', `Resources ${app.resources.length}`], ['sync', 'Last sync'], ['history', `History ${app.history.length}`], ['events', 'Events']] as [tab, label]}<button type="button" role="tab" aria-selected={argoAppTab === tab} on:click={() => (argoAppTab = tab as ArgoAppTab)}>{label}</button>{/each}
+                {#each [['overview', 'Overview'], ['graph', 'Graph'], ['parameters', 'Parameters'], ['resources', `Resources ${app.resources.length}`], ['sync', 'Last sync'], ['history', `History ${app.history.length}`], ['events', 'Events']] as [tab, label]}<button type="button" role="tab" aria-selected={argoAppTab === tab} on:click={() => (argoAppTab = tab as ArgoAppTab)}>{label}</button>{/each}
               </div>
               <div class="argo-app-body">
                 {#if argoAppTab === 'overview'}
@@ -6530,6 +6959,41 @@
                       </div>
                       <button type="button" class="argo-link-button" on:click={() => (argoAppTab = 'resources')}>View resource tree →</button>
                     </section>
+                  </div>
+                {:else if argoAppTab === 'graph'}
+                  <div class="argo-graph-toolbar">
+                    <div class="argo-graph-legend"><span class="argo-badge argo-tone-ok"><Heart size={11} />Healthy</span><span class="argo-badge argo-tone-warn"><LoaderCircle size={11} />Progressing</span><span class="argo-badge argo-tone-bad"><HeartCrack size={11} />Degraded</span><span class="argo-badge argo-tone-warn"><CircleArrowUp size={11} />Out of sync</span></div>
+                    <small>{app.inCluster ? (argoTreeLoading && !argoTreeNodes.length ? 'Finding ReplicaSets and Pods…' : argoTreeError ? `Live objects unavailable: ${argoTreeError}` : 'Live objects refresh every 10 seconds · click a node to open it') : 'Managed resources only · live objects are shown for apps deployed to this cluster'}</small>
+                  </div>
+                  {#if argoGraph}
+                    <div class="argo-graph-scroll">
+                      <div class="argo-graph" style:width={`${argoGraph.width}px`} style:height={`${argoGraph.height}px`}>
+                        <svg class="argo-graph-edges" width={argoGraph.width} height={argoGraph.height} aria-hidden="true">{#each argoGraph.edges as edge (edge.to)}<path d={edge.path} class="argo-edge argo-tone-{argoTone(edge.tone || 'Unknown')}" />{/each}</svg>
+                        {#each argoGraph.nodes as node (node.id)}
+                          <button type="button" class:argo-graph-root={node.id === 'app'} class:argo-graph-more={Boolean(node.more)} class="argo-graph-node argo-tone-{argoTone(node.health || (node.sync === 'OutOfSync' ? 'OutOfSync' : 'Unknown'))}" style:left={`${node.x}px`} style:top={`${node.y}px`} title={`${node.kind} ${node.namespace ? `${node.namespace}/` : ''}${node.name}${node.info ? ` · ${node.info}` : ''}`} on:click={() => openArgoGraphNode(node)}>
+                            {#if node.more}<strong>{node.name}</strong><small>Show all {node.kind}s</small>
+                            {:else}
+                              <span class="argo-graph-icon">{#if node.id === 'app'}<GitBranch size={15} />{:else}<svelte:component this={node.health ? argoHealthIcon(node.health) : CircleCheck} size={14} />{/if}</span>
+                              <span class="argo-graph-text"><small>{node.kind}</small><strong>{node.name}</strong>{#if node.info}<em>{node.info}</em>{/if}</span>
+                              {#if node.sync === 'OutOfSync'}<CircleArrowUp size={14} class="argo-graph-sync" />{/if}
+                            {/if}
+                          </button>
+                        {/each}
+                      </div>
+                    </div>
+                  {/if}
+                {:else if argoAppTab === 'parameters'}
+                  <div class="argo-parameters-page">
+                    {#each app.sources as source, index}
+                      <section class="argo-card">
+                        <header><strong>{source.type}{app.sources.length > 1 ? ` · source ${index + 1}` : ''}</strong><small title={source.repoURL}>{source.repo}{source.chart ? ` · ${source.chart}` : source.path ? ` · ${source.path}` : ''} @ {source.targetRevision}</small></header>
+                        {#if source.options.length}<dl class="argo-facts">{#each source.options as item}<div><dt>{item.label}</dt><dd>{item.value}</dd></div>{/each}</dl>{/if}
+                        {#if source.valueFiles.length}<div class="argo-parameters"><span>Value files</span>{#each source.valueFiles as file}<div><code>{file}</code><b></b></div>{/each}</div>{/if}
+                        {#if source.parameters.length}<div class="argo-parameters"><span>{source.type === 'Kustomize' ? 'Images and settings' : 'Parameters'}</span>{#each source.parameters as parameter}<div><code>{parameter.name}</code><b title={parameter.value}>{parameter.value}</b></div>{/each}</div>{/if}
+                        {#if source.values}<div class="argo-values"><div><span>Values</span><button type="button" class="argo-node-actions-copy" on:click={() => copyText(source.values, 'values')}><Copy size={12} />Copy</button></div><pre>{source.values}</pre></div>{/if}
+                        {#if !source.options.length && !source.valueFiles.length && !source.parameters.length && !source.values}<p class="gw-empty">This source uses its defaults; no {source.type} parameters are overridden.</p>{/if}
+                      </section>
+                    {/each}
                   </div>
                 {:else if argoAppTab === 'resources'}
                   <div class="argo-resource-toolbar">
@@ -6688,6 +7152,191 @@
             </div>
           {/if}
         </section>
+      {:else if activeView === 'OCM'}
+        <section class="argo-page panel ocm-page">
+          <header class="argo-heading">
+            <div class="argo-tabs" role="tablist" aria-label="Open Cluster Management">
+              <button type="button" role="tab" aria-selected={ocmTab === 'clusters'} on:click={() => (ocmTab = 'clusters')}>Clusters<b>{ocmClusters.length}</b></button>
+              {#if ocmDescriptors.sets}<button type="button" role="tab" aria-selected={ocmTab === 'sets'} on:click={() => (ocmTab = 'sets')}>Cluster sets<b>{ocmSets.length}</b></button>{/if}
+              {#if ocmDescriptors.placements}<button type="button" role="tab" aria-selected={ocmTab === 'placements'} on:click={() => (ocmTab = 'placements')}>Placements<b>{ocmPlacements.length}</b></button>{/if}
+              {#if ocmDescriptors.works}<button type="button" role="tab" aria-selected={ocmTab === 'works'} on:click={() => (ocmTab = 'works')}>ManifestWorks<b>{ocmWorks.length}</b></button>{/if}
+              {#if ocmDescriptors.policies}<button type="button" role="tab" aria-selected={ocmTab === 'policies'} on:click={() => (ocmTab = 'policies')}>Policies<b>{ocmPolicies.length}</b></button>{/if}
+            </div>
+            {#if ocmTab === 'clusters'}<div class="argo-heading-controls"><label class="argo-search"><Search size={13} /><input bind:value={ocmSearch} placeholder="Filter clusters, labels, or claims" aria-label="Filter managed clusters" spellcheck="false" /></label></div>{/if}
+          </header>
+          {#if ocmError}
+            <div class="events-error"><Globe size={24} /><div><h3>The hub could not be read</h3><p>{ocmError}</p></div><button class="secondary" on:click={() => loadOcm(true)}>Try again</button></div>
+          {:else if loadingOcm && !ocmClusters.length}
+            <div class="drawer-state"><i></i>Reading managed clusters…</div>
+          {:else if ocmTab === 'clusters'}
+            <div class="ov-kpis argo-kpis">
+              <div class="ov-kpi"><span>Managed clusters</span><strong>{ocmSummary.total}</strong><em>{ocmSets.length} cluster set{ocmSets.length === 1 ? '' : 's'}</em></div>
+              <div class="ov-kpi"><span>Available</span><strong>{ocmSummary.healthy}<small>/{ocmSummary.total}</small></strong><em>Reporting to the hub</em></div>
+              <div class:ov-kpi-warn={ocmSummary.degraded > 0} class="ov-kpi"><span>Unavailable</span><strong>{ocmSummary.degraded}</strong><em>{ocmSummary.degraded ? 'Not reporting or unhealthy' : 'All clusters reporting'}</em></div>
+              <div class:ov-kpi-warn={ocmSummary.pending > 0} class="ov-kpi"><span>Pending</span><strong>{ocmSummary.pending}</strong><em>{ocmSummary.pending ? 'Not yet accepted or joined' : 'None waiting'}</em></div>
+            </div>
+            {#if !visibleOcmClusters.length}<div class="argo-empty"><Globe size={22} /><strong>{ocmClusters.length ? 'No clusters match' : 'No managed clusters registered'}</strong><small>{ocmClusters.length ? 'Try another filter.' : 'Clusters appear here once they register with this hub.'}</small></div>
+            {:else}
+              <div class:argo-body-detail={selectedOcm} class="argo-body" style:--argo-list-percent={`${Math.round(argoListPercent)}%`}>
+                <div class="argo-table" role="table" aria-label="Managed clusters" style:--ocm-grid={gridTemplate(ocmClusterColumns, columnWidths['ocm:clusters'])} style:--ocm-table-min={`${tableMinWidth(ocmClusterColumns, columnWidths['ocm:clusters'], 32, 12)}px`}>
+                  <div class="argo-row ocm-row argo-row-head" role="row">{@render resizableHeaderCells(ocmClusterColumns, 'ocm:clusters')}</div>
+                  {#each visibleOcmClusters as cluster (cluster.name)}
+                    <button type="button" role="row" class:argo-row-selected={selectedOcmCluster === cluster.name} class="argo-row ocm-row" on:click={() => (selectedOcmCluster = selectedOcmCluster === cluster.name ? '' : cluster.name)}>
+                      <span class="argo-app-name"><strong>{cluster.name}</strong><small title={cluster.url}>{cluster.url.replace(/^https?:\/\//, '') || '—'}</small></span>
+                      <span><span class="argo-badge argo-tone-{ocmTone(cluster.health)}">{cluster.health === 'Healthy' ? 'Available' : cluster.health === 'Degraded' ? 'Unavailable' : cluster.health}</span></span>
+                      <span class="argo-muted">{cluster.clusterSet || '—'}</span>
+                      <span class="argo-muted">{cluster.kubernetes || '—'}</span>
+                      <span class="argo-muted">{ocmClaim(cluster, 'platform.open-cluster-management.io', 'product.open-cluster-management.io') || '—'}</span>
+                      <span class="argo-muted">{cluster.cpu || '—'}</span>
+                      <span class="argo-muted">{cluster.memory || '—'}</span>
+                    </button>
+                  {/each}
+                </div>
+                {#if selectedOcm}
+                  {@const cluster = selectedOcm}
+                  <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+                  <div class="pane-splitter" role="separator" tabindex="0" aria-orientation="vertical" aria-label="Resize the list and details" use:dragResize={{ value: argoListPercent, min: 30, max: 75, reset: 60, step: 2, fromPointer: percentOfContainer, onChange: (value) => (argoListPercent = value), onCommit: (value) => savePaneSize(layoutStorageKeys.argoList, value) }}></div>
+                  <aside class="argo-details" aria-label={`${cluster.name} details`}>
+                    <header><div><strong>{cluster.name}</strong><small>{cluster.clusterSet ? `Cluster set ${cluster.clusterSet}` : 'No cluster set'}</small></div><button type="button" class="argo-close" aria-label="Close cluster details" on:click={() => (selectedOcmCluster = '')}>×</button></header>
+                    <dl class="argo-properties">
+                      <div><dt>Accepted</dt><dd><span class="argo-badge argo-tone-{cluster.accepted ? 'ok' : 'warn'}">{cluster.accepted ? 'Yes' : 'Waiting for the hub'}</span></dd></div>
+                      <div><dt>Joined</dt><dd><span class="argo-badge argo-tone-{cluster.joined ? 'ok' : 'warn'}">{cluster.joined ? 'Yes' : 'Not yet'}</span></dd></div>
+                      <div><dt>API server</dt><dd>{cluster.url || '—'}</dd></div>
+                      <div><dt>Kubernetes</dt><dd>{cluster.kubernetes || '—'}</dd></div>
+                      <div><dt>Allocatable</dt><dd>{cluster.cpu || '—'} · {cluster.memory || '—'}</dd></div>
+                    </dl>
+                    <section class="argo-section"><strong>Conditions</strong><div class="argo-resources ocm-mini-list">{#each cluster.conditions as condition}<div><span title={condition.message}>{condition.type.replace('ManagedClusterCondition', '').replace('ManagedCluster', '')}{#if condition.message}<small> · {condition.message}</small>{/if}</span><b class="ov-status ov-status-{ocmTone(condition.status)}">{condition.status}</b></div>{:else}<div><span>No conditions reported</span></div>{/each}</div></section>
+                    {#if ocmAddons.some((addon) => addon.cluster === cluster.name)}<section class="argo-section"><strong>Add-ons</strong><div class="argo-resources ocm-mini-list">{#each ocmAddons.filter((addon) => addon.cluster === cluster.name) as addon}<div><span>{addon.name}</span><b class="ov-status ov-status-{ocmTone(addon.available)}">{addon.available === 'True' ? 'Available' : addon.available === 'False' ? 'Unavailable' : 'Unknown'}</b></div>{/each}</div></section>{/if}
+                    {#if ocmWorks.some((work) => work.cluster === cluster.name)}<section class="argo-section"><strong>ManifestWorks</strong><div class="argo-resources ocm-mini-list">{#each ocmWorks.filter((work) => work.cluster === cluster.name) as work}<div><span>{work.name}<small> · {work.resources} resources</small></span><b class="ov-status ov-status-{ocmTone(work.health)}">{work.health}</b></div>{/each}</div></section>{/if}
+                    {#if cluster.claims.length}<section class="argo-section"><strong>Cluster claims</strong><div class="argo-parameters">{#each cluster.claims as claim}<div><code>{claim.name}</code><b title={claim.value}>{claim.value}</b></div>{/each}</div></section>{/if}
+                    {#if cluster.taints.length}<section class="argo-section"><strong>Taints</strong><div class="policy-rules">{#each cluster.taints as taint}<code>{taint}</code>{/each}</div></section>{/if}
+                    {#if cluster.labels.length}<section class="argo-section"><strong>Labels</strong><div class="inspector-chip-list">{#each cluster.labels as [key, value]}<span><b>{key}</b>{value}</span>{/each}</div></section>{/if}
+                  </aside>
+                {/if}
+              </div>
+            {/if}
+          {:else if ocmTab === 'sets'}
+            <div class="ocm-card-grid">{#each ocmSets as set}<section class="argo-card"><header><strong>{set.name}</strong><b class="argo-type-badge">{set.members} cluster{set.members === 1 ? '' : 's'}</b></header><small class="argo-muted">Membership by {set.selector.toLowerCase()}</small><div class="policy-rules">{#each ocmClusters.filter((cluster) => cluster.clusterSet === set.name || set.name === 'global') as cluster}<code class="ocm-chip ocm-chip-{ocmTone(cluster.health)}">{cluster.name}</code>{/each}</div></section>{:else}<div class="argo-empty"><strong>No cluster sets</strong></div>{/each}</div>
+          {:else if ocmTab === 'placements'}
+            <div class="ocm-card-grid">{#each ocmPlacements as item}<section class="argo-card"><header><strong>{item.name}</strong><span class="argo-badge argo-tone-{ocmTone(item.satisfied)}">{item.satisfied === 'True' ? 'Satisfied' : item.satisfied === 'False' ? 'Not satisfied' : 'Pending'}</span></header><dl class="argo-facts"><div><dt>Namespace</dt><dd>{item.namespace}</dd></div><div><dt>Cluster sets</dt><dd>{item.clusterSets.join(', ') || 'All bound sets'}</dd></div><div><dt>Clusters</dt><dd>{item.selected} selected · {item.requested} requested</dd></div></dl><div class="policy-rules">{#each item.decisions as decision}<code>{decision}</code>{:else}<span class="argo-muted">No clusters chosen yet</span>{/each}</div></section>{:else}<div class="argo-empty"><strong>No placements</strong></div>{/each}</div>
+          {:else if ocmTab === 'works'}
+            <div class="argo-table ocm-works" role="table" aria-label="ManifestWorks">
+              <div class="argo-row argo-row-head ocm-work-row" role="row"><span>ManifestWork</span><span>Cluster</span><span>Resources</span><span>Applied</span><span>Available</span><span>Status</span></div>
+              {#each ocmWorks as work (`${work.cluster}/${work.name}`)}<div class="argo-row ocm-work-row" role="row"><span class="argo-app-name"><strong>{work.name}</strong>{#if work.failing.length}<small title={work.failing.join(', ')}>Failing: {work.failing.join(', ')}</small>{/if}</span><span class="argo-muted">{work.cluster}</span><span>{work.resources}</span><span><b class="ov-status ov-status-{ocmTone(work.applied)}">{work.applied}</b></span><span><b class="ov-status ov-status-{ocmTone(work.available)}">{work.available}</b></span><span><span class="argo-badge argo-tone-{ocmTone(work.health)}">{work.health}</span></span></div>{:else}<div class="argo-empty"><strong>No ManifestWorks</strong></div>{/each}
+            </div>
+          {:else}
+            <div class="ocm-card-grid">{#each ocmPolicies as item}<section class="argo-card"><header><strong>{item.name}</strong><span class="argo-badge argo-tone-{ocmTone(item.compliant)}">{item.disabled ? 'Disabled' : item.compliant}</span></header><dl class="argo-facts"><div><dt>Namespace</dt><dd>{item.namespace}</dd></div><div><dt>Remediation</dt><dd>{item.remediation}</dd></div></dl><div class="policy-rules">{#each item.clusters as entry}<code class="ocm-chip ocm-chip-{ocmTone(entry.compliant)}" title={entry.compliant}>{entry.cluster}</code>{:else}<span class="argo-muted">Not placed on any cluster yet</span>{/each}</div></section>{:else}<div class="argo-empty"><strong>No policies</strong></div>{/each}</div>
+          {/if}
+        </section>
+      {:else if activeView === 'Topology'}
+        <section class="argo-page panel topology-page">
+          <header class="argo-heading">
+            <div><p class="events-scope">How objects in {namespace === 'all namespaces' ? 'all namespaces' : namespace} connect: traffic routes, Service selectors, ownership, and the ConfigMaps, Secrets, and volumes each workload uses.</p></div>
+            <div class="argo-heading-controls">
+              <label class="topology-toggle"><input type="checkbox" bind:checked={topologyProblemsOnly} />Problems only{#if topologyProblems}<b>{topologyProblems}</b>{/if}</label>
+              <label class="argo-search"><Search size={13} /><input bind:value={topologySearch} placeholder="Filter by name, kind, or status" aria-label="Filter topology" spellcheck="false" /></label>
+            </div>
+          </header>
+          {#if topologyError && !topology}
+            <div class="events-error"><Waypoints size={24} /><div><h3>The topology could not be loaded</h3><p>{topologyError}</p></div><button class="secondary" on:click={() => loadTopology(true)}>Try again</button></div>
+          {:else if !topology || !topologyLayout}
+            <div class="argo-empty"><LoaderCircle size={20} class="workspace-loading-spinner" /><strong>Mapping {namespace === 'all namespaces' ? 'the cluster' : namespace}…</strong><small>Reading routes, Services, workloads, Pods, and their references.</small></div>
+          {:else}
+            <div class="argo-graph-toolbar">
+              <div class="argo-graph-legend">
+                <span class="argo-badge argo-tone-ok"><Heart size={11} />Healthy</span><span class="argo-badge argo-tone-warn"><LoaderCircle size={11} />Progressing</span><span class="argo-badge argo-tone-bad"><HeartCrack size={11} />Failing or missing</span>
+                <span class="topology-relation"><i class="topology-line"></i>routes · selects · owns</span><span class="topology-relation"><i class="topology-line topology-line-uses"></i>uses</span>
+              </div>
+              <small>{topologyLayout.groups} {topologyLayout.groups === 1 ? 'group' : 'groups'} · {topologyLayout.nodes.length} objects{topologyError ? ` · last refresh failed: ${topologyError}` : ' · refreshes every 15 seconds · click an object to open it'}</small>
+            </div>
+            {#if topology.warnings.length}<p class="topology-note">Not included: {topology.warnings.join('; ')}.</p>{/if}
+            {#if topologyLayout.nodes.length}
+              <div class="argo-graph-scroll topology-scroll">
+                <div class="argo-graph" style:width={`${topologyLayout.width}px`} style:height={`${topologyLayout.height}px`}>
+                  <svg class="argo-graph-edges" width={topologyLayout.width} height={topologyLayout.height} aria-hidden="true">{#each topologyLayout.edges as edge (`${edge.from}>${edge.to}`)}<path d={edge.path} class="argo-edge topology-edge-{edge.relation} argo-tone-{topologyTone(edge.tone)}" />{/each}</svg>
+                  {#each topologyLayout.bands as band (band.namespace)}<div class="topology-band" style:top={`${band.y}px`}><Boxes size={13} /><strong>{band.namespace || 'cluster'}</strong><small>{band.groups} {band.groups === 1 ? 'group' : 'groups'}</small></div>{/each}
+                  {#each topologyLayout.nodes as node (node.id)}
+                    <button type="button" class:argo-graph-more={Boolean(node.moreOf)} class:topology-missing={node.health === 'Missing'} class="argo-graph-node topology-node argo-tone-{topologyTone(node.health)}" style:left={`${node.x}px`} style:top={`${node.y}px`} title={`${node.kind} ${node.namespace ? `${node.namespace}/` : ''}${node.name}${node.info ? ` · ${node.info}` : ''}`} on:click={() => openTopologyNode(node)}>
+                      {#if node.moreOf}<strong>{node.name}</strong><small>{node.info} · show all</small>
+                      {:else}
+                        <span class="argo-graph-icon"><svelte:component this={TOPOLOGY_ICONS[node.kind] || Boxes} size={14} /></span>
+                        <span class="argo-graph-text"><small>{node.kind === 'PersistentVolumeClaim' ? 'PVC' : node.kind}</small><strong>{node.name}</strong>{#if node.info || node.sharedBy}<em>{[node.info, node.sharedBy ? `shared by ${node.sharedBy} apps` : ''].filter(Boolean).join(' · ')}</em>{/if}</span>
+                      {/if}
+                    </button>
+                  {/each}
+                </div>
+              </div>
+              {#if topologyLayout.hidden}<p class="topology-note">{topologyLayout.hidden} more objects are not drawn. Pick a namespace or filter to see them.</p>{/if}
+            {:else}
+              <div class="argo-empty"><strong>{topologySearch || topologyProblemsOnly ? 'Nothing matches' : 'No objects here'}</strong><small>{topologyProblemsOnly ? 'No failing or missing objects in this scope.' : topologySearch ? 'Try a different filter.' : 'This namespace has no workloads, Services, or routes.'}</small></div>
+            {/if}
+          {/if}
+        </section>
+      {:else if activeView === 'Helm'}
+        <section class="argo-page panel helm-page">
+          <header class="argo-heading">
+            <div><p class="events-scope">Releases in {namespace === 'all namespaces' ? 'all namespaces' : namespace}, read from Helm's own records{helmReleases.length ? ` · ${helmReleases.length} total` : ''}.</p></div>
+            <div class="argo-heading-controls"><label class="argo-search"><Search size={13} /><input bind:value={helmSearch} placeholder="Filter by name, chart, or status" aria-label="Filter Helm releases" spellcheck="false" /></label></div>
+          </header>
+          {#if helmError}
+            <div class="events-error"><Package size={24} /><div><h3>Helm releases could not be loaded</h3><p>{helmError}</p></div><button class="secondary" on:click={() => loadHelmReleases(true)}>Try again</button></div>
+          {:else if loadingHelm && !helmReleases.length}
+            <div class="drawer-state"><i></i>Reading Helm releases…</div>
+          {:else if !visibleHelmReleases.length}
+            <div class="argo-empty"><Package size={22} /><strong>{helmReleases.length ? 'No releases match' : 'No Helm releases found'}</strong><small>{helmReleases.length ? 'Try another filter.' : 'Releases installed with Helm 3 appear here.'}</small></div>
+          {:else}
+            <div class:argo-body-detail={selectedHelmRelease} class="argo-body" style:--argo-list-percent={`${Math.round(helmListPercent)}%`}>
+              <div class="argo-table" role="table" aria-label="Helm releases" style:--helm-grid={gridTemplate(helmColumns, columnWidths['helm:releases'])} style:--helm-table-min={`${tableMinWidth(helmColumns, columnWidths['helm:releases'], 32, 12)}px`}>
+                <div class="argo-row helm-row argo-row-head" role="row">{@render resizableHeaderCells(helmColumns, 'helm:releases')}</div>
+                {#each visibleHelmReleases as release (helmKey(release))}
+                  <button type="button" role="row" class:argo-row-selected={selectedHelmKey === helmKey(release)} class="argo-row helm-row" on:click={() => { helmDetailTab = 'values'; void loadHelmDetail(release); }}>
+                    <span class="argo-app-name"><strong>{release.name}</strong><small>{release.description}</small></span>
+                    <span class="argo-muted">{release.namespace}</span>
+                    <span class="argo-muted" title={`${release.chart}-${release.chartVersion}`}>{release.chart} {release.chartVersion}</span>
+                    <span class="argo-muted">{release.appVersion || '—'}</span>
+                    <span>{release.revision}</span>
+                    <span><span class="argo-badge argo-tone-{helmTone(release.status)}">{release.status}</span></span>
+                    <span class="argo-muted">{release.updated ? resourceAge(release.updated) : '—'}</span>
+                  </button>
+                {/each}
+              </div>
+              {#if selectedHelmRelease}
+                <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+                <div class="pane-splitter" role="separator" tabindex="0" aria-orientation="vertical" aria-label="Resize the list and details" use:dragResize={{ value: helmListPercent, min: 30, max: 75, reset: 58, step: 2, fromPointer: percentOfContainer, onChange: (value) => (helmListPercent = value), onCommit: () => undefined }}></div>
+                {@const release = helmDetail?.release || selectedHelmRelease}
+                <aside class="argo-details helm-details" aria-label={`${release.name} details`}>
+                  <header><div><strong>{release.name}</strong><small>{release.namespace} · revision {release.revision}</small></div><button type="button" class="argo-close" aria-label="Close release details" on:click={() => { selectedHelmKey = ''; helmDetail = null; }}>×</button></header>
+                  <div class="argo-attention"><span class="argo-badge argo-tone-{helmTone(release.status)}">{release.status}</span></div>
+                  <dl class="argo-properties">
+                    <div><dt>Chart</dt><dd>{release.chart} <code>{release.chartVersion}</code></dd></div>
+                    <div><dt>App version</dt><dd>{release.appVersion || '—'}</dd></div>
+                    <div><dt>Updated</dt><dd>{release.updated ? `${resourceAge(release.updated)} ago` : '—'}</dd></div>
+                    {#if release.description}<div><dt>Last action</dt><dd>{release.description}</dd></div>{/if}
+                    {#if helmDetail?.chartDescription}<div><dt>About</dt><dd>{helmDetail.chartDescription}</dd></div>{/if}
+                  </dl>
+                  <div class="argo-actions helm-actions">
+                    <button type="button" class="secondary" title="Open the built-in CLI with this command; nothing runs until you press Enter" on:click={() => prefillCli(`helm history ${release.name} -n ${release.namespace}`)}><Terminal size={13} />History in CLI</button>
+                    <button type="button" class="secondary" title="Open the built-in CLI with this command" on:click={() => prefillCli(`helm upgrade ${release.name} <chart> -n ${release.namespace} --reuse-values`)}><Terminal size={13} />Upgrade in CLI</button>
+                  </div>
+                  <div class="argo-app-tabs" role="tablist" aria-label="Release sections">{#each [['values', 'Values'], ['notes', 'Notes'], ['manifest', 'Manifest'], ['history', `History ${helmDetail?.history.length || ''}`]] as [tab, label]}<button type="button" role="tab" aria-selected={helmDetailTab === tab} on:click={() => (helmDetailTab = tab as typeof helmDetailTab)}>{label}</button>{/each}</div>
+                  {#if loadingHelmDetail && !helmDetail}<div class="drawer-state"><i></i>Reading the release…</div>
+                  {:else if helmDetailError}<p class="gw-empty">{helmDetailError}</p>
+                  {:else if helmDetail}
+                    {#if helmDetailTab === 'values'}
+                      {#if helmDetail.values}<div class="argo-values"><div><span>User-supplied values (helm get values)</span><button type="button" class="argo-node-actions-copy" on:click={() => copyText(helmDetail?.values || '', 'values')}><Copy size={12} />Copy</button></div><pre>{helmDetail.values}</pre></div>{:else}<p class="gw-empty">This release uses the chart's default values.</p>{/if}
+                    {:else if helmDetailTab === 'notes'}
+                      {#if helmDetail.notes}<div class="argo-values"><pre>{helmDetail.notes}</pre></div>{:else}<p class="gw-empty">The chart has no release notes.</p>{/if}
+                    {:else if helmDetailTab === 'manifest'}
+                      <div class="argo-values"><div><span>Rendered manifest</span><button type="button" class="argo-node-actions-copy" on:click={() => copyText(helmDetail?.manifest || '', 'manifest')}><Copy size={12} />Copy</button></div><pre>{helmDetail.manifest}</pre></div>
+                    {:else}
+                      <ol class="argo-history">{#each helmDetail.history as entry, index (entry.revision)}<li class:argo-history-current={entry.revision === release.revision}><span class="argo-history-dot"></span><div class="argo-history-body"><div><strong>#{entry.revision}</strong><span class="argo-badge argo-tone-{helmTone(entry.status)}">{entry.status}</span></div><small>{entry.chart} {entry.chartVersion} · app {entry.appVersion || '—'} · {entry.updated ? `${resourceAge(entry.updated)} ago` : ''}</small>{#if entry.description}<small>{entry.description}</small>{/if}</div><div class="helm-history-actions">{#if entry.revision !== release.revision}<button type="button" class="secondary" on:click={() => loadHelmDetail(release, entry.revision)}>View</button>{/if}{#if index > 0}<button type="button" class="secondary" title="Open the built-in CLI with this command; nothing runs until you press Enter" on:click={() => prefillCli(`helm rollback ${release.name} ${entry.revision} -n ${release.namespace}`)}><Undo2 size={13} />Rollback in CLI</button>{/if}</div></li>{/each}</ol>
+                    {/if}
+                  {/if}
+                </aside>
+              {/if}
+            </div>
+          {/if}
+        </section>
       {:else if activeView === 'Events'}
         <section class="events-page panel">
           <div class="events-heading">
@@ -6796,7 +7445,7 @@
             {#if !selectedResource}
               <div class="resource-directory">
                 <header class="resource-directory-header">
-                  <div><p class="eyebrow">{customApiWorkspace ? 'Custom APIs' : 'Resources'}</p><h2>{customApiWorkspace ? 'Browse custom APIs' : 'Browse resources'}</h2><p>{activeResourceCatalog.length} API types in {activeCluster}. Pick one to load its objects.</p></div>
+                  <div><p class="eyebrow">{customApiWorkspace ? 'Custom Resources' : 'Resources'}</p><h2>{customApiWorkspace ? 'Browse custom resources' : 'Browse resources'}</h2><p>{activeResourceCatalog.length} API types in {activeCluster}. Pick one to load its objects.</p></div>
                   <label class="resource-directory-search"><Search size={15} /><input bind:value={resourceDirectorySearch} placeholder="Find a kind, group, or version" aria-label="Find a resource type" spellcheck="false" /></label>
                 </header>
                 {#if !resourceDirectorySections.length}
@@ -7110,6 +7759,36 @@
     <footer class="workspace-statusbar"><button class:workspace-cli-active={cliOpen} type="button" disabled={!activeClusterId} title={activeClusterId ? `Open terminal for ${activeCluster}` : 'Select a cluster first'} on:click={toggleClusterCli}><Terminal size={14} /><span>CLI</span></button>{#if activeClusterId}<small>{activeCluster} · {namespace === 'all namespaces' ? 'all namespaces' : namespace}</small>{/if}<div class="workspace-zoom-controls" role="group" aria-label="Interface size"><button type="button" disabled={uiScale <= 0.8} aria-label="Decrease interface size" title="Decrease interface size" on:click={() => adjustUiScale(-0.05)}>−</button><output aria-live="polite">{Math.round(uiScale * 100)}%</output><button type="button" disabled={uiScale >= 1.25} aria-label="Increase interface size" title="Increase interface size" on:click={() => adjustUiScale(0.05)}>+</button></div></footer>
   </section>
 
+  {#if updateDialogOpen}
+    <div class="modal-backdrop deletion-backdrop" role="presentation" on:click={() => updateState !== 'downloading' && dismissUpdateDialog()}>
+      <div use:focusOnMount class="deletion-modal update-dialog" role="dialog" aria-modal="true" aria-labelledby="update-dialog-title" tabindex="-1" on:click|stopPropagation on:keydown|stopPropagation={(event) => event.key === 'Escape' && updateState !== 'downloading' && dismissUpdateDialog()}>
+        <div class="update-dialog-mark"><img src="/kuberniva-mark.svg" alt="" /></div>
+        {#if updateState === 'checking'}
+          <h2 id="update-dialog-title">Checking for updates…</h2>
+          <p class="deletion-intro">Looking for a newer version of Kuberniva.</p>
+        {:else if updateState === 'current'}
+          <h2 id="update-dialog-title">You're up to date</h2>
+          <p class="deletion-intro">Kuberniva {appVersion} is the latest version.</p>
+          <div class="deletion-actions"><button class="primary" on:click={dismissUpdateDialog}>OK</button></div>
+        {:else if updateState === 'error'}
+          <h2 id="update-dialog-title">Couldn't check for updates</h2>
+          <p class="deletion-intro">{updateError}</p>
+          <div class="deletion-actions"><button class="secondary" on:click={dismissUpdateDialog}>Close</button><button class="primary" on:click={() => checkForUpdates(false)}>Try again</button></div>
+        {:else if pendingUpdate}
+          <p class="eyebrow">Update available</p>
+          <h2 id="update-dialog-title">Kuberniva {pendingUpdate.version}</h2>
+          <p class="deletion-intro">{updateState === 'ready' ? 'The update is installed. Restart Kuberniva to start using it.' : `You have ${appVersion || 'an older version'}. It downloads in the background and applies when Kuberniva restarts.`}</p>
+          {#if pendingUpdate.body && updateState !== 'ready'}<section class="update-notes">{#each parseReleaseNotes(pendingUpdate.body) as block}{#if block.type === 'heading'}<h3>{block.text}</h3>{:else if block.type === 'label'}<h4>{block.text}</h4>{:else if block.type === 'list'}<ul>{#each block.items as item}<li>{@render noteInline(item)}</li>{/each}</ul>{:else}<p>{@render noteInline(block.inline)}</p>{/if}{/each}</section>{/if}
+          {#if updateState === 'downloading'}<div class="update-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow={updateProgress === null ? undefined : Math.round(updateProgress * 100)}><i class:update-progress-indeterminate={updateProgress === null} style:width={updateProgress === null ? '35%' : `${Math.round(updateProgress * 100)}%`}></i></div>{/if}
+          <div class="deletion-actions">
+            {#if updateState === 'ready'}<button class="secondary" on:click={dismissUpdateDialog}>Later</button><button class="primary" on:click={restartToUpdate}><RefreshCw size={14} /> Restart now</button>
+            {:else if updateState === 'downloading'}<button class="secondary" disabled>{updateProgress === null ? 'Downloading…' : `Downloading ${Math.round(updateProgress * 100)}%`}</button>
+            {:else}<button class="secondary" on:click={dismissUpdateDialog}>Later</button><button class="primary" on:click={installUpdate}><Download size={14} /> Download and install</button>{/if}
+          </div>
+        {/if}
+      </div>
+    </div>
+  {/if}
   {#if argoDialog}
     {@const dialog = argoDialog}
     <div class="modal-backdrop deletion-backdrop" role="presentation" on:click={() => !runningArgoAction && (argoDialog = null)}>

@@ -37,8 +37,10 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 use x509_parser::{parse_x509_certificate, pem::parse_x509_pem};
+mod helm;
 mod live_feeds;
 mod live_resources;
+mod topology;
 use live_resources::{
     run_resource_watch, spawn_sleep_monitor, ResourceSnapshot, ResourceWatchRequest,
 };
@@ -2892,6 +2894,353 @@ async fn argocd_application_action(request: ArgoApplicationActionRequest) -> Res
     Ok(())
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArgoTreeRoot {
+    kind: String,
+    name: String,
+    namespace: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArgoTreeRequest {
+    kubeconfig_path: Option<String>,
+    context: Option<String>,
+    roots: Vec<ArgoTreeRoot>,
+}
+
+/// An object owned (directly or transitively) by one of an Application's managed resources.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct ArgoTreeNode {
+    id: String,
+    parent: String,
+    kind: String,
+    name: String,
+    namespace: String,
+    health: String,
+    info: String,
+}
+
+fn tree_id(kind: &str, namespace: &str, name: &str) -> String {
+    format!("{kind}/{namespace}/{name}")
+}
+
+struct TreeCandidate {
+    node: ArgoTreeNode,
+    owner: String,
+}
+
+fn controller_owner(
+    meta: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta,
+    namespace: &str,
+) -> Option<String> {
+    let owners = meta.owner_references.as_ref()?;
+    let owner = owners
+        .iter()
+        .find(|owner| owner.controller == Some(true))
+        .or_else(|| owners.first())?;
+    Some(tree_id(&owner.kind, namespace, &owner.name))
+}
+
+fn pod_tree_node(pod: &Pod, namespace: &str) -> Option<TreeCandidate> {
+    let name = pod.metadata.name.clone()?;
+    let owner = controller_owner(&pod.metadata, namespace)?;
+    let (health, info) = pod_health(pod);
+    Some(TreeCandidate {
+        node: ArgoTreeNode {
+            id: tree_id("Pod", namespace, &name),
+            parent: owner.clone(),
+            kind: "Pod".into(),
+            name,
+            namespace: namespace.into(),
+            health,
+            info,
+        },
+        owner,
+    })
+}
+
+/// Argo CD-style health and a one-line summary for a Pod.
+fn pod_health(pod: &Pod) -> (String, String) {
+    let statuses = pod
+        .status
+        .as_ref()
+        .and_then(|status| status.container_statuses.clone())
+        .unwrap_or_default();
+    let ready = statuses.iter().filter(|status| status.ready).count();
+    let restarts: i32 = statuses.iter().map(|status| status.restart_count).sum();
+    let waiting = statuses
+        .iter()
+        .find_map(|status| status.state.as_ref()?.waiting.as_ref()?.reason.clone());
+    let phase = pod
+        .status
+        .as_ref()
+        .and_then(|status| status.phase.clone())
+        .unwrap_or_default();
+    let health = match (phase.as_str(), waiting.as_deref()) {
+        (
+            _,
+            Some(
+                "CrashLoopBackOff"
+                | "ImagePullBackOff"
+                | "ErrImagePull"
+                | "CreateContainerConfigError",
+            ),
+        )
+        | ("Failed", _) => "Degraded",
+        ("Running", _) if ready == statuses.len() && !statuses.is_empty() => "Healthy",
+        ("Succeeded", _) => "Healthy",
+        _ => "Progressing",
+    };
+    let state = waiting.unwrap_or(phase);
+    (
+        health.into(),
+        format!(
+            "{state} · {ready}/{} ready{}",
+            statuses.len(),
+            if restarts > 0 {
+                format!(" · {restarts} restarts")
+            } else {
+                String::new()
+            }
+        ),
+    )
+}
+
+/// Attaches candidates to the tree when their owner is already in it (Deployment → ReplicaSet → Pod).
+fn attach_tree(roots: &[String], mut candidates: Vec<TreeCandidate>) -> Vec<ArgoTreeNode> {
+    let mut known: HashSet<String> = roots.iter().cloned().collect();
+    let mut attached = Vec::new();
+    for _ in 0..4 {
+        let (ready, rest): (Vec<_>, Vec<_>) = candidates
+            .into_iter()
+            .partition(|candidate| known.contains(&candidate.owner));
+        if ready.is_empty() {
+            break;
+        }
+        for candidate in ready {
+            known.insert(candidate.node.id.clone());
+            attached.push(candidate.node);
+        }
+        candidates = rest;
+    }
+    attached.sort_by(|left, right| {
+        left.parent
+            .cmp(&right.parent)
+            .then(left.kind.cmp(&right.kind))
+            .then(left.name.cmp(&right.name))
+    });
+    attached
+}
+
+/// Live children of an Application's managed resources, like the Argo CD resource tree.
+#[tauri::command]
+async fn argocd_resource_tree(request: ArgoTreeRequest) -> Result<Vec<ArgoTreeNode>, String> {
+    bounded_cluster_read(
+        "Reading the resource tree",
+        cluster_read_timeout(&request.kubeconfig_path, &request.context, 35),
+        argocd_resource_tree_inner(request),
+    )
+    .await
+}
+
+async fn argocd_resource_tree_inner(request: ArgoTreeRequest) -> Result<Vec<ArgoTreeNode>, String> {
+    use k8s_openapi::api::apps::v1::ReplicaSet;
+    use k8s_openapi::api::batch::v1::Job;
+    use k8s_openapi::api::discovery::v1::EndpointSlice;
+    let client = client_for(request.kubeconfig_path.clone(), request.context.clone()).await?;
+    let roots: Vec<String> = request
+        .roots
+        .iter()
+        .map(|root| tree_id(&root.kind, &root.namespace, &root.name))
+        .collect();
+    let namespaces: BTreeSet<String> = request
+        .roots
+        .iter()
+        .map(|root| root.namespace.clone())
+        .filter(|namespace| !namespace.is_empty())
+        .collect();
+    let mut candidates = Vec::new();
+    for namespace in namespaces.iter().take(20) {
+        let params = ListParams::default();
+        let (rs_api, pod_api, job_api, slice_api) = (
+            Api::<ReplicaSet>::namespaced(client.clone(), namespace),
+            Api::<Pod>::namespaced(client.clone(), namespace),
+            Api::<Job>::namespaced(client.clone(), namespace),
+            Api::<EndpointSlice>::namespaced(client.clone(), namespace),
+        );
+        let (replica_sets, pods, jobs, slices) = tokio::join!(
+            rs_api.list(&params),
+            pod_api.list(&params),
+            job_api.list(&params),
+            slice_api.list(&params),
+        );
+        for replica_set in replica_sets.map(|list| list.items).unwrap_or_default() {
+            let desired = replica_set
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.replicas)
+                .unwrap_or(0);
+            // Old revisions scaled to zero only add noise, as in Argo CD's default view.
+            if desired == 0 {
+                continue;
+            }
+            let Some(name) = replica_set.metadata.name.clone() else {
+                continue;
+            };
+            let Some(owner) = controller_owner(&replica_set.metadata, namespace) else {
+                continue;
+            };
+            let ready = replica_set
+                .status
+                .as_ref()
+                .and_then(|status| status.ready_replicas)
+                .unwrap_or(0);
+            let revision = replica_set
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| {
+                    annotations
+                        .get("deployment.kubernetes.io/revision")
+                        .cloned()
+                });
+            candidates.push(TreeCandidate {
+                node: ArgoTreeNode {
+                    id: tree_id("ReplicaSet", namespace, &name),
+                    parent: owner.clone(),
+                    kind: "ReplicaSet".into(),
+                    name,
+                    namespace: namespace.clone(),
+                    health: if ready >= desired {
+                        "Healthy"
+                    } else {
+                        "Progressing"
+                    }
+                    .into(),
+                    info: format!(
+                        "{}{ready}/{desired} ready",
+                        revision
+                            .map(|revision| format!("rev {revision} · "))
+                            .unwrap_or_default()
+                    ),
+                },
+                owner,
+            });
+        }
+        for pod in pods.map(|list| list.items).unwrap_or_default() {
+            if let Some(candidate) = pod_tree_node(&pod, namespace) {
+                candidates.push(candidate);
+            }
+        }
+        for job in jobs.map(|list| list.items).unwrap_or_default() {
+            let Some(name) = job.metadata.name.clone() else {
+                continue;
+            };
+            let Some(owner) = controller_owner(&job.metadata, namespace) else {
+                continue;
+            };
+            let status = job.status.clone().unwrap_or_default();
+            let health = if status.failed.unwrap_or(0) > 0 {
+                "Degraded"
+            } else if status.succeeded.unwrap_or(0) > 0 {
+                "Healthy"
+            } else {
+                "Progressing"
+            };
+            candidates.push(TreeCandidate {
+                node: ArgoTreeNode {
+                    id: tree_id("Job", namespace, &name),
+                    parent: owner.clone(),
+                    kind: "Job".into(),
+                    name,
+                    namespace: namespace.clone(),
+                    health: health.into(),
+                    info: format!("{} succeeded", status.succeeded.unwrap_or(0)),
+                },
+                owner,
+            });
+        }
+        for slice in slices.map(|list| list.items).unwrap_or_default() {
+            let Some(name) = slice.metadata.name.clone() else {
+                continue;
+            };
+            let service = slice
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("kubernetes.io/service-name").cloned());
+            let Some(owner) = service
+                .map(|service| tree_id("Service", namespace, &service))
+                .or_else(|| controller_owner(&slice.metadata, namespace))
+            else {
+                continue;
+            };
+            let ready = slice
+                .endpoints
+                .iter()
+                .filter(|endpoint| {
+                    endpoint
+                        .conditions
+                        .as_ref()
+                        .and_then(|conditions| conditions.ready)
+                        .unwrap_or(false)
+                })
+                .count();
+            candidates.push(TreeCandidate {
+                node: ArgoTreeNode {
+                    id: tree_id("EndpointSlice", namespace, &name),
+                    parent: owner.clone(),
+                    kind: "EndpointSlice".into(),
+                    name,
+                    namespace: namespace.clone(),
+                    health: if ready > 0 { "Healthy" } else { "Missing" }.into(),
+                    info: format!("{ready}/{} endpoints ready", slice.endpoints.len()),
+                },
+                owner,
+            });
+        }
+    }
+    Ok(attach_tree(&roots, candidates))
+}
+
+#[tauri::command]
+async fn cluster_topology(
+    request: topology::TopologyRequest,
+) -> Result<topology::Topology, String> {
+    let timeout = cluster_read_timeout(&request.kubeconfig_path, &request.context, 60);
+    bounded_cluster_read(
+        "Reading the cluster topology",
+        timeout,
+        topology::read(request),
+    )
+    .await
+}
+
+#[tauri::command]
+async fn list_helm_releases(request: helm::HelmRequest) -> Result<Vec<helm::HelmRelease>, String> {
+    let timeout = std::time::Duration::from_secs(60);
+    bounded_cluster_read(
+        "Reading Helm releases",
+        timeout,
+        helm::list_releases(request),
+    )
+    .await
+}
+
+#[tauri::command]
+async fn get_helm_release(request: helm::HelmRequest) -> Result<helm::HelmReleaseDetail, String> {
+    let timeout = std::time::Duration::from_secs(35);
+    bounded_cluster_read(
+        "Reading the Helm release",
+        timeout,
+        helm::release_detail(request),
+    )
+    .await
+}
+
 /// Full objects of one type, for structured views that read spec and status
 /// (Gateway routes, admission policies, Argo CD applications).
 #[tauri::command]
@@ -4950,6 +5299,45 @@ users:
     }
 
     #[test]
+    fn argocd_tree_attaches_owned_objects_transitively() {
+        let candidate = |kind: &str, name: &str, owner: &str| TreeCandidate {
+            node: ArgoTreeNode {
+                id: tree_id(kind, "shop", name),
+                parent: owner.into(),
+                kind: kind.into(),
+                name: name.into(),
+                namespace: "shop".into(),
+                health: "Healthy".into(),
+                info: String::new(),
+            },
+            owner: owner.into(),
+        };
+        let roots = vec![tree_id("Deployment", "shop", "api")];
+        let tree = attach_tree(
+            &roots,
+            vec![
+                candidate("Pod", "api-7d-x1", "ReplicaSet/shop/api-7d"),
+                candidate("ReplicaSet", "api-7d", "Deployment/shop/api"),
+                candidate("Pod", "stray", "ReplicaSet/shop/other"),
+            ],
+        );
+        assert_eq!(
+            tree.iter()
+                .map(|node| node.name.as_str())
+                .collect::<Vec<_>>(),
+            ["api-7d", "api-7d-x1"]
+        );
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "api-7d-x1", "ownerReferences": [{ "apiVersion": "apps/v1", "kind": "ReplicaSet", "name": "api-7d", "uid": "u", "controller": true }] },
+            "status": { "phase": "Running", "containerStatuses": [{ "name": "api", "image": "i", "imageID": "", "ready": false, "restartCount": 4, "state": { "waiting": { "reason": "CrashLoopBackOff" } } }] }
+        })).unwrap();
+        let node = pod_tree_node(&pod, "shop").unwrap();
+        assert_eq!(node.owner, "ReplicaSet/shop/api-7d");
+        assert_eq!(node.node.health, "Degraded");
+        assert_eq!(node.node.info, "CrashLoopBackOff · 0/1 ready · 4 restarts");
+    }
+
+    #[test]
     fn argocd_actions_build_cli_compatible_patches() {
         let idle = serde_json::json!({
             "spec": { "source": { "targetRevision": "main" } },
@@ -5250,6 +5638,10 @@ pub fn run() {
             start_live_feed,
             list_resource_manifests,
             argocd_application_action,
+            argocd_resource_tree,
+            list_helm_releases,
+            cluster_topology,
+            get_helm_release,
             read_object_events,
             get_resource_detail,
             delete_resource_object,
@@ -5273,6 +5665,34 @@ pub fn run() {
         .setup(|app| {
             spawn_sleep_monitor(app.handle().clone());
             Ok(())
+        })
+        // "Check for Updates…" lives in the Kuberniva app menu, right after About.
+        .menu(|handle| {
+            let menu = tauri::menu::Menu::default(handle)?;
+            #[cfg(target_os = "macos")]
+            if let Some(tauri::menu::MenuItemKind::Submenu(app_menu)) =
+                menu.items()?.into_iter().next()
+            {
+                let check = tauri::menu::MenuItem::with_id(
+                    handle,
+                    "check-for-updates",
+                    "Check for Updates…",
+                    true,
+                    None::<&str>,
+                )?;
+                app_menu.insert(&check, 1)?;
+                app_menu.insert(&tauri::menu::PredefinedMenuItem::separator(handle)?, 2)?;
+            }
+            Ok(menu)
+        })
+        .on_menu_event(|app, event| {
+            if event.id() == "check-for-updates" {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+                let _ = app.emit("kuberniva://check-for-updates", ());
+            }
         })
         // On macOS, closing the window hides it like other Mac apps: live watches keep
         // streaming in the background, the Dock icon brings it back, and ⌘Q quits.

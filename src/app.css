@@ -8328,3 +8328,97 @@ html body main.theme-dark .command-modal { color: var(--ui-ink) !important; back
 html body main.theme-dark :is(.reveal-button, .workload-terminal-heading > button, .favorite-toggle) { color: var(--ui-copy) !important; background: var(--ui-surface-strong) !important; border-color: var(--ui-border-strong) !important; }
 html body main.theme-dark .favorite-toggle.favorite-toggle-active { color: #f0c674 !important; background: rgba(214, 160, 60, .14) !important; border-color: rgba(214, 160, 60, .4) !important; }
 html body main.theme-dark .resource-pane-heading > span { color: var(--ui-copy) !important; background: var(--ui-surface-strong) !important; border-color: var(--ui-border) !important; }
+
+/* Update window: opened from the Kuberniva menu or automatically when a release appears. */
+.update-dialog { width: min(560px, calc(100vw - 48px)) !important; }
+.update-dialog-mark { display: grid; place-items: center; width: 52px; height: 52px; margin-bottom: 6px; }
+.update-dialog-mark img { width: 52px; height: 52px; border-radius: 12px; }
+.update-dialog .update-notes { max-height: 300px; margin: 6px 0 14px; }
+.update-dialog { max-height: calc(100vh - 48px); overflow-y: auto; }
+
+/* Argo CD application graph */
+.argo-graph-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
+.argo-graph-toolbar small { color: var(--ui-muted); font-size: 12px; }
+.argo-graph-legend { display: flex; flex-wrap: wrap; gap: 6px; }
+.argo-graph-scroll { overflow: auto; padding: 8px 4px 16px; border: 1px solid var(--ui-border); border-radius: 14px; background:
+  radial-gradient(circle, var(--ui-border) 1px, transparent 1.2px) 0 0 / 18px 18px, var(--ui-surface-muted); }
+.argo-graph { position: relative; margin: 8px 12px; }
+.argo-graph-edges { position: absolute; inset: 0; overflow: visible; pointer-events: none; }
+.argo-edge { fill: none; stroke: var(--ui-border-strong); stroke-width: 1.5; }
+.argo-edge.argo-tone-bad { stroke: #d9695c; }
+.argo-edge.argo-tone-warn { stroke: #d49b2e; }
+.argo-graph-node { position: absolute; display: flex; align-items: center; gap: 9px; width: 232px; height: 54px; padding: 0 10px 0 8px; border: 1px solid var(--ui-border); border-left: 3px solid var(--argo-fg, var(--ui-border-strong)); border-radius: 11px; color: var(--ui-ink); background: var(--ui-surface); box-shadow: 0 2px 6px rgba(0, 0, 0, .06); font: inherit; text-align: left; cursor: pointer; transition: border-color .12s, box-shadow .12s, transform .12s; }
+.argo-graph-node:hover { border-color: var(--ui-border-strong); box-shadow: 0 6px 16px rgba(0, 0, 0, .12); transform: translateY(-1px); }
+.argo-graph-node.argo-tone-none { border-left-color: var(--ui-border-strong); }
+.argo-graph-root { border-left-color: var(--ui-accent) !important; background: var(--ui-accent-soft); }
+.argo-graph-icon { display: grid; place-items: center; flex: 0 0 auto; width: 28px; height: 28px; border-radius: 8px; color: var(--argo-fg, var(--ui-muted)); background: var(--argo-bg, var(--ui-surface-strong)); }
+.argo-graph-root .argo-graph-icon { color: var(--ui-accent); background: var(--ui-surface); }
+.argo-graph-text { display: grid; min-width: 0; flex: 1; line-height: 1.25; }
+.argo-graph-text small { color: var(--ui-muted); font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+.argo-graph-text strong { overflow: hidden; font-size: 12.5px; text-overflow: ellipsis; white-space: nowrap; }
+.argo-graph-text em { overflow: hidden; color: var(--ui-muted); font-size: 11px; font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
+.argo-graph-sync { flex: 0 0 auto; color: #d49b2e; }
+.argo-graph-more { justify-content: center; flex-direction: column; gap: 0; border-style: dashed; border-left-width: 1px; background: transparent; }
+.argo-graph-more strong { font-size: 12.5px; }
+.argo-graph-more small { color: var(--ui-muted); font-size: 11px; }
+.argo-parameters-page { display: grid; gap: 12px; }
+.argo-values { display: grid; gap: 6px; }
+.argo-values > div { display: flex; align-items: center; justify-content: space-between; }
+.argo-values span { color: var(--ui-muted); font-size: 11.5px; font-weight: 600; }
+.argo-values pre { max-height: 360px; margin: 0; padding: 10px 12px; overflow: auto; border: 1px solid var(--ui-border); border-radius: 9px; color: var(--ui-ink); background: var(--ui-surface-muted); font-family: 'DM Mono', ui-monospace, monospace; font-size: 12px; line-height: 1.55; }
+.argo-node-actions-copy { display: inline-flex; align-items: center; gap: 5px; height: 26px; padding: 0 9px; border: 1px solid var(--ui-border); border-radius: 7px; color: var(--ui-copy); background: var(--ui-surface-muted); font: inherit; font-size: 11.5px; font-weight: 600; cursor: pointer; }
+
+/* Helm releases */
+html body main .helm-row { grid-template-columns: var(--helm-grid) !important; }
+html body main .argo-table > .helm-row { min-width: var(--helm-table-min, 100%); }
+.helm-details .argo-app-tabs { margin-top: 2px; }
+.helm-actions { flex-wrap: wrap; }
+.helm-history-actions { display: flex; flex-direction: column; gap: 6px; }
+.helm-history-actions button { display: inline-flex; align-items: center; gap: 6px; }
+.helm-page .argo-body.argo-body-detail { grid-template-columns: minmax(320px, var(--argo-list-percent, 58%)) 6px minmax(340px, 1fr); }
+
+/* Open Cluster Management hub */
+html body main .ocm-row { grid-template-columns: var(--ocm-grid) !important; }
+html body main .argo-table > .ocm-row { min-width: var(--ocm-table-min, 100%); }
+.ocm-page .argo-body.argo-body-detail { grid-template-columns: minmax(320px, var(--argo-list-percent, 60%)) 6px minmax(320px, 1fr); }
+.ocm-card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); align-items: start; gap: 12px; overflow-y: auto; }
+.ocm-works { flex: 1 1 auto; }
+html body main .ocm-work-row { grid-template-columns: minmax(180px, 1.4fr) minmax(110px, .8fr) 80px 90px 90px 120px; cursor: default; }
+.ocm-chip { border-left: 3px solid var(--ui-border-strong); }
+.ocm-chip-ok { border-left-color: #22a55b; }
+.ocm-chip-bad { border-left-color: #d0544a; }
+.ocm-chip-warn { border-left-color: #d49b2e; }
+
+.ocm-mini-list > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+.ocm-mini-list > div > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ocm-mini-list {
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0;
+}
+
+/* Topology */
+.topology-toggle { display: inline-flex; align-items: center; gap: 7px; height: 32px; padding: 0 11px; border: 1px solid var(--ui-border); border-radius: 9px; color: var(--ui-ink); background: var(--ui-surface); font-size: 12.5px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+.topology-toggle input { margin: 0; accent-color: var(--ui-accent); }
+.topology-toggle b { min-width: 18px; padding: 1px 6px; border-radius: 999px; color: #fff; background: #c4554a; font-size: 11px; text-align: center; }
+.topology-relation { display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; color: var(--ui-muted); font-size: 11.5px; font-weight: 600; white-space: nowrap; }
+.topology-line { display: inline-block; width: 22px; border-top: 1.5px solid var(--ui-border-strong); }
+.topology-line-uses { border-top-style: dashed; }
+.topology-note { margin: 0 0 10px; color: var(--ui-muted); font-size: 12px; }
+.topology-scroll { max-height: calc(100vh - 250px); min-height: 320px; }
+.topology-band { position: absolute; left: 0; right: 0; display: flex; align-items: center; gap: 7px; height: 26px; padding: 0 10px; border-bottom: 1px solid var(--ui-border); color: var(--ui-muted); font-size: 12px; pointer-events: none; }
+.topology-band strong { color: var(--ui-ink); font-size: 12.5px; }
+.topology-band small { font-size: 11px; }
+.topology-node { width: 220px; }
+.argo-edge.topology-edge-uses { stroke-dasharray: 4 4; opacity: .75; }
+.topology-missing { border-style: dashed; border-left-style: solid; background: transparent; }

@@ -580,3 +580,185 @@ export const visualQaArgoProjects = [
 ];
 
 export const visualQaReleaseNotes = `${releaseNotes}\nDMG SHA-256: \`0000\`\n`;
+
+/** Live children for the Argo CD graph: ReplicaSet + Pods per Deployment, EndpointSlice per Service. */
+export function visualQaArgoTree(args: Record<string, unknown>) {
+  const roots = ((args.request as { roots: { kind: string; name: string; namespace: string }[] }).roots) || [];
+  const nodes: Record<string, string>[] = [];
+  for (const root of roots) {
+    const parent = `${root.kind}/${root.namespace}/${root.name}`;
+    if (root.kind === 'Deployment') {
+      const rs = `${root.name}-6f9c7d8b4`;
+      nodes.push({ id: `ReplicaSet/${root.namespace}/${rs}`, parent, kind: 'ReplicaSet', name: rs, namespace: root.namespace, health: 'Progressing', info: 'rev 16 · 2/3 ready' });
+      ['x7k2p', 'm4q9d', 'c2v8n'].forEach((suffix, index) => nodes.push({
+        id: `Pod/${root.namespace}/${rs}-${suffix}`, parent: `ReplicaSet/${root.namespace}/${rs}`, kind: 'Pod', name: `${rs}-${suffix}`, namespace: root.namespace,
+        health: index === 2 ? 'Degraded' : 'Healthy', info: index === 2 ? 'CrashLoopBackOff · 0/2 ready · 12 restarts' : 'Running · 2/2 ready',
+      }));
+    }
+    if (root.kind === 'Service') {
+      nodes.push({ id: `EndpointSlice/${root.namespace}/${root.name}-abcde`, parent, kind: 'EndpointSlice', name: `${root.name}-abcde`, namespace: root.namespace, health: 'Healthy', info: '2/3 endpoints ready' });
+    }
+  }
+  return nodes;
+}
+
+const helmRelease = (name: string, namespace: string, revision: number, status: string, chart: string, chartVersion: string, appVersion: string, hoursAgo: number, description = 'Upgrade complete') => ({
+  name, namespace, revision, status, chart, chartVersion, appVersion, description, updated: new Date(Date.now() - hoursAgo * 3_600_000).toISOString(),
+});
+
+export const visualQaHelmReleases = [
+  helmRelease('cert-manager', 'cert-manager', 4, 'deployed', 'cert-manager', 'v1.15.3', 'v1.15.3', 240),
+  helmRelease('ingress-nginx', 'ingress-nginx', 9, 'deployed', 'ingress-nginx', '4.11.2', '1.11.2', 72),
+  helmRelease('kube-prometheus', 'monitoring', 17, 'failed', 'kube-prometheus-stack', '62.3.1', 'v0.76.1', 3, 'Upgrade "kube-prometheus" failed: timed out waiting for the condition'),
+  helmRelease('redis', 'payments', 2, 'deployed', 'redis', '19.6.4', '7.2.5', 600),
+  helmRelease('storefront', 'web', 23, 'pending-upgrade', 'storefront', '3.8.0', '3.8.0', 0.1, 'Preparing upgrade'),
+];
+
+export function visualQaHelmDetail(args: Record<string, unknown>) {
+  const request = args.request as { name: string; namespace: string; revision?: number | null };
+  const latest = visualQaHelmReleases.find((release) => release.name === request.name) || visualQaHelmReleases[0];
+  const history = Array.from({ length: Math.min(latest.revision, 5) }, (_, index) => {
+    const revision = latest.revision - index;
+    return { ...latest, revision, status: index === 0 ? latest.status : 'superseded', chartVersion: index === 0 ? latest.chartVersion : `${latest.chartVersion.replace(/\d+$/, '')}${Math.max(0, Number(latest.chartVersion.split('.').pop()) - index)}`, updated: new Date(Date.parse(latest.updated) - index * 86_400_000).toISOString(), description: index === 0 ? latest.description : 'Upgrade complete' };
+  });
+  const release = history.find((entry) => entry.revision === request.revision) || history[0];
+  return {
+    release,
+    notes: `${release.chart} has been installed.\n\nCheck its status by running:\n  kubectl --namespace ${release.namespace} get pods -l "app.kubernetes.io/instance=${release.name}"`,
+    values: `replicaCount: 3\nimage:\n  tag: "${release.appVersion}"\nresources:\n  limits:\n    cpu: 500m\n    memory: 512Mi\ningress:\n  enabled: true\n  hosts:\n    - ${release.name}.acme.example.com\n`,
+    manifest: `---\n# Source: ${release.chart}/templates/deployment.yaml\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: ${release.name}\n  namespace: ${release.namespace}\nspec:\n  replicas: 3\n`,
+    chartDescription: `The ${release.chart} chart for Kubernetes`,
+    history,
+  };
+}
+
+export const visualQaOcmResources = [
+  { group: 'cluster.open-cluster-management.io', version: 'v1', apiVersion: 'cluster.open-cluster-management.io/v1', kind: 'ManagedCluster', plural: 'managedclusters', namespaced: false, category: 'Custom Resources', custom: true, crd: true },
+  { group: 'cluster.open-cluster-management.io', version: 'v1beta2', apiVersion: 'cluster.open-cluster-management.io/v1beta2', kind: 'ManagedClusterSet', plural: 'managedclustersets', namespaced: false, category: 'Custom Resources', custom: true, crd: true },
+  { group: 'cluster.open-cluster-management.io', version: 'v1beta1', apiVersion: 'cluster.open-cluster-management.io/v1beta1', kind: 'Placement', plural: 'placements', namespaced: true, category: 'Custom Resources', custom: true, crd: true },
+  { group: 'cluster.open-cluster-management.io', version: 'v1beta1', apiVersion: 'cluster.open-cluster-management.io/v1beta1', kind: 'PlacementDecision', plural: 'placementdecisions', namespaced: true, category: 'Custom Resources', custom: true, crd: true },
+  { group: 'work.open-cluster-management.io', version: 'v1', apiVersion: 'work.open-cluster-management.io/v1', kind: 'ManifestWork', plural: 'manifestworks', namespaced: true, category: 'Custom Resources', custom: true, crd: true },
+  { group: 'policy.open-cluster-management.io', version: 'v1', apiVersion: 'policy.open-cluster-management.io/v1', kind: 'Policy', plural: 'policies', namespaced: true, category: 'Custom Resources', custom: true, crd: true },
+  { group: 'addon.open-cluster-management.io', version: 'v1alpha1', apiVersion: 'addon.open-cluster-management.io/v1alpha1', kind: 'ManagedClusterAddOn', plural: 'managedclusteraddons', namespaced: true, category: 'Custom Resources', custom: true, crd: true },
+];
+
+const ocmCluster = (name: string, set: string, available: string, platform: string, region: string, cpu: string, memory: string, extra: Record<string, unknown> = {}) => ({
+  apiVersion: 'cluster.open-cluster-management.io/v1', kind: 'ManagedCluster',
+  metadata: { name, labels: { 'cluster.open-cluster-management.io/clusterset': set, region, env: set } },
+  spec: { hubAcceptsClient: extra.accepted !== false, managedClusterClientConfigs: [{ url: `https://api.${name}.acme.example.com:6443` }], taints: extra.taints },
+  status: {
+    conditions: extra.accepted === false ? [] : [
+      { type: 'HubAcceptedManagedCluster', status: 'True', reason: 'HubClusterAdminAccepted', message: 'Accepted by hub cluster admin' },
+      { type: 'ManagedClusterJoined', status: 'True', reason: 'ManagedClusterJoined', message: 'Managed cluster joined' },
+      { type: 'ManagedClusterConditionAvailable', status: available, reason: available === 'True' ? 'ManagedClusterAvailable' : 'ManagedClusterLeaseUpdateStopped', message: available === 'True' ? 'Managed cluster is available' : 'Registration agent stopped updating its lease 6m ago' },
+    ],
+    version: { kubernetes: 'v1.30.4' }, allocatable: { cpu, memory },
+    clusterClaims: [{ name: 'platform.open-cluster-management.io', value: platform }, { name: 'region.open-cluster-management.io', value: region }, { name: 'id.k8s.io', value: `${name}-7f3a` }],
+  },
+});
+
+export const visualQaOcm = {
+  clusters: [
+    ocmCluster('prod-us-east', 'prod', 'True', 'AWS', 'us-east-1', '63800m', '247Gi'),
+    ocmCluster('prod-eu-west', 'prod', 'True', 'GCP', 'europe-west1', '47600m', '185Gi'),
+    ocmCluster('prod-ap-south', 'prod', 'Unknown', 'Azure', 'centralindia', '31800m', '123Gi'),
+    ocmCluster('staging', 'staging', 'True', 'AWS', 'us-west-2', '15800m', '61Gi', { taints: [{ key: 'maintenance', value: 'patching', effect: 'NoSelect' }] }),
+    ocmCluster('edge-store-42', 'edge', 'False', 'Bare metal', 'store-42', '3900m', '15Gi', { accepted: false }),
+  ],
+  sets: ['prod', 'staging', 'edge'].map((name) => ({ metadata: { name }, spec: { clusterSelector: { selectorType: 'ExclusiveClusterSetLabel' } } })),
+  placements: [
+    { metadata: { name: 'web-prod', namespace: 'apps' }, spec: { clusterSets: ['prod'], numberOfClusters: 3 }, status: { numberOfSelectedClusters: 2, conditions: [{ type: 'PlacementSatisfied', status: 'False' }] } },
+    { metadata: { name: 'monitoring', namespace: 'open-cluster-management-observability' }, spec: { clusterSets: ['prod', 'staging'] }, status: { numberOfSelectedClusters: 4, conditions: [{ type: 'PlacementSatisfied', status: 'True' }] } },
+  ],
+  decisions: [
+    { metadata: { namespace: 'apps', labels: { 'cluster.open-cluster-management.io/placement': 'web-prod' } }, status: { decisions: [{ clusterName: 'prod-us-east' }, { clusterName: 'prod-eu-west' }] } },
+    { metadata: { namespace: 'open-cluster-management-observability', labels: { 'cluster.open-cluster-management.io/placement': 'monitoring' } }, status: { decisions: ['prod-us-east', 'prod-eu-west', 'prod-ap-south', 'staging'].map((clusterName) => ({ clusterName })) } },
+  ],
+  works: [
+    ...['prod-us-east', 'prod-eu-west'].map((cluster) => ({ metadata: { name: 'web-app', namespace: cluster }, spec: { workload: { manifests: [{}, {}, {}] } }, status: { conditions: [{ type: 'Applied', status: 'True' }, { type: 'Available', status: 'True' }] } })),
+    { metadata: { name: 'web-app', namespace: 'prod-ap-south' }, spec: { workload: { manifests: [{}, {}, {}] } }, status: { conditions: [{ type: 'Applied', status: 'True' }, { type: 'Available', status: 'False' }], resourceStatus: { manifests: [{ resourceMeta: { kind: 'Deployment', namespace: 'web', name: 'storefront' }, conditions: [{ type: 'Available', status: 'False' }] }] } } },
+  ],
+  policies: [
+    { metadata: { name: 'require-team-label', namespace: 'policies' }, spec: { remediationAction: 'inform' }, status: { compliant: 'NonCompliant', status: [{ clustername: 'prod-us-east', compliant: 'Compliant' }, { clustername: 'prod-eu-west', compliant: 'NonCompliant' }, { clustername: 'staging', compliant: 'Compliant' }] } },
+    { metadata: { name: 'disallow-privileged', namespace: 'policies' }, spec: { remediationAction: 'enforce' }, status: { compliant: 'Compliant', status: ['prod-us-east', 'prod-eu-west', 'prod-ap-south', 'staging'].map((clustername) => ({ clustername, compliant: 'Compliant' })) } },
+  ],
+  addons: ['prod-us-east', 'prod-eu-west', 'staging'].flatMap((cluster) => [
+    { metadata: { name: 'application-manager', namespace: cluster }, status: { conditions: [{ type: 'Available', status: 'True' }] } },
+    { metadata: { name: 'cluster-proxy', namespace: cluster }, status: { conditions: [{ type: 'Available', status: cluster === 'staging' ? 'False' : 'True' }] } },
+  ]),
+};
+
+type QaTopologyNode = { id: string; kind: string; group: string; name: string; namespace: string; health: string; info: string; owner: string | null };
+export function visualQaTopology(args: Record<string, unknown>) {
+  const nodes: QaTopologyNode[] = [];
+  const edges: { from: string; to: string; relation: string }[] = [];
+  const groups: Record<string, string> = { Deployment: 'apps', StatefulSet: 'apps', ReplicaSet: 'apps', DaemonSet: 'apps', Job: 'batch', CronJob: 'batch', Ingress: 'networking.k8s.io', Gateway: 'gateway.networking.k8s.io', HTTPRoute: 'gateway.networking.k8s.io' };
+  const add = (kind: string, namespace: string, name: string, health = 'Healthy', info = '', owner: string | null = null) => {
+    const id = `${kind}/${namespace}/${name}`;
+    nodes.push({ id, kind, group: groups[kind] || '', name, namespace, health, info, owner });
+    if (owner) edges.push({ from: owner, to: id, relation: 'owns' });
+    return id;
+  };
+  const link = (from: string, to: string, relation: string) => edges.push({ from, to, relation });
+  const pods = (owner: string, namespace: string, prefix: string, count: number, bad = -1) => {
+    for (let index = 0; index < count; index += 1) {
+      add('Pod', namespace, `${prefix}-${['x7k2p', 'm4q9z', 'b8n3d', 'r2t6w', 'h5v1c', 'j9f4s', 'p3l8g'][index]}`, index === bad ? 'Degraded' : 'Healthy', index === bad ? 'CrashLoopBackOff · 0/1 ready · 14 restarts' : 'Running · 1/1 ready', owner);
+    }
+  };
+  const ns = 'payments';
+  const gateway = add('Gateway', ns, 'public', 'Healthy', 'istio');
+  const route = add('HTTPRoute', ns, 'checkout', 'Healthy', 'pay.acme.example.com');
+  link(gateway, route, 'routes');
+  const checkoutSvc = add('Service', ns, 'checkout', 'Healthy', 'ClusterIP :8080');
+  link(route, checkoutSvc, 'routes');
+  const checkout = add('Deployment', ns, 'checkout', 'Progressing', '6/7 ready');
+  link(checkoutSvc, checkout, 'selects');
+  const checkoutRs = add('ReplicaSet', ns, 'checkout-6d8f9c7b5', 'Progressing', 'rev 14 · 6/7 ready', checkout);
+  pods(checkoutRs, ns, 'checkout-6d8f9c7b5', 7, 3);
+  const settings = add('ConfigMap', ns, 'checkout-settings');
+  const stripe = add('Secret', ns, 'stripe-api');
+  const registry = add('Secret', ns, 'registry-pull', 'Missing', 'Referenced but not found');
+  link(checkout, settings, 'uses');
+  link(checkout, stripe, 'uses');
+  link(checkout, registry, 'uses');
+  const ledgerSvc = add('Service', ns, 'ledger-db', 'Healthy', 'ClusterIP :5432');
+  const ledger = add('StatefulSet', ns, 'ledger-db', 'Healthy', '2/2 ready');
+  link(ledgerSvc, ledger, 'selects');
+  pods(ledger, ns, 'ledger-db', 2);
+  nodes.filter((node) => node.owner === ledger).forEach((node, index) => { node.name = `ledger-db-${index}`; node.id = `Pod/${ns}/ledger-db-${index}`; });
+  edges.filter((edge) => edge.from === ledger).forEach((edge, index) => { edge.to = `Pod/${ns}/ledger-db-${index}`; });
+  const claim = add('PersistentVolumeClaim', ns, 'data-ledger-db', 'Healthy', 'Bound · 50Gi · gp3');
+  link(ledger, claim, 'uses');
+  link(ledger, settings, 'uses');
+  const cron = add('CronJob', ns, 'settlement-report', 'Healthy', '0 2 * * *');
+  const job = add('Job', ns, 'settlement-report-29311', 'Healthy', '1/1 complete', cron);
+  add('Pod', ns, 'settlement-report-29311-5kq8d', 'Healthy', 'Succeeded · 0/1 ready', job);
+  link(cron, stripe, 'uses');
+  add('Service', ns, 'legacy-webhook', 'Degraded', 'ClusterIP :9000 · no matching pods');
+
+  const web = 'storefront';
+  const ingress = add('Ingress', web, 'storefront', 'Healthy', 'shop.acme.example.com · nginx');
+  const webSvc = add('Service', web, 'storefront', 'Healthy', 'ClusterIP :80');
+  const apiSvc = add('Service', web, 'catalog-api', 'Healthy', 'ClusterIP :8080');
+  link(ingress, webSvc, 'routes');
+  link(ingress, apiSvc, 'routes');
+  const front = add('Deployment', web, 'storefront', 'Healthy', '3/3 ready');
+  const api = add('Deployment', web, 'catalog-api', 'Healthy', '2/2 ready');
+  link(webSvc, front, 'selects');
+  link(apiSvc, api, 'selects');
+  const frontRs = add('ReplicaSet', web, 'storefront-7c9d8f6b4', 'Healthy', 'rev 31 · 3/3 ready', front);
+  const apiRs = add('ReplicaSet', web, 'catalog-api-5f7b9d', 'Healthy', 'rev 9 · 2/2 ready', api);
+  pods(frontRs, web, 'storefront-7c9d8f6b4', 3);
+  pods(apiRs, web, 'catalog-api-5f7b9d', 2);
+  const flags = add('ConfigMap', web, 'feature-flags');
+  link(front, flags, 'uses');
+  link(api, flags, 'uses');
+  link(api, add('Secret', web, 'catalog-db'), 'uses');
+  const cache = add('DaemonSet', web, 'edge-cache', 'Healthy', '4/4 ready');
+  pods(cache, web, 'edge-cache', 4);
+
+  const scope = String((args.request as Record<string, unknown> | undefined)?.namespace || 'all namespaces');
+  const keep = (namespace: string) => scope === 'all namespaces' || scope === namespace;
+  const kept = new Set(nodes.filter((node) => keep(node.namespace)).map((node) => node.id));
+  return { nodes: nodes.filter((node) => kept.has(node.id)), edges: edges.filter((edge) => kept.has(edge.from) && kept.has(edge.to)), warnings: [] as string[] };
+}

@@ -37,7 +37,7 @@ export type ArgoApp = {
 };
 
 export type ArgoResource = { group: string; version: string; kind: string; name: string; namespace: string; sync: string; health: string; healthMessage: string; requiresPruning: boolean; hook: boolean };
-export type ArgoSourceDetail = { repoURL: string; repo: string; path: string; chart: string; targetRevision: string; type: 'Helm' | 'Kustomize' | 'Directory' | 'Plugin'; parameters: { name: string; value: string }[]; valueFiles: string[] };
+export type ArgoSourceDetail = { repoURL: string; repo: string; path: string; chart: string; targetRevision: string; type: 'Helm' | 'Kustomize' | 'Directory' | 'Plugin'; parameters: { name: string; value: string }[]; valueFiles: string[]; values: string; options: { label: string; value: string }[] };
 export type ArgoHistoryEntry = { id: number; revision: string; deployedAt: string; startedAt: string; initiatedBy: string; source: string };
 export type ArgoSyncResult = { group: string; kind: string; name: string; namespace: string; status: string; message: string; hookPhase: string; syncPhase: string };
 export type ArgoOperation = { phase: string; message: string; startedAt: string; finishedAt: string; initiatedBy: string; revision: string; dryRun: boolean; prune: boolean; retryCount: number; results: ArgoSyncResult[] };
@@ -60,6 +60,31 @@ function sourceDetail(source: Manifest): ArgoSourceDetail {
     ...list(plugin.env).map((env) => ({ name: text(env.name), value: text(env.value) })),
   ];
   if (text(helm.releaseName)) parameters.unshift({ name: 'releaseName', value: text(helm.releaseName) });
+  // Inline Helm values: a YAML string, or a structured object shown as JSON.
+  const values = text(helm.values) || (Object.keys(record(helm.valuesObject)).length ? JSON.stringify(helm.valuesObject, null, 2) : '');
+  const directory = record(source.directory);
+  const options: { label: string; value: string }[] = [];
+  const option = (label: string, value: unknown) => {
+    const shown = typeof value === 'boolean' ? (value ? 'Yes' : '') : Array.isArray(value) ? value.map(text).filter(Boolean).join(', ') : typeof value === 'object' && value ? Object.entries(record(value)).map(([key, item]) => `${key}=${text(item)}`).join(', ') : text(value);
+    if (shown) options.push({ label, value: shown });
+  };
+  option('Helm version', helm.version);
+  option('Skip CRDs', helm.skipCrds);
+  option('Pass credentials', helm.passCredentials);
+  option('Ignore missing value files', helm.ignoreMissingValueFiles);
+  option('Name prefix', kustomize.namePrefix);
+  option('Name suffix', kustomize.nameSuffix);
+  option('Namespace', kustomize.namespace);
+  option('Common labels', kustomize.commonLabels);
+  option('Common annotations', kustomize.commonAnnotations);
+  option('Replicas', list(kustomize.replicas).map((replica) => `${text(replica.name)}=${text(replica.count)}`));
+  option('Components', kustomize.components);
+  option('Patches', list(kustomize.patches).length ? `${list(kustomize.patches).length} patch${list(kustomize.patches).length === 1 ? '' : 'es'}` : '');
+  option('Kustomize version', kustomize.version);
+  option('Recurse', directory.recurse);
+  option('Include', directory.include);
+  option('Exclude', directory.exclude);
+  option('Plugin', plugin.name);
   return {
     repoURL: text(source.repoURL),
     repo: text(source.repoURL).replace(/^https?:\/\//, '').replace(/\.git$/, ''),
@@ -69,6 +94,8 @@ function sourceDetail(source: Manifest): ArgoSourceDetail {
     type,
     parameters,
     valueFiles: Array.isArray(helm.valueFiles) ? helm.valueFiles.map(text).filter(Boolean) : [],
+    values,
+    options,
   };
 }
 
