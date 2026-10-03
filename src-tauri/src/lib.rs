@@ -526,6 +526,11 @@ struct ClusterOverview {
     totals: ClusterTotals,
     metrics_available: bool,
     observed_at: String,
+    /// When metrics-server took the newest sample, and how often it samples.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metrics_sampled_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metrics_window_seconds: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1986,8 +1991,64 @@ async fn read_cluster_overview(
 
 pub(crate) type NodeMetricMap = HashMap<String, (Option<String>, Option<String>)>;
 
+/// One read of the Metrics API: usage per node plus when metrics-server sampled it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct NodeMetricSamples {
+    pub usage: NodeMetricMap,
+    /// The newest sample time across nodes (RFC 3339).
+    pub sampled_at: Option<String>,
+    /// metrics-server's sampling window, in seconds.
+    pub window_seconds: Option<f64>,
+    /// Changes only when metrics-server publishes a new sample for some node.
+    pub fingerprint: String,
+}
+
+pub(crate) fn node_metric_samples(items: Vec<DynamicObject>) -> NodeMetricSamples {
+    let mut samples = NodeMetricSamples::default();
+    let mut parts = Vec::new();
+    for metric in items {
+        let Some(name) = metric.metadata.name.clone() else {
+            continue;
+        };
+        let text = |pointer: &str| {
+            metric
+                .data
+                .pointer(pointer)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        let (cpu, memory, timestamp) = (
+            text("/usage/cpu"),
+            text("/usage/memory"),
+            text("/timestamp"),
+        );
+        if let Some(window) =
+            text("/window").and_then(|window| window.trim_end_matches('s').parse::<f64>().ok())
+        {
+            samples.window_seconds = Some(
+                samples
+                    .window_seconds
+                    .map_or(window, |current: f64| current.max(window)),
+            );
+        }
+        if timestamp.as_deref() > samples.sampled_at.as_deref() {
+            samples.sampled_at = timestamp.clone();
+        }
+        parts.push(format!(
+            "{name}:{}:{}:{}",
+            timestamp.unwrap_or_default(),
+            cpu.as_deref().unwrap_or_default(),
+            memory.as_deref().unwrap_or_default()
+        ));
+        samples.usage.insert(name, (cpu, memory));
+    }
+    parts.sort();
+    samples.fingerprint = parts.join("|");
+    samples
+}
+
 /// Node metrics are optional (the metrics-server may not be installed).
-pub(crate) async fn read_node_metrics(client: Client) -> Option<NodeMetricMap> {
+pub(crate) async fn read_node_metric_samples(client: Client) -> Option<NodeMetricSamples> {
     let node_metrics_resource = ApiResource {
         group: "metrics.k8s.io".to_string(),
         version: "v1beta1".to_string(),
@@ -1996,34 +2057,8 @@ pub(crate) async fn read_node_metrics(client: Client) -> Option<NodeMetricMap> {
         plural: "nodes".to_string(),
     };
     let metrics_api = Api::<DynamicObject>::all_with(client, &node_metrics_resource);
-    metrics_api
-        .list(&ListParams::default())
-        .await
-        .ok()
-        .map(|response| {
-            response
-                .items
-                .into_iter()
-                .filter_map(|metric| {
-                    let name = metric.metadata.name?;
-                    Some((
-                        name,
-                        (
-                            metric
-                                .data
-                                .pointer("/usage/cpu")
-                                .and_then(Value::as_str)
-                                .map(str::to_string),
-                            metric
-                                .data
-                                .pointer("/usage/memory")
-                                .and_then(Value::as_str)
-                                .map(str::to_string),
-                        ),
-                    ))
-                })
-                .collect::<HashMap<_, _>>()
-        })
+    let response = metrics_api.list(&ListParams::default()).await.ok()?;
+    Some(node_metric_samples(response.items))
 }
 
 async fn read_cluster_overview_inner(
@@ -2035,10 +2070,23 @@ async fn read_cluster_overview_inner(
     // Metrics API never delays the cluster overview itself.
     let nodes_api = Api::<Node>::all(client.clone());
     let nodes_params = ListParams::default();
-    let (metrics, nodes_response) =
-        tokio::join!(read_node_metrics(client), nodes_api.list(&nodes_params));
+    let (samples, nodes_response) = tokio::join!(
+        read_node_metric_samples(client),
+        nodes_api.list(&nodes_params)
+    );
     let node_items = nodes_response.map_err(|error| error.to_string())?.items;
-    Ok(build_cluster_overview(node_items, metrics))
+    Ok(overview_with_samples(node_items, samples.as_ref()))
+}
+
+pub(crate) fn overview_with_samples(
+    node_items: Vec<Node>,
+    samples: Option<&NodeMetricSamples>,
+) -> ClusterOverview {
+    let mut overview =
+        build_cluster_overview(node_items, samples.map(|samples| samples.usage.clone()));
+    overview.metrics_sampled_at = samples.and_then(|samples| samples.sampled_at.clone());
+    overview.metrics_window_seconds = samples.and_then(|samples| samples.window_seconds);
+    overview
 }
 
 /// Builds the Overview from Nodes and optional metrics; the live feed reuses it on every change.
@@ -2302,6 +2350,8 @@ pub(crate) fn build_cluster_overview(
         totals,
         metrics_available,
         observed_at: Utc::now().to_rfc3339(),
+        metrics_sampled_at: None,
+        metrics_window_seconds: None,
     }
 }
 

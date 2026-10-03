@@ -9,7 +9,8 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const BATCH_INTERVAL: Duration = Duration::from_millis(50);
-const METRICS_INTERVAL: Duration = Duration::from_secs(15);
+// Metrics cannot be watched; poll often and publish only when metrics-server has a new sample.
+const METRICS_INTERVAL: Duration = Duration::from_secs(3);
 const EVENT_SNAPSHOT_LIMIT: u32 = 500;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -329,7 +330,7 @@ async fn run_overview_feed(
             let nodes_api = Api::<Node>::all(client.clone());
             let list_params = ListParams::default();
             let (metrics, listed) = tokio::join!(
-                read_node_metrics(client.clone()),
+                read_node_metric_samples(client.clone()),
                 nodes_api.list(&list_params)
             );
             let listed = listed.map_err(|error| {
@@ -348,10 +349,10 @@ async fn run_overview_feed(
             let mut metrics = metrics;
             let mut last = String::new();
             let mut publish = |nodes: &BTreeMap<String, Node>,
-                               metrics: &Option<NodeMetricMap>,
+                               metrics: &Option<NodeMetricSamples>,
                                publisher: &mut FeedPublisher| {
                 let overview =
-                    build_cluster_overview(nodes.values().cloned().collect(), metrics.clone());
+                    overview_with_samples(nodes.values().cloned().collect(), metrics.as_ref());
                 let fingerprint = overview_fingerprint(&overview);
                 if fingerprint != last {
                     last = fingerprint;
@@ -378,9 +379,12 @@ async fn run_overview_feed(
                     _ = resume_signal().notified() => return Ok(()),
                     _ = flush.tick() => if dirty { dirty = false; publish(&nodes, &metrics, publisher); },
                     _ = metrics_tick.tick() => {
-                        if let Ok(next) = tokio::time::timeout(Duration::from_secs(10), read_node_metrics(client.clone())).await {
-                            metrics = next;
-                            dirty = true;
+                        // Only a new sample from metrics-server changes anything; repeated reads are free.
+                        if let Ok(Some(next)) = tokio::time::timeout(Duration::from_secs(10), read_node_metric_samples(client.clone())).await {
+                            if metrics.as_ref().map(|current| current.fingerprint.as_str()) != Some(next.fingerprint.as_str()) {
+                                metrics = Some(next);
+                                dirty = true;
+                            }
                         }
                     }
                     event = stream.next() => match event {
@@ -483,6 +487,27 @@ mod tests {
             overview_fingerprint(&first),
             overview_fingerprint(&with_metrics)
         );
+    }
+
+    #[test]
+    fn metric_samples_change_only_when_metrics_server_resamples() {
+        let sample = |timestamp: &str, cpu: &str| -> DynamicObject {
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "metrics.k8s.io/v1beta1", "kind": "NodeMetrics",
+                "metadata": { "name": "worker-1" },
+                "timestamp": timestamp, "window": "15.012s",
+                "usage": { "cpu": cpu, "memory": "2Gi" }
+            }))
+            .unwrap()
+        };
+        let first = node_metric_samples(vec![sample("2026-10-02T10:00:00Z", "500m")]);
+        let repeat = node_metric_samples(vec![sample("2026-10-02T10:00:00Z", "500m")]);
+        let next = node_metric_samples(vec![sample("2026-10-02T10:00:15Z", "650m")]);
+        assert_eq!(first.fingerprint, repeat.fingerprint);
+        assert_ne!(first.fingerprint, next.fingerprint);
+        assert_eq!(next.sampled_at.as_deref(), Some("2026-10-02T10:00:15Z"));
+        assert_eq!(first.window_seconds, Some(15.012));
+        assert_eq!(next.usage["worker-1"].0.as_deref(), Some("650m"));
     }
 
     #[test]
