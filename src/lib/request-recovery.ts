@@ -33,6 +33,8 @@ export function resumeAction(state: ResumeState): ResumeAction {
     if (state.watchStatus === 'error') return 'restart-watch';
     return 'none';
   }
+  // A streaming feed is already current; only a plain snapshot view refreshes when old.
+  if (state.watchStatus === 'connected' || state.watchStatus === 'reconnecting') return 'none';
   if ((state.view === 'Overview' || state.view === 'Events') && state.snapshotAgeMs >= 60_000) return 'quiet-refresh';
   return 'none';
 }

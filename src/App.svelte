@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from 'svelte';
   import { LiveResourceStore, panePercent, type RowChange } from './lib/live-resources';
+  import { KeyedFeedStore, newestEvents, type FeedChange } from './lib/live-feed';
+  import { dragResize, percentOfContainer, widthFromDrag } from './lib/drag-resize';
   import { admissionPolicyView, isAdmissionPolicyKind, tokenizeCel, type CelEntry } from './lib/admission-policy';
   import { argoApplication, argoApplicationSet, argoProject, argoTone, isForbidden, resourcesByKind, summarizeArgo, type ArgoApp, type ArgoAppSet, type ArgoProject, type ArgoResource } from './lib/argocd';
   import { conditions as gatewayConditions, gatewayAddresses, gatewayListeners, routeHostnames, routeParents, routeRules, routesAttachedToGateway, routesTargetingService, type RouteSummary } from './lib/gateway-api';
@@ -32,6 +34,8 @@
     cpuUsage?: string;
     memoryUsage?: string;
     nodeName?: string;
+    /** Server-printed column values, aligned with the list's TableColumn definitions. */
+    cells?: string[];
   };
   type PodPort = { container: string; name?: string; port: number; protocol: string };
   type PodLogResponse = { lines: string[]; containers: string[]; selectedContainer?: string; ports: PodPort[] };
@@ -65,8 +69,9 @@
   type CliSession = { lines: CliLine[]; runId: string | null; running: boolean; startedAt: number; draft: string; open: boolean; expanded: boolean };
   type CliOutputEvent = { runId: string; chunks: { stream: 'stdout' | 'stderr'; text: string }[] };
   type CliExitEvent = { runId: string; exitCode?: number | null; success: boolean; cancelled: boolean; error?: string | null };
-  type ResourceSnapshot = { items: ResourceObject[]; resourceVersion: string };
-  type ResourceWatchSignal = { watchId: string; sequence: number; action: string; changes?: RowChange<ResourceObject>[]; items?: ResourceObject[]; resourceVersion?: string; error?: string };
+  type TableColumn = { name: string; type: string; priority: number };
+  type ResourceSnapshot = { items: ResourceObject[]; resourceVersion: string; columns?: TableColumn[] };
+  type ResourceWatchSignal = { watchId: string; sequence: number; action: string; changes?: RowChange<ResourceObject>[]; items?: ResourceObject[]; resourceVersion?: string; error?: string; columns?: TableColumn[] };
   type ResourceWatchStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'error';
   type LiveDataStatus = 'loading' | 'live' | 'loaded' | 'stale' | 'paused' | 'unavailable';
   type LiveRefreshContext = { clusterId: string; view: View; dataKey: string };
@@ -213,6 +218,12 @@
   let resourceNavigatorWidth = 272;
   let resourceObjectPaneWidth = 300;
   let workloadListPercent = 38;
+  // Draggable layout: Logs page split, Argo CD list/details, and Name columns (0 = automatic).
+  let logSidebarWidth = 258;
+  let argoListPercent = 60;
+  let workloadNameWidth = 0;
+  let resourceNameWidth = 0;
+  const layoutStorageKeys = { logSidebar: 'kuberniva.log-sidebar-width.v1', argoList: 'kuberniva.argo-list-percent.v1', workloadName: 'kuberniva.workload-name-width.v1', resourceName: 'kuberniva.resource-name-width.v1' };
   let stopWorkloadPaneResize: (() => void) | undefined;
   let accessDecisions: Record<string, AccessReviewDecision> = {};
   let catalogPermissionsReady = false;
@@ -271,6 +282,17 @@
   // Without watch permission the list still refreshes, from periodic snapshots.
   let liveSnapshotPollTimer: ReturnType<typeof window.setInterval> | undefined;
   let liveStoreVersion = '';
+  // Live feeds for Overview, Events, and Argo CD: one snapshot, then 50 ms batches from the backend.
+  type LiveFeedKind = 'overview' | 'events' | 'manifests';
+  type LiveFeedStatus = 'idle' | 'connecting' | 'live' | 'reconnecting' | 'unavailable';
+  type LiveFeedSignal = { feedId: string; sequence: number; action: string; overview?: ClusterOverview; items?: { key: string; item: unknown }[]; changes?: FeedChange<unknown>[]; error?: string };
+  let liveFeedId = '';
+  let liveFeedKind: LiveFeedKind | '' = '';
+  let liveFeedClusterId = '';
+  let liveFeedSequence = 0;
+  let liveFeedStatus: LiveFeedStatus = 'idle';
+  let liveFeedUnlisten: (() => void) | undefined;
+  let keyedFeed = new KeyedFeedStore<unknown>();
   const visualQaRecoveryScenario = import.meta.env.DEV ? new URLSearchParams(window.location.search).get('visual-qa') || '' : '';
   const visualQaRecoveryEnabled = import.meta.env.DEV && ['recovery-workloads', 'recovery-editing', 'recovery-timeout'].includes(visualQaRecoveryScenario);
   let removeVisualQaRecoveryControl: (() => void) | undefined;
@@ -309,6 +331,8 @@
   const clusterSessionCache = new Map<string, ClusterSession>();
   const resourceObjectCache = new Map<string, ResourceObject[]>();
   const resourceSnapshotVersions = new Map<string, string>();
+  // Column definitions from the server's Table rendering, per list.
+  let tableColumns: Record<string, TableColumn[]> = {};
   const liveDataUpdatedAt = new Map<string, number>();
   const liveDataStaleAfterMs = 120_000;
   const workspaceStorageKey = 'kuberniva.workspace.v1';
@@ -362,6 +386,11 @@
       : liveDataStatus === 'stale' ? 'Stale'
         : liveDataStatus === 'loaded' ? 'Loaded'
           : liveDataStatus === 'unavailable' ? 'Unavailable' : 'Live';
+  $: pageLive = ['Workloads', 'Resources'].includes(activeView)
+    ? { state: liveDataStatus === 'live' ? 'live' : liveDataStatus === 'loading' ? 'loading' : liveDataStatus === 'unavailable' ? 'error' : ['stale', 'paused'].includes(liveDataStatus) ? 'warn' : 'idle', text: liveDataStatusText, tooltip: liveDataStatusTooltip }
+    : ['Overview', 'Events', 'Argo CD'].includes(activeView)
+      ? { state: liveFeedStatus === 'live' ? 'live' : liveFeedStatus === 'connecting' ? 'loading' : liveFeedStatus === 'reconnecting' ? 'warn' : liveFeedStatus === 'unavailable' ? 'idle' : 'idle', text: liveFeedStatus === 'live' ? 'Live' : liveFeedStatus === 'connecting' ? 'Connecting' : liveFeedStatus === 'reconnecting' ? 'Reconnecting' : liveFeedStatus === 'unavailable' ? 'Snapshot' : 'Loaded', tooltip: liveFeedStatus === 'live' ? 'Streaming changes from the cluster' : liveFeedStatus === 'reconnecting' ? 'Reconnecting in the background; showing the last data' : liveFeedStatus === 'unavailable' ? 'Live updates are not available here; data refreshes periodically' : 'Connecting to live updates' }
+      : null;
   $: liveDataStatusTooltip = liveDataStatusMessage
     || (liveDataStatus === 'live' ? 'Live updates are current'
       : liveDataStatus === 'loading' ? 'Loading the current Kubernetes API snapshot'
@@ -459,8 +488,14 @@
   $: if (activeClusterId !== cliSessionClusterId) swapCliSession(activeClusterId);
   $: workloadDetailOpen = (editorResource?.category === 'Workloads' && editorObject !== null) || (workloadDetailMode === 'logs' && logTarget !== null);
   // A list dragged wider than the details gets its full columns back.
-  $: workloadColumns = buildWorkloadColumns(workloadResource?.kind === 'Pod', namespace === 'all namespaces', !workloadDetailOpen || workloadListPercent >= 62 ? 'full' : workloadListPercent >= 46 ? 'medium' : 'compact');
+  $: workloadColumns = buildWorkloadColumns(workloadResource?.kind === 'Pod', namespace === 'all namespaces', !workloadDetailOpen || workloadListPercent >= 62 ? 'full' : workloadListPercent >= 46 ? 'medium' : 'compact', workloadServerColumns, workloadNameWidth);
   $: workloadGridColumns = `${workloadColumns.map((column) => column.width).join(' ')} 18px`;
+  $: workloadServerColumns = workloadResource && !(workloadResource.kind === 'Pod' && !workloadResource.group)
+    ? serverColumnsFor(tableColumns[resourceObjectCacheKey(activeClusterId, workloadResource, namespace)])
+    : [];
+  $: resourceServerColumns = selectedResource && !(selectedResource.kind === 'Pod' && !selectedResource.group)
+    ? serverColumnsFor(tableColumns[resourceObjectCacheKey(activeClusterId, selectedResource, namespace)])
+    : [];
   $: workloadSearchNeedle = workloadSearch.trim().toLowerCase();
   $: visibleWorkloadObjects = filterObjects(workloadObjects, workloadSearchNeedle);
   $: visibleResourceObjects = filterObjects(resourceObjects, resourceObjectSearch.trim().toLowerCase());
@@ -545,11 +580,23 @@
     return openingLogsTarget?.key === logOpeningKey(kind, object);
   }
 
-  /** Matches name, namespace, status (Running, Failed, …), and node, ignoring case. */
+  /** Matches name, namespace, status (Running, Failed, …), node, and server columns, ignoring case. */
   function filterObjects(objects: ResourceObject[], query: string) {
     const tokens = searchTokens(query);
     if (!tokens.length) return objects;
-    return objects.filter((object) => matchesSearch(tokens, [object.name, object.namespace, object.status ? workloadStatusLabel(object) : '', object.nodeName]));
+    return objects.filter((object) => matchesSearch(tokens, [object.name, object.namespace, object.status ? workloadStatusLabel(object) : '', object.nodeName, ...(object.cells || [])]));
+  }
+
+  /** The columns `kubectl get` prints by default, minus the ones Kuberniva already shows. */
+  function serverColumnsFor(columns: TableColumn[] | undefined) {
+    return (columns || [])
+      .map((column, index) => ({ ...column, index }))
+      .filter((column) => column.priority === 0 && !['name', 'namespace', 'age', 'created at'].includes(column.name.toLowerCase()));
+  }
+
+  function rememberTableColumns(key: string, columns: TableColumn[] | undefined) {
+    if (!columns) return;
+    tableColumns = { ...tableColumns, [key]: columns };
   }
 
   function resetObjectSearch(..._dependencies: unknown[]) {
@@ -1496,7 +1543,7 @@
   async function restoreVisualQaScenario() {
     if (!import.meta.env.DEV) return false;
     const scenario = new URLSearchParams(window.location.search).get('visual-qa');
-    if (!scenario || (!visualQaRecoveryEnabled && !['overview', 'workloads', 'workloads-first-open', 'workload-details', 'pod-details', 'workload-logs', 'workload-yaml', 'resources', 'custom-apis', 'resources-directory', 'custom-directory', 'overview-large', 'events', 'workloads-large', 'argocd', 'gateway', 'httproute', 'admission-policy', 'workload-terminal', 'update-available', 'configuration', 'configuration-many', 'secret', 'permissions-readonly'].includes(scenario))) return false;
+    if (!scenario || (!visualQaRecoveryEnabled && !['overview', 'workloads', 'workloads-first-open', 'workload-details', 'pod-details', 'workload-logs', 'workload-yaml', 'resources', 'custom-apis', 'resources-directory', 'custom-directory', 'overview-large', 'events', 'workloads-large', 'argocd', 'gateway', 'httproute', 'admission-policy', 'workload-terminal', 'update-available', 'services', 'configuration', 'configuration-many', 'secret', 'permissions-readonly'].includes(scenario))) return false;
     const fixtures = await import('./dev/visual-qa-fixtures');
     const qaCluster = fixtures.visualQaCluster as Cluster;
     const directoryScenario = scenario === 'resources-directory' || scenario === 'custom-directory';
@@ -1537,6 +1584,8 @@
       const showPodDetail = scenario === 'pod-details';
       activeView = 'Workloads';
       workloadResource = qaResources.find((resource) => resource.kind === (showWorkloadDetail && !showPodDetail ? 'Deployment' : 'Pod')) || null;
+      const deploymentResource = qaResources.find((resource) => resource.kind === 'Deployment');
+      if (deploymentResource) rememberTableColumns(resourceObjectCacheKey(qaCluster.id, deploymentResource, namespace), fixtures.visualQaDeploymentColumns);
       workloadObjects = scenario === 'workloads-first-open'
         ? []
         : showWorkloadDetail && !showPodDetail
@@ -1642,11 +1691,12 @@
       loadingEditor = false;
     } else {
       activeView = 'Resources';
-      const selectedKind = scenario === 'secret' ? 'Secret' : scenario === 'custom-apis' ? 'TenantPolicy' : 'ConfigMap';
+      const selectedKind = scenario === 'secret' ? 'Secret' : scenario === 'custom-apis' ? 'TenantPolicy' : scenario === 'services' ? 'Service' : 'ConfigMap';
       selectedResource = directoryScenario ? null : qaResources.find((resource) => resource.kind === selectedKind) || null;
       selectedCategory = scenario === 'custom-apis' || scenario === 'custom-directory' ? 'Custom Resources' : 'Configuration';
       sidebarResourceCategory = selectedCategory;
-      resourceObjects = (scenario === 'custom-apis' ? fixtures.visualQaCustomObjects : fixtures.visualQaConfigMaps) as ResourceObject[];
+      resourceObjects = (scenario === 'custom-apis' ? fixtures.visualQaCustomObjects : scenario === 'services' ? fixtures.visualQaServices : fixtures.visualQaConfigMaps) as ResourceObject[];
+      if (scenario === 'services' && selectedResource) rememberTableColumns(resourceObjectCacheKey(qaCluster.id, selectedResource, namespace), fixtures.visualQaServiceColumns);
       loadingObjects = false;
       if (selectedResource) {
         const key = resourceObjectCacheKey(qaCluster.id, selectedResource, namespace);
@@ -1733,6 +1783,126 @@
   function stopOverviewRefresh() {
     if (overviewRefreshTimer) window.clearInterval(overviewRefreshTimer);
     overviewRefreshTimer = undefined;
+  }
+
+  function liveFeedKindForView(view: View): LiveFeedKind | '' {
+    if (view === 'Overview') return 'overview';
+    if (view === 'Events') return 'events';
+    if (view === 'Argo CD' && argoApplicationResource) return 'manifests';
+    return '';
+  }
+
+  function stopLiveFeed() {
+    const id = liveFeedId;
+    liveFeedId = '';
+    liveFeedKind = '';
+    liveFeedClusterId = '';
+    liveFeedSequence = 0;
+    liveFeedStatus = 'idle';
+    keyedFeed = new KeyedFeedStore<unknown>();
+    if (id && '__TAURI_INTERNALS__' in window) {
+      void import('@tauri-apps/api/core').then(({ invoke }) => invoke('stop_resource_watch', { watchId: id })).catch(() => undefined);
+    }
+  }
+
+  /** Starts (or keeps) the live feed that matches the current view. */
+  async function syncLiveFeed() {
+    const kind = activeClusterId ? liveFeedKindForView(activeView) : '';
+    if (kind && kind === liveFeedKind && liveFeedId && liveFeedClusterId === activeClusterId) return;
+    stopLiveFeed();
+    if (!kind || !('__TAURI_INTERNALS__' in window)) return;
+    const id = `feed-${crypto.randomUUID()}`;
+    liveFeedId = id;
+    liveFeedKind = kind;
+    liveFeedClusterId = activeClusterId;
+    liveFeedStatus = 'connecting';
+    const resource = kind === 'manifests' ? argoApplicationResource : null;
+    const scope = argoScopeNote ? (namespace !== 'all namespaces' ? namespace : 'argocd') : 'all namespaces';
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+      await invoke('start_live_feed', {
+        feedId: id,
+        request: {
+          kubeconfigPath: activeKubeconfigPath || kubeconfigPath || null,
+          context: activeCluster,
+          kind,
+          resource: resource ? manifestListRequest(resource, scope).request : null,
+        },
+      });
+    } catch {
+      if (liveFeedId === id) {
+        liveFeedStatus = 'unavailable';
+        fallBackFromLiveFeed(kind);
+      }
+    }
+  }
+
+  /** Without a feed, views keep their previous periodic refresh. */
+  function fallBackFromLiveFeed(kind: LiveFeedKind) {
+    if (kind === 'overview' && activeView === 'Overview') {
+      void loadClusterOverview(true, Boolean(clusterOverview));
+      startOverviewRefresh();
+    } else if (kind === 'events' && activeView === 'Events') {
+      void loadClusterEvents(true, clusterEvents.length > 0);
+    }
+  }
+
+  function publishKeyedFeed() {
+    if (liveFeedKind === 'events') {
+      clusterEvents = newestEvents(keyedFeed.values() as ClusterEvent[]);
+      eventsClusterId = activeClusterId;
+      eventsObservedAt = new Date().toISOString();
+      eventsError = '';
+      loadingEvents = false;
+    } else if (liveFeedKind === 'manifests') {
+      argoApps = (keyedFeed.values() as Record<string, unknown>[]).map(argoApplication)
+        .sort((left, right) => left.namespace.localeCompare(right.namespace) || left.name.localeCompare(right.name));
+      argoClusterId = activeClusterId;
+      argoError = '';
+      loadingArgo = false;
+    }
+    lastConnectionVerifiedAt = Date.now();
+  }
+
+  function handleLiveFeedSignal(signal: LiveFeedSignal) {
+    if (signal.feedId !== liveFeedId || signal.sequence <= liveFeedSequence) return;
+    if (signal.sequence !== liveFeedSequence + 1) {
+      // A lost batch is repaired with a fresh feed and snapshot, never a partial view.
+      stopLiveFeed();
+      void syncLiveFeed();
+      return;
+    }
+    liveFeedSequence = signal.sequence;
+    if (signal.action === 'overview' && signal.overview) {
+      clusterOverview = signal.overview;
+      overviewError = '';
+      loadingOverview = false;
+      lastConnectionVerifiedAt = Date.now();
+      if (!signal.overview.nodes.some((node) => node.name === selectedNodeName)) selectedNodeName = signal.overview.nodes[0]?.name || '';
+    } else if (signal.action === 'reset') {
+      keyedFeed.reset(signal.items || []);
+      publishKeyedFeed();
+    } else if (signal.action === 'delta') {
+      if (keyedFeed.apply(signal.changes || [])) publishKeyedFeed();
+    } else if (signal.action === 'connected') {
+      liveFeedStatus = 'live';
+    } else if (signal.action === 'reconnecting') {
+      liveFeedStatus = 'reconnecting';
+    } else if (signal.action === 'forbidden') {
+      const kind = liveFeedKind;
+      liveFeedStatus = 'unavailable';
+      if (kind) fallBackFromLiveFeed(kind);
+    }
+  }
+
+  async function setupLiveFeedListener() {
+    if (!('__TAURI_INTERNALS__' in window)) return;
+    try {
+      const { listen } = await import('@tauri-apps/api/event');
+      liveFeedUnlisten = await listen<LiveFeedSignal>('kuberniva://live-feed', ({ payload }) => handleLiveFeedSignal(payload));
+    } catch {
+      liveFeedUnlisten = undefined;
+    }
   }
 
   function stopLiveObjectRefresh() {
@@ -1961,6 +2131,7 @@
     if (signal.action === 'resetBegin') { liveResourceStore.beginReset(); return; }
     if (signal.action === 'resetChunk') { liveResourceStore.stage(signal.items || []); return; }
     if (signal.action === 'resetEnd') {
+      rememberTableColumns(resourceWatchDataKey, signal.columns);
       if (liveResourceStore.finishReset()) publishLiveRows();
       return;
     }
@@ -2163,6 +2334,12 @@
     };
     window.addEventListener('pointermove', resize);
     window.addEventListener('pointerup', stopResize, { once: true });
+  }
+
+  /** Drag from the current rendered width when the column is still automatic. */
+  function columnWidthFromDrag(event: PointerEvent, start: { value: number; x: number; node: HTMLElement }) {
+    const base = start.value || (start.node.parentElement?.getBoundingClientRect().width ?? 200);
+    return Math.max(120, widthFromDrag(event, { value: base, x: start.x }));
   }
 
   function setWorkloadPanePercent(percent: number) {
@@ -2405,17 +2582,23 @@
     try {
       if (!await refreshClusterConnection(cluster)) return;
       if (refreshGeneration !== refreshViewGeneration || requestClusterId !== activeClusterId || requestView !== activeView || requestNamespace !== namespace) return;
-      if (requestView === 'Overview') {
-        await loadClusterOverview(true);
-        startOverviewRefresh();
-        return;
-      }
-      if (requestView === 'Events') {
-        await loadClusterEvents(true);
+      if (requestView === 'Overview' || requestView === 'Events') {
+        // A manual refresh after reconnecting restarts the feed with a fresh snapshot.
+        if ('__TAURI_INTERNALS__' in window) {
+          stopLiveFeed();
+          await syncLiveFeed();
+        } else if (requestView === 'Overview') {
+          await loadClusterOverview(true);
+          startOverviewRefresh();
+        } else {
+          await loadClusterEvents(true);
+        }
         return;
       }
       if (requestView === 'Argo CD') {
         await loadArgoApps(true);
+        stopLiveFeed();
+        await syncLiveFeed();
         return;
       }
       if (requestView === 'Workloads') {
@@ -2530,7 +2713,9 @@
 
   function queueLiveResumeRecovery(_hiddenDuration = 0) {
     if (!activeClusterId || !['Overview', 'Events', 'Workloads', 'Resources', 'Logs'].includes(activeView)) return;
-    const action = resumeAction({ view: activeView, watchStatus: resourceWatchStatus, connectionFailed: Boolean(catalogError), snapshotAgeMs: snapshotAgeMs() });
+    const feedView = activeView === 'Overview' || activeView === 'Events';
+    const watchStatus = feedView ? (liveFeedStatus === 'live' ? 'connected' : liveFeedStatus === 'reconnecting' ? 'reconnecting' : 'idle') : resourceWatchStatus;
+    const action = resumeAction({ view: activeView, watchStatus, connectionFailed: Boolean(catalogError), snapshotAgeMs: snapshotAgeMs() });
     if (action === 'none') return;
     if (action === 'quiet-refresh') {
       if (activeView === 'Overview') void loadClusterOverview(false, true);
@@ -2986,21 +3171,33 @@
       liveDataStatus = 'loading';
       liveDataStatusMessage = 'Waiting for live data';
     }
+    if (!liveFeedKindForView(view)) stopLiveFeed();
+    const liveFeeds = '__TAURI_INTERNALS__' in window;
     if (view === 'Overview' && activeClusterId) {
       stopLiveObjectRefresh();
-      void loadClusterOverview();
-      startOverviewRefresh();
+      if (liveFeeds) {
+        if (!clusterOverview) loadingOverview = true;
+        void syncLiveFeed();
+      } else {
+        void loadClusterOverview();
+        startOverviewRefresh();
+      }
       return;
     }
+    stopOverviewRefresh();
     if (view === 'Events' && activeClusterId) {
       stopLiveObjectRefresh();
-      void loadClusterEvents();
+      if (liveFeeds) {
+        if (!clusterEvents.length || eventsClusterId !== activeClusterId) loadingEvents = true;
+        void syncLiveFeed();
+      } else {
+        void loadClusterEvents();
+      }
       return;
     }
-    if (view !== 'Overview') stopOverviewRefresh();
     if (view === 'Argo CD') {
       stopLiveObjectRefresh();
-      void loadArgoApps(true);
+      void loadArgoApps(true).then(() => syncLiveFeed());
       return;
     }
     if (view === 'Resources') {
@@ -3083,6 +3280,7 @@
       workloadObjects = response;
       resourceObjectCache.set(cacheKey, response);
       resourceSnapshotVersions.set(cacheKey, snapshot.resourceVersion);
+      rememberTableColumns(cacheKey, snapshot.columns);
       reconcileWorkloadObjectSelection(response);
       markLiveDataAvailable(resource, requestClusterId, requestNamespace, 'Workloads');
       if (
@@ -3267,13 +3465,29 @@
   const commonResourceKinds = ['ConfigMap', 'Secret', 'Service', 'Ingress', 'PersistentVolumeClaim', 'ServiceAccount', 'Role', 'RoleBinding', 'NetworkPolicy', 'Gateway', 'HTTPRoute', 'StorageClass', 'PersistentVolume', 'Namespace', 'Node'];
   const recentResourcesStorageKey = 'kuberniva.recent-resources.v1';
 
-  type WorkloadColumnKey = 'name' | 'namespace' | 'node' | 'status' | 'ready' | 'restarts' | 'cpu' | 'memory' | 'age';
+  type WorkloadColumnKey = 'name' | 'namespace' | 'node' | 'status' | 'ready' | 'restarts' | 'cpu' | 'memory' | 'age' | `cell:${number}`;
 
   // Each fact gets its own aligned column; namespace appears only when it varies (all
   // namespaces). With details open (focus mode) the list narrows to name and status.
   /** Columns follow the list's width: compact beside open details, a middle tier when dragged wider, then everything. */
-  function buildWorkloadColumns(pod: boolean, allNamespaces: boolean, density: 'compact' | 'medium' | 'full') {
+  function buildWorkloadColumns(pod: boolean, allNamespaces: boolean, density: 'compact' | 'medium' | 'full', server: { name: string; index: number }[] = [], nameWidth = 0) {
+    const columns = buildWorkloadColumnsAuto(pod, allNamespaces, density, server);
+    // A dragged Name column keeps its width; the other columns share what is left.
+    if (nameWidth > 0) columns[0] = { ...columns[0], width: `${Math.round(nameWidth)}px` };
+    return columns;
+  }
+
+  function buildWorkloadColumnsAuto(pod: boolean, allNamespaces: boolean, density: 'compact' | 'medium' | 'full', server: { name: string; index: number }[]) {
     const columns: { key: WorkloadColumnKey; label: string; width: string }[] = [{ key: 'name', label: 'Name', width: 'minmax(170px, 2fr)' }];
+    if (!pod && server.length) {
+      // Deployments, StatefulSets, Jobs…: the server's own columns (Ready, Up-to-date, Completions…).
+      const shown = density === 'compact' ? server.slice(0, 1) : density === 'medium' ? server.slice(0, 3) : server;
+      if (density !== 'full') columns[0].width = 'minmax(0, 1fr)';
+      if (allNamespaces && density === 'full') columns.push({ key: 'namespace', label: 'Namespace', width: 'minmax(90px, .7fr)' });
+      for (const column of shown) columns.push({ key: `cell:${column.index}`, label: column.name, width: 'minmax(72px, .7fr)' });
+      if (density !== 'compact') columns.push({ key: 'age', label: 'Age', width: '44px' });
+      return columns;
+    }
     if (density === 'compact') return [{ key: 'name', label: 'Name', width: 'minmax(0, 1fr)' }, { key: 'status', label: 'Status', width: '88px' }] as typeof columns;
     if (density === 'medium') {
       columns[0].width = 'minmax(0, 1fr)';
@@ -5221,6 +5435,8 @@
     stopOverviewRefresh();
     stopLiveObjectRefresh();
     resourceWatchUnlisten?.();
+    liveFeedUnlisten?.();
+    stopLiveFeed();
     resourceWatchUnlisten = undefined;
     stopWindowFocusListening?.();
     stopWindowFocusListening = undefined;
@@ -5243,9 +5459,14 @@
     resourceNavigatorWidth = loadPaneSize(resourceNavigatorWidthStorageKey, 272, 220, 440);
     resourceObjectPaneWidth = loadPaneSize(resourceObjectPaneWidthStorageKey, 300, 180, 520);
     workloadListPercent = loadPaneSize(workloadPaneStorageKey, 38, 25, 70);
+    logSidebarWidth = loadPaneSize(layoutStorageKeys.logSidebar, 258, 180, 520);
+    argoListPercent = loadPaneSize(layoutStorageKeys.argoList, 60, 30, 75);
+    workloadNameWidth = loadPaneSize(layoutStorageKeys.workloadName, 0, 0, 900);
+    resourceNameWidth = loadPaneSize(layoutStorageKeys.resourceName, 0, 0, 900);
     void restoreWorkspace();
     void setupWindowFocusListener();
     resourceWatchListenerReady = setupResourceWatchListener();
+    void setupLiveFeedListener();
     const closeFloatingMenus = (event: PointerEvent) => {
       const target = event.target instanceof Element ? event.target : null;
       if (!target?.closest('.cluster-selector')) clusterPickerOpen = false;
@@ -5378,17 +5599,25 @@
   }
 
   function startClusterViewLoads() {
+    const liveFeeds = '__TAURI_INTERNALS__' in window;
     if (activeView === 'Overview') {
-      void loadClusterOverview();
-      startOverviewRefresh();
+      if (liveFeeds) {
+        loadingOverview = !clusterOverview;
+        void syncLiveFeed();
+      } else {
+        void loadClusterOverview();
+        startOverviewRefresh();
+      }
     } else if (activeView === 'Events') {
-      void loadClusterEvents(true);
+      if (liveFeeds) void syncLiveFeed();
+      else void loadClusterEvents(true);
     } else if (activeView === 'Argo CD') {
-      void loadArgoApps(true);
+      void loadArgoApps(true).then(() => syncLiveFeed());
     }
   }
 
   async function loadCluster(cluster: Cluster, force = false) {
+    stopLiveFeed();
     const connectionGeneration = ++connectionRequestGeneration;
     refreshViewGeneration += 1;
     refreshingCluster = false;
@@ -5860,6 +6089,7 @@
         resourceObjects = response;
         resourceObjectCache.set(cacheKey, response);
       resourceSnapshotVersions.set(cacheKey, snapshot.resourceVersion);
+        rememberTableColumns(cacheKey, snapshot.columns);
         reconcileResourceObjectSelection(response);
         markLiveDataAvailable(resource, requestClusterId, requestNamespace, 'Resources');
         if (!silent && activeView === 'Resources') startLiveObjectRefresh();
@@ -6021,7 +6251,7 @@
     <div class:resource-workspace-content={activeView === 'Resources'} class:workload-workspace-content={activeView === 'Workloads'} class="content">
       <div class:cluster-page-heading={activeView === 'Clusters'} class:resource-page-heading={activeView === 'Resources'} class="page-heading">
         <div>
-          <div class="title-line"><h1>{activeViewTitle}</h1>{#if activeClusterId && !catalogError}{#if ['Workloads', 'Resources'].includes(activeView)}<span class:live-status-loading={liveDataStatus === 'loading'} class:live-status-loaded={liveDataStatus === 'loaded'} class:live-status-stale={liveDataStatus === 'stale'} class:live-status-paused={liveDataStatus === 'paused'} class:live-status-unavailable={liveDataStatus === 'unavailable'} class="live-pill live-status-pill" title={liveDataStatusTooltip} aria-label={liveDataStatusTooltip} aria-live="polite"><b></b> {liveDataStatusText}</span>{:else}<span class="live-pill"><b></b> Live</span>{/if}{/if}</div>
+          <div class="title-line"><h1>{activeViewTitle}</h1>{#if activeClusterId && !catalogError && pageLive}<span class="live-pill live-state-{pageLive.state}" title={pageLive.tooltip} aria-label={pageLive.tooltip} aria-live="polite"><b></b> {pageLive.text}</span>{/if}</div>
           {#if pageContextCopy}<p>{pageContextCopy}</p>{/if}
         </div>
       </div>
@@ -6278,7 +6508,7 @@
             </div>
           {/if}
           {:else if argoTab === 'sets'}
-            <div class:argo-body-detail={selectedArgoSet} class="argo-body">
+            <div class:argo-body-detail={selectedArgoSet} class="argo-body" style:--argo-list-percent={`${Math.round(argoListPercent)}%`}>
               <div class="argo-table" role="table" aria-label="Argo CD ApplicationSets">
                 <div class="argo-row argo-set-row argo-row-head" role="row"><span>ApplicationSet</span><span>Generators</span><span>Apps</span><span>Status</span></div>
                 {#each visibleArgoSets as set (`${set.namespace}/${set.name}`)}
@@ -6290,6 +6520,7 @@
                   </button>
                 {:else}<div class="argo-empty"><GitBranch size={22} /><strong>{argoSets.length ? 'No ApplicationSets match' : 'No ApplicationSets found'}</strong></div>{/each}
               </div>
+              {#if selectedArgoSet}<!-- svelte-ignore a11y_no_noninteractive_tabindex --><div class="pane-splitter" role="separator" tabindex="0" aria-orientation="vertical" aria-label="Resize the list and details" use:dragResize={{ value: argoListPercent, min: 30, max: 75, reset: 60, step: 2, fromPointer: percentOfContainer, onChange: (value) => (argoListPercent = value), onCommit: (value) => savePaneSize(layoutStorageKeys.argoList, value) }}></div>{/if}
               {#if selectedArgoSet}
                 {@const set = selectedArgoSet}
                 <aside class="argo-details" aria-label={`${set.name} details`}>
@@ -6302,7 +6533,7 @@
               {/if}
             </div>
           {:else}
-            <div class:argo-body-detail={selectedArgoProject} class="argo-body">
+            <div class:argo-body-detail={selectedArgoProject} class="argo-body" style:--argo-list-percent={`${Math.round(argoListPercent)}%`}>
               <div class="argo-table" role="table" aria-label="Argo CD projects">
                 <div class="argo-row argo-set-row argo-row-head" role="row"><span>Project</span><span>Destinations</span><span>Apps</span><span>Roles</span></div>
                 {#each visibleArgoProjects as project (`${project.namespace}/${project.name}`)}
@@ -6314,6 +6545,7 @@
                   </button>
                 {:else}<div class="argo-empty"><GitBranch size={22} /><strong>{argoProjects.length ? 'No projects match' : 'No projects found'}</strong></div>{/each}
               </div>
+              {#if selectedArgoProject}<!-- svelte-ignore a11y_no_noninteractive_tabindex --><div class="pane-splitter" role="separator" tabindex="0" aria-orientation="vertical" aria-label="Resize the list and details" use:dragResize={{ value: argoListPercent, min: 30, max: 75, reset: 60, step: 2, fromPointer: percentOfContainer, onChange: (value) => (argoListPercent = value), onCommit: (value) => savePaneSize(layoutStorageKeys.argoList, value) }}></div>{/if}
               {#if selectedArgoProject}
                 {@const project = selectedArgoProject}
                 <aside class="argo-details" aria-label={`${project.name} details`}>
@@ -6460,13 +6692,13 @@
               </div>
             {:else}
             <div class:resource-workbench-inspecting={Boolean((editorObject || loadingEditor) && !configModalOpen)} class="resource-workbench-body resource-workbench-body-focused">
-              <aside class:resource-objects-single-namespace={Boolean(selectedResource && (namespace !== 'all namespaces' || !selectedResource.namespaced))} class="resource-object-browser" aria-label="Resource objects">
+              <aside class:resource-objects-single-namespace={Boolean(selectedResource && (namespace !== 'all namespaces' || !selectedResource.namespaced))} class:resource-object-table={resourceServerColumns.length > 0} style:--resource-server-columns={resourceServerColumns.map(() => 'minmax(72px, .8fr)').join(' ')} style:--resource-name-col={resourceNameWidth > 0 ? `${Math.round(resourceNameWidth)}px` : 'minmax(140px, 1.4fr)'} class="resource-object-browser" aria-label="Resource objects">
                 {#if selectedResource}
-                  <div class="resource-object-heading resource-pane-heading"><button type="button" class="resource-directory-back" aria-label="Back to all resource types" title="All resource types" on:click={showResourceDirectory}>←</button><div><span class:custom={selectedResource.crd} class="resource-pane-icon"><svelte:component this={resourceIcon(selectedResource)} size={16} strokeWidth={1.8} /></span><div><strong>{selectedResource.kind} objects</strong><small>{selectedResource.apiVersion} · {selectedResource.namespaced ? (namespace === 'all namespaces' ? 'All namespaces' : namespace) : 'Cluster-wide'}</small></div></div><span class:live-status-loading={liveDataStatus === 'loading'} class:live-status-loaded={liveDataStatus === 'loaded'} class:live-status-stale={liveDataStatus === 'stale'} class:live-status-paused={liveDataStatus === 'paused'} class:live-status-unavailable={liveDataStatus === 'unavailable'} class="live-list-status resource-live-status" title={liveDataStatusTooltip} aria-label={liveDataStatusTooltip} aria-live="polite"><i></i></span><b>{resourceObjects.length}</b></div>
+                  <div class="resource-object-heading resource-pane-heading"><button type="button" class="resource-directory-back" aria-label="Back to all resource types" title="All resource types" on:click={showResourceDirectory}>←</button><div><span class:custom={selectedResource.crd} class="resource-pane-icon"><svelte:component this={resourceIcon(selectedResource)} size={16} strokeWidth={1.8} /></span><div><strong>{selectedResource.kind} objects</strong><small>{selectedResource.apiVersion} · {selectedResource.namespaced ? (namespace === 'all namespaces' ? 'All namespaces' : namespace) : 'Cluster-wide'}</small></div></div><span class:live-status-loading={liveDataStatus === 'loading'} class:live-status-loaded={liveDataStatus === 'loaded'} class:live-status-stale={liveDataStatus === 'stale'} class:live-status-paused={liveDataStatus === 'paused'} class:live-status-unavailable={liveDataStatus === 'unavailable'} class:live-status-live={liveDataStatus === 'live'} class="live-list-status resource-live-status" title={liveDataStatusTooltip} aria-label={liveDataStatusTooltip} aria-live="polite"><i></i></span><b>{resourceObjects.length}</b></div>
                   <label class="resource-object-search"><Search size={13} /><input bind:value={resourceObjectSearch} placeholder={`Filter ${selectedResource.plural} by name, namespace, or status`} aria-label={`Filter ${selectedResource.plural}`} spellcheck="false" />{#if resourceObjectSearch}<span>{visibleResourceObjects.length}/{resourceObjects.length}</span><button type="button" aria-label="Clear filter" on:click={() => (resourceObjectSearch = '')}>×</button>{/if}</label>
-                  <div class="resource-object-columns" role="row" aria-label="Select shown resource objects">{#if selectedResourcePermissionSet.canDelete}<label class:resource-select-all-partial={resourceObjectsSelectionPartial} class="resource-select-all"><input type="checkbox" checked={allResourceObjectsSelected} disabled={deletingResource || loadingObjects || !visibleResourceObjects.length} aria-checked={resourceObjectsSelectionPartial ? 'mixed' : allResourceObjectsSelected ? 'true' : 'false'} aria-label={`Select all shown ${selectedResource.plural}`} on:change={toggleAllResourceObjects} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}<span>Name</span><span>Namespace</span><span>Age</span><span>Action</span></div>
+                  <div class="resource-object-columns" role="row" aria-label="Select shown resource objects">{#if selectedResourcePermissionSet.canDelete}<label class:resource-select-all-partial={resourceObjectsSelectionPartial} class="resource-select-all"><input type="checkbox" checked={allResourceObjectsSelected} disabled={deletingResource || loadingObjects || !visibleResourceObjects.length} aria-checked={resourceObjectsSelectionPartial ? 'mixed' : allResourceObjectsSelected ? 'true' : 'false'} aria-label={`Select all shown ${selectedResource.plural}`} on:change={toggleAllResourceObjects} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}<span class="column-head-resizable">Name{#if resourceServerColumns.length}<!-- svelte-ignore a11y_no_noninteractive_tabindex --><i class="column-resizer" role="separator" tabindex="0" aria-orientation="vertical" aria-label="Resize the Name column" title="Drag to resize · double-click to reset" use:dragResize={{ value: resourceNameWidth, min: 0, max: 900, reset: 0, step: 24, fromPointer: columnWidthFromDrag, onChange: (value) => (resourceNameWidth = value), onCommit: (value) => savePaneSize(layoutStorageKeys.resourceName, value) }}></i>{/if}</span>{#each resourceServerColumns as column}<span class="resource-server-cell" title={column.name}>{column.name}</span>{/each}<span class="resource-columns-namespace">Namespace</span><span>Age</span><span>Action</span></div>
                   {#if selectedResourceObjects.length && selectedResourcePermissionSet.canDelete}<div class="resource-bulk-toolbar" role="region" aria-label="Bulk resource actions"><span><strong>{selectedResourceObjects.length}</strong> selected</span><button class="destructive" type="button" disabled={deletingResource || loadingEditor || savingEditor || loadingYaml || savingYaml} on:click={() => requestBulkResourceDeletion(selectedResource!)}>Delete {selectedResourceObjects.length}</button><button class="resource-bulk-clear" type="button" disabled={deletingResource} on:click={clearResourceObjectSelection}>Clear</button></div>{/if}
-                  {#if loadingObjects}<div class="drawer-state"><i></i>Listing {selectedResource.plural}…</div>{:else if resourceObjects.length === 0}<div class="resource-object-empty"><span>○</span><strong>No {selectedResource.plural} found</strong><p>Try another namespace or use Refresh in the top bar.</p></div>{:else if visibleResourceObjects.length === 0}<div class="resource-object-empty"><span>○</span><strong>No {selectedResource.plural} match “{resourceObjectSearch}”</strong><p>Search matches name, namespace, and status.</p></div>{:else}<div class="object-list">{#each renderedResourceObjects as object}<div class:resource-object-row-selected={isResourceObjectSelected(object, selectedResourceKeySet)} class="resource-object-row">{#if selectedResourcePermissionSet.canDelete}<label class="resource-object-select"><input type="checkbox" checked={isResourceObjectSelected(object, selectedResourceKeySet)} disabled={deletingResource} aria-label={`Select ${selectedResource.kind} ${object.name}`} on:change={() => toggleResourceObjectSelection(object)} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}<button type="button" disabled={!selectedResourceCanOpen} aria-busy={selectedResource.kind === 'Pod' && isOpeningLogs('Pod', object)} class:object-selected={editorObject?.name === object.name && editorObject?.namespace === object.namespace} on:click={() => openObject(selectedResource!, object)}><div class="resource-object-primary"><strong>{object.name}</strong></div><span class="resource-object-namespace">{object.namespace || 'cluster scoped'}</span><small class="resource-object-age">{object.createdAt ? resourceAge(object.createdAt) : '—'}</small><span class="resource-object-action">{selectedResourceCanOpen ? (selectedResource.kind === 'Pod' ? (isOpeningLogs('Pod', object) ? 'Opening…' : 'Logs →') : 'Open →') : ''}</span></button></div>{/each}{#if visibleResourceObjects.length > resourceRenderLimit}<div class="list-reveal-sentinel" use:revealOnView={() => (resourceRenderLimit += LIST_RENDER_BATCH * 2)}>Showing {resourceRenderLimit.toLocaleString()} of {visibleResourceObjects.length.toLocaleString()} · scroll for more</div>{/if}</div>{/if}
+                  {#if loadingObjects}<div class="drawer-state"><i></i>Listing {selectedResource.plural}…</div>{:else if resourceObjects.length === 0}<div class="resource-object-empty"><span>○</span><strong>No {selectedResource.plural} found</strong><p>Try another namespace or use Refresh in the top bar.</p></div>{:else if visibleResourceObjects.length === 0}<div class="resource-object-empty"><span>○</span><strong>No {selectedResource.plural} match “{resourceObjectSearch}”</strong><p>Search matches name, namespace, and status.</p></div>{:else}<div class="object-list">{#each renderedResourceObjects as object}<div class:resource-object-row-selected={isResourceObjectSelected(object, selectedResourceKeySet)} class="resource-object-row">{#if selectedResourcePermissionSet.canDelete}<label class="resource-object-select"><input type="checkbox" checked={isResourceObjectSelected(object, selectedResourceKeySet)} disabled={deletingResource} aria-label={`Select ${selectedResource.kind} ${object.name}`} on:change={() => toggleResourceObjectSelection(object)} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}<button type="button" disabled={!selectedResourceCanOpen} aria-busy={selectedResource.kind === 'Pod' && isOpeningLogs('Pod', object)} class:object-selected={editorObject?.name === object.name && editorObject?.namespace === object.namespace} on:click={() => openObject(selectedResource!, object)}><div class="resource-object-primary"><strong>{object.name}</strong></div>{#each resourceServerColumns as column}<span class="resource-server-cell" title={object.cells?.[column.index] || ''}>{object.cells?.[column.index] || '—'}</span>{/each}<span class="resource-object-namespace">{object.namespace || 'cluster scoped'}</span><small class="resource-object-age">{object.createdAt ? resourceAge(object.createdAt) : '—'}</small><span class="resource-object-action">{selectedResourceCanOpen ? (selectedResource.kind === 'Pod' ? (isOpeningLogs('Pod', object) ? 'Opening…' : 'Logs →') : 'Open →') : ''}</span></button></div>{/each}{#if visibleResourceObjects.length > resourceRenderLimit}<div class="list-reveal-sentinel" use:revealOnView={() => (resourceRenderLimit += LIST_RENDER_BATCH * 2)}>Showing {resourceRenderLimit.toLocaleString()} of {visibleResourceObjects.length.toLocaleString()} · scroll for more</div>{/if}</div>{/if}
                 {:else}
                   <div class="resource-object-empty"><span>⌘</span><strong>Select a resource kind</strong><p>Choose a kind from the left. Kuberniva loads only that API.</p></div>
                 {/if}
@@ -6585,14 +6817,14 @@
               <nav class="kind-tabs" aria-label="Workload types">{#each workloadResources as resource}<button type="button" aria-pressed={workloadResource !== null && resourceKey(workloadResource) === resourceKey(resource)} class:kind-tab-active={workloadResource !== null && resourceKey(workloadResource) === resourceKey(resource)} title={kindLabel(resource)} on:click={() => selectWorkloadResource(resource)}>{kindTabLabel(resource)}</button>{/each}</nav>
             {/if}
             <div class:workload-detail-open={(editorResource?.category === 'Workloads' && editorObject !== null) || (workloadDetailMode === 'logs' && logTarget !== null)} class:workload-logs-open={workloadDetailMode === 'logs' && logTarget !== null} style:--workload-list-percent={`${workloadListPercent}%`} class="workload-grid grid min-h-[560px]">
-              <div class="workload-list-panel overflow-hidden rounded-2xl border border-white/10 bg-[#151924]/90 shadow-2xl shadow-black/10"><div class="workload-list-header flex items-center justify-between gap-4 border-b border-white/10 px-5 py-4"><div><div class="flex items-center gap-2"><Container size={18} class="text-cyan-300" /><h3 class="m-0 text-lg font-semibold text-white">{workloadResource?.kind || 'Select a type'}</h3></div><p class="mb-0 mt-1 text-xs text-slate-400">{namespace} · {workloadResource?.apiVersion || 'Kubernetes API'}{#if workloadResource?.kind === 'Pod'} · CPU/memory from Metrics API{/if}</p></div><span class:live-status-loading={liveDataStatus === 'loading'} class:live-status-loaded={liveDataStatus === 'loaded'} class:live-status-stale={liveDataStatus === 'stale'} class:live-status-paused={liveDataStatus === 'paused'} class:live-status-unavailable={liveDataStatus === 'unavailable'} class="live-list-status" title={liveDataStatusTooltip} aria-label={liveDataStatusTooltip} aria-live="polite"><i></i>{liveDataStatusText}</span><label class="flex h-10 w-72 items-center gap-2 rounded-lg border border-white/10 bg-black/20 px-3 text-slate-500 focus-within:border-indigo-400 focus-within:bg-black/30 focus-within:ring-2 focus-within:ring-indigo-500/20"><Search size={16} /><input class="min-w-0 flex-1 border-0 bg-transparent text-sm text-slate-100 outline-none placeholder:text-slate-500" bind:value={workloadSearch} placeholder={`Filter ${workloadResource?.plural || 'workloads'} by name or status`} /></label></div>
+              <div class="workload-list-panel overflow-hidden rounded-2xl border border-white/10 bg-[#151924]/90 shadow-2xl shadow-black/10"><div class="workload-list-header flex items-center justify-between gap-4 border-b border-white/10 px-5 py-4"><div><div class="flex items-center gap-2"><Container size={18} class="text-cyan-300" /><h3 class="m-0 text-lg font-semibold text-white">{workloadResource?.kind || 'Select a type'}</h3></div><p class="mb-0 mt-1 text-xs text-slate-400">{namespace} · {workloadResource?.apiVersion || 'Kubernetes API'}{#if workloadResource?.kind === 'Pod'} · CPU/memory from Metrics API{/if}</p></div><span class:live-status-loading={liveDataStatus === 'loading'} class:live-status-loaded={liveDataStatus === 'loaded'} class:live-status-stale={liveDataStatus === 'stale'} class:live-status-paused={liveDataStatus === 'paused'} class:live-status-unavailable={liveDataStatus === 'unavailable'} class:live-status-live={liveDataStatus === 'live'} class="live-list-status" title={liveDataStatusTooltip} aria-label={liveDataStatusTooltip} aria-live="polite"><i></i>{liveDataStatusText}</span><label class="flex h-10 w-72 items-center gap-2 rounded-lg border border-white/10 bg-black/20 px-3 text-slate-500 focus-within:border-indigo-400 focus-within:bg-black/30 focus-within:ring-2 focus-within:ring-indigo-500/20"><Search size={16} /><input class="min-w-0 flex-1 border-0 bg-transparent text-sm text-slate-100 outline-none placeholder:text-slate-500" bind:value={workloadSearch} placeholder={`Filter ${workloadResource?.plural || 'workloads'} by name or status`} /></label></div>
                 {#if loadingWorkloads}
                   <div class="grid min-h-96 place-items-center text-sm text-slate-400"><div class="flex items-center gap-3"><RefreshCw size={18} class="animate-spin text-cyan-300" />Loading {workloadResource?.plural || 'workloads'}…</div></div>
                 {:else if visibleWorkloadObjects.length === 0}
                   <div class="grid min-h-96 place-items-center px-6 text-center"><div><div class="mx-auto grid h-12 w-12 place-items-center rounded-2xl bg-indigo-500/15 text-cyan-300"><Boxes size={22} /></div><h4 class="mb-0 mt-4 text-base font-semibold text-slate-100">{workloadObjects.length ? 'No matching workloads' : `No ${workloadResource?.plural || 'workloads'} found`}</h4><p class="mb-0 mt-2 text-sm text-slate-400">{workloadObjects.length ? 'Try a different name or namespace filter.' : `Nothing was returned for ${namespace}.`}</p></div></div>
                 {:else}
                   <div class="workload-object-list" aria-label={`${workloadResource?.kind || 'Workload'} list`}>
-                    <div class:workload-pod-row={workloadResource?.kind === 'Pod'} class="workload-object-list-header workload-selection-header" style:--workload-columns={`28px ${workloadGridColumns}`} aria-label="Workload columns">{#if workloadPermissionSet.canDelete}<label class:resource-select-all-partial={workloadObjectsSelectionPartial} class="resource-select-all"><input type="checkbox" checked={allWorkloadObjectsSelected} disabled={deletingResource || loadingWorkloads || !visibleWorkloadObjects.length} aria-checked={workloadObjectsSelectionPartial ? 'mixed' : allWorkloadObjectsSelected ? 'true' : 'false'} aria-label={`Select all shown ${workloadResource?.plural || 'workloads'}`} on:change={toggleAllWorkloadObjects} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}{#each workloadColumns as column}<span>{column.label}</span>{/each}<span></span></div>
+                    <div class:workload-pod-row={workloadResource?.kind === 'Pod'} class="workload-object-list-header workload-selection-header" style:--workload-columns={`28px ${workloadGridColumns}`} aria-label="Workload columns">{#if workloadPermissionSet.canDelete}<label class:resource-select-all-partial={workloadObjectsSelectionPartial} class="resource-select-all"><input type="checkbox" checked={allWorkloadObjectsSelected} disabled={deletingResource || loadingWorkloads || !visibleWorkloadObjects.length} aria-checked={workloadObjectsSelectionPartial ? 'mixed' : allWorkloadObjectsSelected ? 'true' : 'false'} aria-label={`Select all shown ${workloadResource?.plural || 'workloads'}`} on:change={toggleAllWorkloadObjects} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}{#each workloadColumns as column}{#if column.key === 'name'}<span class="column-head-resizable">{column.label}<!-- svelte-ignore a11y_no_noninteractive_tabindex --><i class="column-resizer" role="separator" tabindex="0" aria-orientation="vertical" aria-label="Resize the Name column" title="Drag to resize · double-click to reset" use:dragResize={{ value: workloadNameWidth, min: 0, max: 900, reset: 0, step: 24, fromPointer: columnWidthFromDrag, onChange: (value) => (workloadNameWidth = value), onCommit: (value) => savePaneSize(layoutStorageKeys.workloadName, value) }}></i></span>{:else}<span>{column.label}</span>{/if}{/each}<span></span></div>
                     {#if selectedWorkloadObjects.length && workloadPermissionSet.canDelete}<div class="resource-bulk-toolbar workload-bulk-toolbar" role="region" aria-label="Bulk workload actions"><span><strong>{selectedWorkloadObjects.length}</strong> selected</span><button class="destructive" type="button" disabled={deletingResource || loadingEditor || savingEditor || loadingYaml || savingYaml} on:click={() => workloadResource && requestBulkResourceDeletion(workloadResource, selectedWorkloadObjects)}>Delete {selectedWorkloadObjects.length}</button><button class="resource-bulk-clear" type="button" disabled={deletingResource} on:click={clearWorkloadObjectSelection}>Clear</button></div>{/if}
                     {#each renderedWorkloadObjects as workload}
                       <div class:workload-pod-row={workloadResource?.kind === 'Pod'} class:resource-object-row-selected={isWorkloadObjectSelected(workload, selectedWorkloadKeySet)} class="resource-object-row workload-selection-row">
@@ -6622,6 +6854,7 @@
                             {:else if column.key === 'restarts'}<div class="workload-row-fact"><b class:workload-restarts-warn={(workload.restarts || 0) > 0}>{workload.restarts ?? 0}</b></div>
                             {:else if column.key === 'cpu'}<div class="workload-row-fact"><b title={cpuMetricLabel(workload.cpuUsage)}>{cpuMetricLabel(workload.cpuUsage)}</b></div>
                             {:else if column.key === 'memory'}<div class="workload-row-fact"><b title={workload.memoryUsage || 'Metrics unavailable'}>{podMetricLabel(workload.memoryUsage)}</b></div>
+                            {:else if column.key.startsWith('cell:')}<div class="workload-row-fact"><b title={workload.cells?.[Number(column.key.slice(5))] || ''}>{workload.cells?.[Number(column.key.slice(5))] || '—'}</b></div>
                             {:else}<div class="workload-row-fact workload-row-age"><b>{resourceAge(workload.createdAt)}</b></div>{/if}
                           {/each}
                           <ChevronRight size={17} class="workload-row-arrow" />
@@ -6719,13 +6952,15 @@
         <section class="empty-view"><div class="explore-orbit"><i></i><i></i><b>⌕</b></div><h2>Explore without memorizing paths</h2><p>Ask for a resource, filter it, and move between related objects in one place.</p><button class="primary" on:click={openCommandSearch}>Search resources</button></section>
       {:else}
         {#if logTarget}
-          <section class="logs-workspace panel">
+          <section class="logs-workspace panel" style:--log-sidebar-width={`${Math.round(logSidebarWidth)}px`}>
             <aside class="log-pod-sidebar" aria-label="Pods with logs">
               <div class="log-pod-sidebar-heading"><div><p class="eyebrow">{logScopeLabel || 'Pod'} stream</p><h2>Pods</h2><p>{logPods.length} available in this view</p></div><div class="log-pod-heading-actions"><span>{logPods.length}</span></div></div>
               <div class="log-pod-list">{#each logPods as pod}<button class:log-pod-selected={logTarget.pod === pod.name && logTarget.namespace === (pod.namespace || namespace)} on:click={() => selectLogPod(pod)}><span class="log-pod-dot"></span><div><strong>{pod.name}</strong><small>{pod.namespace || namespace}</small></div><span class="log-pod-arrow">→</span></button>{/each}</div>
               {#if logPorts.length}<section class="log-port-section"><div><span>Container ports</span><small>{logPorts.length}</small></div>{#each logPorts as port}<span class="log-port-chip" title={`${port.container}${port.name ? ` · ${port.name}` : ''} · ${port.protocol}`}><b>{port.port}/{port.protocol}</b><small>{port.container}{port.name ? ` · ${port.name}` : ''}</small></span>{/each}</section>{/if}
               <div class="log-pod-sidebar-footer">Switch Pods without leaving the log stream.</div>
             </aside>
+            <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+            <div class="pane-splitter" role="separator" tabindex="0" aria-orientation="vertical" aria-label="Resize the Pod list" aria-valuenow={Math.round(logSidebarWidth)} aria-valuemin={180} aria-valuemax={520} use:dragResize={{ value: logSidebarWidth, min: 180, max: 520, reset: 258, step: 16, fromPointer: widthFromDrag, onChange: (value) => (logSidebarWidth = value), onCommit: (value) => savePaneSize(layoutStorageKeys.logSidebar, value) }}></div>
             <div class="log-stream-panel">
               <div class="log-stream-heading"><div><p class="eyebrow">Streaming output</p><h2>{logTarget.pod}</h2><p>{activeCluster} · {logScopeLabel || 'Pod'} · {logTarget.namespace}</p></div><div class="table-actions"><button class="secondary" on:click={() => { closeLogs(); void navigateTo('Workloads') }}>← Back to workloads</button></div></div>
               <div class="log-toolbar"><div><strong>Live logs</strong><small>{openingLogsTarget ? 'Opening the first live stream…' : loadingLogs ? 'Refreshing now…' : 'Auto-refreshes every 30 seconds · select, copy, or download'}</small></div><div class="log-search" role="search"><Search size={13} /><input bind:value={logSearch} placeholder="Search logs" aria-label="Search log output" spellcheck="false" />{#if logSearch}<span>{visibleLogLines.length}/{logLines.length}</span><button type="button" aria-label="Clear log search" on:click={() => (logSearch = '')}>×</button>{/if}</div><div class="log-toolbar-actions">{#if logContainers.length > 1}<label>Container <select bind:value={selectedLogContainer} on:change={() => loadLogs(true)}>{#each logContainers as container}<option value={container}>{container}</option>{/each}</select></label>{/if}<button class="log-tool-button" disabled={loadingLogs || !logTarget} on:click={() => loadLogs(true)}><RefreshCw size={13} class={loadingLogs ? 'animate-spin' : ''} /><span>{loadingLogs ? 'Refreshing' : 'Refresh'}</span></button><button class:log-tool-button-copied={logsCopied} class="log-tool-button" disabled={!logLines.length} on:click={copyLogs}>{#if logsCopied}<Check size={13} />{:else}<Copy size={13} />{/if}<span>{logsCopied ? 'Copied' : 'Copy'}</span></button><button class="log-tool-button" disabled={!logLines.length || downloadingLogs} on:click={downloadLogs}><Download size={13} /><span>{downloadingLogs ? 'Saving' : 'Download'}</span></button></div></div>

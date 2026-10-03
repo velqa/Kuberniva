@@ -15,11 +15,12 @@ test('a watch that failed to start is restarted, and a real connection failure r
   assert.equal(resume({ view: 'Overview', connectionFailed: true }), 'reconnect');
 });
 
-test('snapshot views refresh quietly only when their data is old', () => {
-  assert.equal(resume({ view: 'Overview', snapshotAgeMs: 30_000 }), 'none');
-  assert.equal(resume({ view: 'Overview', snapshotAgeMs: 61_000 }), 'quiet-refresh');
-  assert.equal(resume({ view: 'Events', snapshotAgeMs: 3_600_000 }), 'quiet-refresh');
-  assert.equal(resume({ view: 'Settings', snapshotAgeMs: 3_600_000 }), 'none');
+test('snapshot views refresh quietly only when their data is old and not streaming', () => {
+  assert.equal(resume({ view: 'Overview', watchStatus: 'connected', snapshotAgeMs: 3_600_000 }), 'none');
+  assert.equal(resume({ view: 'Overview', watchStatus: 'idle', snapshotAgeMs: 30_000 }), 'none');
+  assert.equal(resume({ view: 'Overview', watchStatus: 'idle', snapshotAgeMs: 61_000 }), 'quiet-refresh');
+  assert.equal(resume({ view: 'Events', watchStatus: 'idle', snapshotAgeMs: 3_600_000 }), 'quiet-refresh');
+  assert.equal(resume({ view: 'Settings', watchStatus: 'idle', snapshotAgeMs: 3_600_000 }), 'none');
 });
 
 test('a hung native request rejects and allows the loading workflow to finish', async () => {

@@ -150,6 +150,34 @@ export const visualQaDeployments = [
   status: deployment.status,
   readyContainers: deployment.readyContainers,
   totalContainers: deployment.totalContainers,
+  cells: [deployment.name, `${deployment.readyContainers}/${deployment.totalContainers}`, String(deployment.totalContainers), String(deployment.readyContainers), `${deployment.ageMinutes}m`, deployment.name, `ghcr.io/acme/${deployment.name}:3.8.2`, `app=${deployment.name}`],
+}));
+
+export const visualQaDeploymentColumns = [
+  { name: 'Name', type: 'string', priority: 0 }, { name: 'Ready', type: 'string', priority: 0 }, { name: 'Up-to-date', type: 'string', priority: 0 },
+  { name: 'Available', type: 'string', priority: 0 }, { name: 'Age', type: 'string', priority: 0 }, { name: 'Containers', type: 'string', priority: 1 },
+  { name: 'Images', type: 'string', priority: 1 }, { name: 'Selector', type: 'string', priority: 1 },
+];
+
+export const visualQaServiceColumns = [
+  { name: 'Name', type: 'string', priority: 0 }, { name: 'Type', type: 'string', priority: 0 }, { name: 'Cluster-IP', type: 'string', priority: 0 },
+  { name: 'External-IP', type: 'string', priority: 0 }, { name: 'Port(s)', type: 'string', priority: 0 }, { name: 'Age', type: 'string', priority: 0 },
+  { name: 'Selector', type: 'string', priority: 1 },
+];
+
+export const visualQaServices = [
+  ['api', 'ClusterIP', '10.96.14.21', '<none>', '80/TCP,443/TCP'],
+  ['checkout-public', 'LoadBalancer', '10.96.88.3', '34.120.18.44', '443:31443/TCP'],
+  ['kube-dns', 'ClusterIP', '10.96.0.10', '<none>', '53/UDP,53/TCP,9153/TCP'],
+  ['metrics', 'NodePort', '10.96.120.7', '<none>', '9100:30910/TCP'],
+  ['payments-db', 'ClusterIP', 'None', '<none>', '5432/TCP'],
+].map(([name, type, clusterIp, externalIp, ports], index) => ({
+  name,
+  namespace: 'platform',
+  uid: `visual-service-${index}`,
+  resourceVersion: `${7000 + index}`,
+  createdAt: new Date(Date.now() - (index + 1) * 86_400_000).toISOString(),
+  cells: [name, type, clusterIp, externalIp, ports, `${index + 1}d`, `app=${name}`],
 }));
 
 export const visualQaWorkloadManifest = {

@@ -37,6 +37,7 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 use x509_parser::{parse_x509_certificate, pem::parse_x509_pem};
+mod live_feeds;
 mod live_resources;
 use live_resources::{
     run_resource_watch, spawn_sleep_monitor, ResourceSnapshot, ResourceWatchRequest,
@@ -162,6 +163,9 @@ struct ResourceObject {
     memory_usage: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     node_name: Option<String>,
+    /// Server-printed columns (the Kubernetes Table API), aligned with the snapshot's columns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cells: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1623,6 +1627,7 @@ fn pod_resource_object(pod: Pod, usage: Option<&(String, String)>) -> ResourceOb
             .map(|usage| usage.1.clone())
             .filter(|value| !value.is_empty()),
         node_name,
+        cells: None,
     }
 }
 
@@ -1979,11 +1984,10 @@ async fn read_cluster_overview(
     .await
 }
 
-async fn read_cluster_overview_inner(
-    kubeconfig_path: Option<String>,
-    context: Option<String>,
-) -> Result<ClusterOverview, String> {
-    let client = client_for(kubeconfig_path, context).await?;
+pub(crate) type NodeMetricMap = HashMap<String, (Option<String>, Option<String>)>;
+
+/// Node metrics are optional (the metrics-server may not be installed).
+pub(crate) async fn read_node_metrics(client: Client) -> Option<NodeMetricMap> {
     let node_metrics_resource = ApiResource {
         group: "metrics.k8s.io".to_string(),
         version: "v1beta1".to_string(),
@@ -1991,45 +1995,60 @@ async fn read_cluster_overview_inner(
         kind: "NodeMetrics".to_string(),
         plural: "nodes".to_string(),
     };
-    // Node metrics are optional (the metrics-server may not be installed). Fetch them in
-    // parallel with the authoritative Node list so an unavailable Metrics API never delays
-    // the cluster overview itself.
-    let metrics_api = Api::<DynamicObject>::all_with(client.clone(), &node_metrics_resource);
-    let nodes_api = Api::<Node>::all(client);
-    let metrics_params = ListParams::default();
+    let metrics_api = Api::<DynamicObject>::all_with(client, &node_metrics_resource);
+    metrics_api
+        .list(&ListParams::default())
+        .await
+        .ok()
+        .map(|response| {
+            response
+                .items
+                .into_iter()
+                .filter_map(|metric| {
+                    let name = metric.metadata.name?;
+                    Some((
+                        name,
+                        (
+                            metric
+                                .data
+                                .pointer("/usage/cpu")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            metric
+                                .data
+                                .pointer("/usage/memory")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        ),
+                    ))
+                })
+                .collect::<HashMap<_, _>>()
+        })
+}
+
+async fn read_cluster_overview_inner(
+    kubeconfig_path: Option<String>,
+    context: Option<String>,
+) -> Result<ClusterOverview, String> {
+    let client = client_for(kubeconfig_path, context).await?;
+    // Fetch metrics in parallel with the authoritative Node list so an unavailable
+    // Metrics API never delays the cluster overview itself.
+    let nodes_api = Api::<Node>::all(client.clone());
     let nodes_params = ListParams::default();
-    let metrics_request = metrics_api.list(&metrics_params);
-    let nodes_request = nodes_api.list(&nodes_params);
-    let (metrics_response, nodes_response) = tokio::join!(metrics_request, nodes_request);
-    let metrics = metrics_response.ok().map(|response| {
-        response
-            .items
-            .into_iter()
-            .filter_map(|metric| {
-                let name = metric.metadata.name?;
-                Some((
-                    name,
-                    (
-                        metric
-                            .data
-                            .pointer("/usage/cpu")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                        metric
-                            .data
-                            .pointer("/usage/memory")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                    ),
-                ))
-            })
-            .collect::<HashMap<_, _>>()
-    });
+    let (metrics, nodes_response) =
+        tokio::join!(read_node_metrics(client), nodes_api.list(&nodes_params));
+    let node_items = nodes_response.map_err(|error| error.to_string())?.items;
+    Ok(build_cluster_overview(node_items, metrics))
+}
+
+/// Builds the Overview from Nodes and optional metrics; the live feed reuses it on every change.
+pub(crate) fn build_cluster_overview(
+    node_items: Vec<Node>,
+    metrics: Option<NodeMetricMap>,
+) -> ClusterOverview {
     let metrics_available = metrics.is_some();
     let metrics = metrics.unwrap_or_default();
-    let mut nodes = nodes_response
-        .map_err(|error| error.to_string())?
-        .items
+    let mut nodes = node_items
         .into_iter()
         .filter_map(|node| {
             let name = node.metadata.name.clone()?;
@@ -2278,12 +2297,12 @@ async fn read_cluster_overview_inner(
             .filter(|node| node.cpu_usage.is_some() || node.memory_usage.is_some())
             .count(),
     };
-    Ok(ClusterOverview {
+    ClusterOverview {
         nodes,
         totals,
         metrics_available,
         observed_at: Utc::now().to_rfc3339(),
-    })
+    }
 }
 
 #[tauri::command]
@@ -2479,6 +2498,43 @@ async fn list_resource_objects(request: ResourceRequest) -> Result<Vec<ResourceO
     .await
 }
 
+/// Starts a live feed (Overview, Events, or manifests) and returns its id; stop it with
+/// `stop_resource_watch`.
+#[tauri::command]
+async fn start_live_feed(
+    app: tauri::AppHandle,
+    request: live_feeds::LiveFeedRequest,
+    feed_id: String,
+) -> Result<String, String> {
+    if feed_id.is_empty() || feed_id.len() > 128 {
+        return Err("Invalid feed identifier".into());
+    }
+    let (stop_tx, stop_rx) = oneshot::channel();
+    {
+        let mut registry = RESOURCE_WATCH_REGISTRY
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .map_err(|_| "Kuberniva's resource watch registry is unavailable".to_string())?;
+        if registry.contains_key(&feed_id) {
+            return Err("Feed identifier is already active".into());
+        }
+        if registry.len() >= 16 {
+            return Err("Too many active live feeds".into());
+        }
+        registry.insert(feed_id.clone(), stop_tx);
+    }
+    let task_id = feed_id.clone();
+    tokio::spawn(async move {
+        live_feeds::run_live_feed(app, task_id.clone(), request, stop_rx).await;
+        if let Some(registry) = RESOURCE_WATCH_REGISTRY.get() {
+            if let Ok(mut registry) = registry.lock() {
+                registry.remove(&task_id);
+            }
+        }
+    });
+    Ok(feed_id)
+}
+
 /// Called when the network changes: reopen live watches from their cursors.
 #[tauri::command]
 fn resume_live_connections() {
@@ -2608,6 +2664,7 @@ async fn list_resource_objects_inner(
             cpu_usage: None,
             memory_usage: None,
             node_name: None,
+            cells: None,
         })
         .collect::<Vec<_>>();
     objects.sort_by(|left, right| {
@@ -5127,6 +5184,7 @@ pub fn run() {
             list_resource_snapshot,
             read_pod_metrics,
             resume_live_connections,
+            start_live_feed,
             list_resource_manifests,
             argocd_application_action,
             read_object_events,

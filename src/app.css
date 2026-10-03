@@ -6957,7 +6957,7 @@ main.theme-dark .configuration-toolbar-close { color: #e4e3e0; border-color: #50
 @container resource-workbench (max-width: 760px) {
   .resource-workbench-body-focused { grid-template-columns: minmax(180px, .42fr) minmax(0, 1.58fr); }
   .resource-object-columns { grid-template-columns: 26px minmax(0, 1fr) 50px 54px !important; }
-  .resource-object-columns span:nth-of-type(2) { display: none; }
+  .resource-object-columns .resource-columns-namespace { display: none; }
   .resource-workbench .resource-object-browser .object-list .resource-object-row > button { grid-template-columns: minmax(0, 1fr) 42px 52px !important; }
   .resource-object-namespace { display: none; }
 }
@@ -7555,7 +7555,7 @@ main .resource-workbench .resource-object-browser .resource-object-columns { gri
 main .resource-workbench .resource-object-browser .object-list .resource-object-row > button { grid-template-columns: minmax(0, 1fr) minmax(110px, 200px) 64px 76px !important; }
 main .resource-workbench .resource-objects-single-namespace .resource-object-columns { grid-template-columns: 28px minmax(0, 1fr) 64px 76px !important; }
 main .resource-workbench .resource-objects-single-namespace .object-list .resource-object-row > button { grid-template-columns: minmax(0, 1fr) 64px 76px !important; }
-main .resource-workbench .resource-objects-single-namespace .resource-object-columns > :nth-child(3),
+main .resource-workbench .resource-objects-single-namespace .resource-object-columns > .resource-columns-namespace,
 main .resource-workbench .resource-objects-single-namespace .resource-object-namespace { display: none !important; }
 main .resource-workbench .resource-object-columns > :nth-last-child(-n+2),
 main .resource-workbench .resource-object-age,
@@ -8078,3 +8078,183 @@ main.theme-dark .argo-app-mark { color: #f0a679; background: rgba(201, 100, 66, 
 .resource-object-search input { min-width: 0; flex: 1; border: 0; outline: 0; color: var(--ui-ink); background: transparent; font: inherit; font-size: 12.5px; }
 .resource-object-search span { color: var(--ui-muted); font-size: 11px; white-space: nowrap; }
 .resource-object-search button { border: 0; color: var(--ui-muted); background: none; font-size: 15px; line-height: 1; cursor: pointer; }
+
+/* Server-printed columns (Type, Cluster-IP, External-IP, Ports…) in resource lists */
+.resource-server-cell { min-width: 0; overflow: hidden; color: var(--ui-copy); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.resource-object-columns .resource-server-cell { color: inherit; font-size: inherit; }
+main .resource-workbench .resource-object-browser.resource-object-table .resource-object-columns { grid-template-columns: 28px minmax(140px, 1.4fr) var(--resource-server-columns) minmax(100px, 180px) 52px 64px !important; }
+main .resource-workbench .resource-object-browser.resource-object-table .object-list .resource-object-row > button { grid-template-columns: minmax(140px, 1.4fr) var(--resource-server-columns) minmax(100px, 180px) 52px 64px !important; }
+main .resource-workbench .resource-object-browser.resource-object-table.resource-objects-single-namespace .resource-object-columns { grid-template-columns: 28px minmax(140px, 1.4fr) var(--resource-server-columns) 52px 64px !important; }
+main .resource-workbench .resource-object-browser.resource-object-table.resource-objects-single-namespace .object-list .resource-object-row > button { grid-template-columns: minmax(140px, 1.4fr) var(--resource-server-columns) 52px 64px !important; }
+/* While an object is open the list is narrow: keep Name, Age, and Action only. */
+main .resource-workbench-inspecting .resource-object-browser.resource-object-table .resource-server-cell,
+main .resource-workbench-inspecting .resource-object-browser.resource-object-table .resource-object-namespace,
+main .resource-workbench-inspecting .resource-object-browser.resource-object-table .resource-columns-namespace { display: none; }
+main .resource-workbench-inspecting .resource-object-browser.resource-object-table .resource-object-columns { grid-template-columns: 28px minmax(0, 1fr) 52px 64px !important; }
+main .resource-workbench-inspecting .resource-object-browser.resource-object-table .object-list .resource-object-row > button { grid-template-columns: minmax(0, 1fr) 52px 64px !important; }
+
+/* Live status: green when streaming and current, amber while recovering, muted otherwise. */
+main .live-pill, main .live-list-status { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border: 1px solid var(--ui-border); border-radius: 999px; color: var(--ui-muted); background: var(--ui-surface); font-size: 10.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; box-shadow: none; }
+main .live-pill > b, main .live-list-status > i { width: 7px; height: 7px; border-radius: 50%; background: var(--ui-border-strong); box-shadow: none; }
+main .live-pill.live-state-live, main .live-list-status.live-status-live { color: #1f7a4a; border-color: #bfe3cd; background: #e8f6ee; }
+main .live-pill.live-state-live > b, main .live-list-status.live-status-live > i { background: #22a55b; box-shadow: 0 0 0 3px rgba(34, 165, 91, .18); animation: live-pulse 2.4s ease-in-out infinite; }
+main .live-pill.live-state-loading > b, main .live-list-status.live-status-loading > i { background: #5b8def; animation: live-pulse 1.2s ease-in-out infinite; }
+main .live-pill.live-state-warn, main .live-list-status.live-status-stale, main .live-list-status.live-status-paused { color: #8a5a10; border-color: #ecd8ab; background: #fdf6e6; }
+main .live-pill.live-state-warn > b, main .live-list-status.live-status-stale > i, main .live-list-status.live-status-paused > i { background: #d49b2e; }
+main .live-pill.live-state-error, main .live-list-status.live-status-unavailable { color: #9b2c2c; border-color: #f0c9c3; background: #fbecea; }
+main .live-pill.live-state-error > b, main .live-list-status.live-status-unavailable > i { background: #d0544a; }
+main.theme-dark .live-pill.live-state-live, main.theme-dark .live-list-status.live-status-live { color: #7ee2a8; border-color: rgba(34, 165, 91, .45); background: rgba(34, 165, 91, .14); }
+main.theme-dark .live-pill.live-state-warn, main.theme-dark .live-list-status.live-status-stale, main.theme-dark .live-list-status.live-status-paused { color: #f0c674; border-color: rgba(214, 160, 60, .4); background: rgba(214, 160, 60, .12); }
+main.theme-dark .live-pill.live-state-error, main.theme-dark .live-list-status.live-status-unavailable { color: #f4a9a0; border-color: rgba(214, 90, 74, .4); background: rgba(214, 90, 74, .14); }
+@keyframes live-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
+@media (prefers-reduced-motion: reduce) { main .live-pill > b, main .live-list-status > i { animation: none !important; } }
+
+/* Splitters and resizable Name columns */
+.pane-splitter { position: relative; z-index: 5; width: 6px; min-height: 0; cursor: col-resize; touch-action: none; }
+.pane-splitter::after { content: ''; position: absolute; inset: 0 2px; border-radius: 2px; background: var(--ui-border); transition: background .12s; }
+.pane-splitter:hover::after, .pane-splitter:focus-visible::after { background: var(--ui-accent); }
+.pane-splitter:focus-visible { outline: none; }
+body.is-resizing, body.is-resizing * { cursor: col-resize !important; user-select: none !important; }
+main .logs-workspace.panel { display: grid !important; grid-template-columns: var(--log-sidebar-width, 258px) 6px minmax(0, 1fr) !important; }
+main .argo-body.argo-body-detail { grid-template-columns: minmax(280px, var(--argo-list-percent, 60%)) 6px minmax(300px, 1fr); gap: 0 8px; }
+.column-head-resizable { position: relative; }
+.column-resizer { position: absolute; top: -6px; right: -6px; bottom: -6px; width: 9px; cursor: col-resize; touch-action: none; }
+.column-resizer::after { content: ''; position: absolute; top: 4px; bottom: 4px; left: 4px; width: 1px; background: var(--ui-border-strong); opacity: 0; transition: opacity .12s; }
+.workload-object-list-header:hover .column-resizer::after, .resource-object-columns:hover .column-resizer::after, .column-resizer:focus-visible::after { opacity: 1; }
+.column-resizer:hover::after, .column-resizer:focus-visible::after { width: 2px; background: var(--ui-accent); }
+main .resource-workbench .resource-object-browser.resource-object-table .resource-object-columns { grid-template-columns: 28px var(--resource-name-col) var(--resource-server-columns) minmax(100px, 180px) 52px 64px !important; }
+main .resource-workbench .resource-object-browser.resource-object-table .object-list .resource-object-row > button { grid-template-columns: var(--resource-name-col) var(--resource-server-columns) minmax(100px, 180px) 52px 64px !important; }
+main .resource-workbench .resource-object-browser.resource-object-table.resource-objects-single-namespace .resource-object-columns { grid-template-columns: 28px var(--resource-name-col) var(--resource-server-columns) 52px 64px !important; }
+main .resource-workbench .resource-object-browser.resource-object-table.resource-objects-single-namespace .object-list .resource-object-row > button { grid-template-columns: var(--resource-name-col) var(--resource-server-columns) 52px 64px !important; }
+main .resource-workbench-inspecting .resource-object-browser.resource-object-table .resource-object-columns { grid-template-columns: 28px minmax(0, 1fr) 52px 64px !important; }
+main .resource-workbench-inspecting .resource-object-browser.resource-object-table .object-list .resource-object-row > button { grid-template-columns: minmax(0, 1fr) 52px 64px !important; }
+main .resource-workbench-inspecting .resource-object-browser.resource-object-table .column-resizer { display: none; }
+
+/* ───────────────────────── Dark theme v2 ─────────────────────────
+   A layered neutral palette (canvas → panel → raised) with brighter secondary text and
+   status colors tuned for dark backgrounds. Kept last so it consistently wins over the
+   historical per-component dark rules above. */
+html body main.theme-dark {
+  --ui-canvas: #171716;
+  --ui-sidebar: #131312;
+  --ui-topbar: rgba(23, 23, 22, .92);
+  --ui-surface: #201f1e;
+  --ui-surface-muted: #1b1b1a;
+  --ui-surface-strong: #2b2a28;
+  --ui-border: #31302d;
+  --ui-border-strong: #4a4844;
+  --ui-ink: #f3f2ee;
+  --ui-copy: #d3d1ca;
+  --ui-muted: #a8a59d;
+  --ui-active: #2f2e2b;
+  --ui-active-muted: #8c8a83;
+  --ui-selected: #ffffff;
+  --ui-selected-border: #f3f2ee;
+  --ui-selected-muted: #8c8a83;
+  --ui-teal: #6fd8cb;
+  --ui-accent: #e8875f;
+  --ui-accent-soft: rgba(232, 135, 95, .14);
+  --ui-shadow: 0 10px 28px rgba(0, 0, 0, .35);
+  --ui-selected-shadow: 0 8px 22px rgba(0, 0, 0, .45);
+  color: var(--ui-ink);
+  background: var(--ui-canvas) !important;
+}
+html body main.theme-dark .app-shell, html body main.theme-dark .content { background: var(--ui-canvas) !important; }
+html body main.theme-dark .sidebar { background: var(--ui-sidebar) !important; border-right: 1px solid var(--ui-border) !important; }
+html body main.theme-dark .topbar { background: var(--ui-topbar) !important; border-bottom-color: var(--ui-border) !important; }
+html body main.theme-dark .statusbar { background: var(--ui-sidebar) !important; border-top-color: var(--ui-border) !important; color: var(--ui-muted) !important; }
+
+/* Panels and cards: one surface, one border. */
+html body main.theme-dark :is(.panel, .workload-list-panel, .workload-inspector, .resource-object-browser, .resource-kind-browser, .resource-inspector-surface, .ov-kpi, .ov-table, .ov-details, .argo-card, .argo-table, .argo-details, .argo-status-card, .argo-tree-root, .argo-tree-node, .argo-history-body, .argo-event, .gw-card, .detail-fact, .events-group, .settings-theme-panel, .service-overview-card, .network-inspector-card, .certificate-card, .workload-detail-card, .pod-diagnostics-card, .resource-labels, .inspector-summary-grid > div, .configuration-values-editor, .deletion-modal, .command-palette, .kubeconfig-dialog) {
+  background: var(--ui-surface) !important;
+  border-color: var(--ui-border) !important;
+  box-shadow: none !important;
+}
+html body main.theme-dark :is(.workload-object-list-header, .resource-object-columns, .argo-row-head, .gw-row-head, .argo-result-head, .ov-table-head, .pod-diagnostics-heading) {
+  background: var(--ui-surface-muted) !important;
+  color: var(--ui-muted) !important;
+  border-color: var(--ui-border) !important;
+}
+html body main.theme-dark :is(.workload-object-row, .resource-object-row > button, .argo-row, .ov-row, .gw-row, .argo-result-row, .object-list > button) {
+  background: transparent !important;
+  border-color: var(--ui-border) !important;
+  color: var(--ui-ink) !important;
+}
+html body main.theme-dark :is(.workload-object-row, .resource-object-row > button, .argo-row, .ov-row, .object-list > button):hover:not(:disabled) { background: var(--ui-surface-strong) !important; }
+html body main.theme-dark :is(.workload-object-selected, .resource-object-row-selected > button, .argo-row-selected, .ov-row-selected, .object-selected) { background: var(--ui-active) !important; }
+
+/* Text: titles, body, secondary. */
+html body main.theme-dark :is(h1, h2, h3, h4, strong, .workload-object-name strong, .argo-app-name strong, .resource-object-primary strong) { color: var(--ui-ink); }
+html body main.theme-dark :is(small, .eyebrow + p, .panel-heading p, .page-heading p, .workload-row-muted b, .argo-muted, .resource-object-namespace, .resource-object-age, .resource-server-cell, time, kbd, .events-scope, .detail-fact > span, .argo-status-card small, .cluster-picker small, .namespace-picker small) { color: var(--ui-muted) !important; }
+html body main.theme-dark .workload-row-fact b, html body main.theme-dark .workload-row-node bdi { color: var(--ui-copy); }
+html body main.theme-dark .nav-item { color: var(--ui-copy) !important; }
+html body main.theme-dark .nav-item .nav-icon { color: var(--ui-muted) !important; }
+html body main.theme-dark .nav-item:hover, html body main.theme-dark .nav-item.active { color: var(--ui-ink) !important; background: var(--ui-surface-strong) !important; }
+html body main.theme-dark .nav-item.active .nav-icon, html body main.theme-dark .nav-item:hover .nav-icon { color: var(--ui-accent) !important; }
+html body main.theme-dark :is(.sidebar-tree-section, .sidebar-tree-item, .favorite-shortcut, .sidebar-favorites-title) { color: var(--ui-copy) !important; }
+html body main.theme-dark :is(.count, .sidebar-tree-section small) { color: var(--ui-copy) !important; background: var(--ui-surface-strong) !important; }
+
+/* Inputs, pickers, and buttons. */
+html body main.theme-dark :is(input, select, textarea):not([type="checkbox"]):not([type="radio"]) { color: var(--ui-ink); }
+html body main.theme-dark :is(input, textarea)::placeholder { color: #8b887f !important; }
+html body main.theme-dark :is(.cluster-picker, .namespace-picker, .command-button, .icon-button, .sidebar-toggle, .argo-search, .resource-object-search, .resource-kind-search, .log-search, .events-search, .workload-list-header label, .argo-segmented, .terminal-access) {
+  background: var(--ui-surface-muted) !important;
+  border-color: var(--ui-border) !important;
+  color: var(--ui-copy) !important;
+}
+html body main.theme-dark :is(.cluster-picker, .namespace-picker) strong, html body main.theme-dark .cluster-picker-name { color: var(--ui-ink) !important; }
+html body main.theme-dark .secondary { color: var(--ui-ink) !important; background: var(--ui-surface-strong) !important; border-color: var(--ui-border-strong) !important; }
+html body main.theme-dark .secondary:hover:not(:disabled) { background: #363532 !important; }
+html body main.theme-dark .primary { color: #1a1310 !important; background: var(--ui-accent) !important; border-color: var(--ui-accent) !important; }
+html body main.theme-dark .primary:hover:not(:disabled) { background: #f0976f !important; }
+html body main.theme-dark .destructive { color: #ffb4a8 !important; background: rgba(214, 90, 74, .14) !important; border-color: rgba(214, 90, 74, .45) !important; }
+html body main.theme-dark :is(.kind-tabs button, .argo-tabs button, .argo-app-tabs button) { color: var(--ui-copy) !important; }
+html body main.theme-dark .kind-tabs .kind-tab-active { color: #1a1310 !important; background: var(--ui-accent) !important; border-color: var(--ui-accent) !important; }
+html body main.theme-dark kbd { background: var(--ui-surface-strong) !important; border-color: var(--ui-border) !important; }
+
+/* Status colors that read on dark surfaces. */
+html body main.theme-dark .workload-status-label.running, html body main.theme-dark .workload-status-label { color: #6fd49b; }
+html body main.theme-dark .workload-status-label.pending { color: #f0c674 !important; }
+html body main.theme-dark .workload-status-label.failed { color: #f4978e !important; }
+html body main.theme-dark :is(.workload-restarts-warn, .pod-container-diagnostics p) { color: #f4978e !important; }
+html body main.theme-dark :is(.workload-action-card) { color: var(--ui-ink) !important; background: var(--ui-surface) !important; border-color: var(--ui-border) !important; }
+html body main.theme-dark .workload-action-card strong { color: var(--ui-ink) !important; }
+html body main.theme-dark .workload-action-card small { color: var(--ui-muted) !important; }
+html body main.theme-dark .workload-action-card > b { color: var(--ui-accent) !important; }
+html body main.theme-dark .workload-action-card > span { color: var(--ui-accent) !important; background: var(--ui-accent-soft) !important; }
+html body main.theme-dark .node-metric-card strong { color: var(--ui-ink) !important; }
+html body main.theme-dark .node-metric-card b { color: var(--ui-accent) !important; }
+html body main.theme-dark .terminal-output, html body main.theme-dark .workload-log-output, html body main.theme-dark .live-log-output { background: #0f0f0e !important; color: #e6e4de !important; border-color: var(--ui-border) !important; }
+
+/* Dark theme v2: remaining contrast fixes found by the audit. */
+html body main.theme-dark :is(.resource-object-action, .argo-link-button, .argo-pod-row em, .workload-row-arrow) { color: #f0976f !important; }
+html body main.theme-dark :is(.global-namespace-trigger .chevron, .chevron, .resource-directory-back, .terminal-pod-strip > span, .terminal-target label, .workload-log-toolbar-actions label, .node-property-list span, .node-detail-section span) { color: var(--ui-muted) !important; }
+html body main.theme-dark .favorite-shortcut kbd, html body main.theme-dark .command-button kbd { color: var(--ui-copy) !important; }
+html body main.theme-dark :is(.resource-pane-icon, .drawer-heading > div > span, .inspector-heading > div > span) { color: var(--ui-accent) !important; background: var(--ui-accent-soft) !important; border-color: transparent !important; }
+html body main.theme-dark :is(.resource-pane-icon, .drawer-heading > div > span).custom { color: #8fb8f0 !important; background: rgba(93, 148, 220, .16) !important; }
+html body main.theme-dark .events-filter button { color: var(--ui-copy) !important; background: transparent !important; }
+html body main.theme-dark .events-filter button.active { color: var(--ui-ink) !important; background: var(--ui-surface-strong) !important; }
+html body main.theme-dark .events-filter b { color: var(--ui-ink) !important; background: var(--ui-border) !important; }
+html body main.theme-dark :is(.workload-details-delete, .pod-diagnostics-heading span) { color: #f4978e !important; }
+html body main.theme-dark .log-time { color: #a8a59d !important; opacity: 1 !important; }
+html body main.theme-dark :is(.node-detail-grid span, .node-detail-tab-panel small) { color: var(--ui-muted) !important; }
+html body main.theme-dark .node-detail-grid strong { color: var(--ui-ink) !important; }
+html body main.theme-dark .node-detail-tabs { background: var(--ui-surface-muted) !important; border-color: var(--ui-border) !important; }
+html body main.theme-dark .node-detail-tabs button { color: var(--ui-copy) !important; background: transparent !important; }
+html body main.theme-dark .node-detail-tabs .node-detail-tab-active { color: var(--ui-ink) !important; background: var(--ui-surface-strong) !important; box-shadow: inset 0 0 0 1px var(--ui-border-strong) !important; }
+
+/* Light theme: secondary text meets 4.5:1 without changing the warm palette. */
+html body main:not(.theme-dark) { --ui-muted: #6c6860; }
+html body main:not(.theme-dark) :is(.eyebrow, .cluster-picker-copy small, .global-namespace-copy small, .favorite-shortcut kbd, .chevron, .resource-object-age, .resource-directory-back, .sidebar-tree-section small, .sidebar-favorites-manage, .node-detail-grid span, .events-actions small, .terminal-target span, .workload-terminal-heading small, .events-filter b, .argo-kind, .ov-status-none, .settings-theme-panel p, .node-metric-card small, .ov-details p, .inspector-summary-grid span, .resource-server-cell, .resource-object-namespace) { color: #6c6860 !important; }
+html body main:not(.theme-dark) .sidebar-tree-item-selected span { color: #a3442a !important; }
+html body main:not(.theme-dark) .workload-restarts-warn { color: #9a5a0c !important; }
+html body main:not(.theme-dark) :is(.argo-type-badge, .workload-terminal-action > span) { color: #1e6f67 !important; }
+html body main:not(.theme-dark) :is(.favorite-shortcut kbd, .command-button kbd) { opacity: 1 !important; color: #5f5b54 !important; }
+html body main:not(.theme-dark) :is(.events-scope, .events-filter button, .drawer-heading p, .inspector-heading p, .workload-inspector-actions button, .terminal-pod-strip > span, .resource-object-heading > b) { color: #66625a !important; }
+html body main:not(.theme-dark) .workload-status-label.running, html body main:not(.theme-dark) .workload-status-label.workload-details-status { color: #23704a !important; }
+html body main:not(.theme-dark) .workload-status-label.pending { color: #87601d !important; }
+html body main:not(.theme-dark) :is(.node-metric-heading b, .node-inspector-status) { color: #22705f !important; }
+html body main:not(.theme-dark) .kind-tabs .kind-tab-active { background: #b5532f !important; border-color: #b5532f !important; }
+html body main:not(.theme-dark) :is(.workload-log-pod-picker small, .workload-log-toolbar small, .workload-log-ports strong, .terminal-target label, .terminal-command label) { color: #66625a !important; }
+html body main :is(.log-time) { color: #a8a59d !important; opacity: 1 !important; }
+html body main:not(.theme-dark) .cel-function { color: #136a75; }

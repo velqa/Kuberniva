@@ -7,7 +7,7 @@ const PAGE_SIZE: u32 = 500;
 
 static RESUME_SIGNAL: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
 
-fn resume_signal() -> &'static tokio::sync::Notify {
+pub(super) fn resume_signal() -> &'static tokio::sync::Notify {
     RESUME_SIGNAL.get_or_init(tokio::sync::Notify::new)
 }
 
@@ -59,6 +59,7 @@ const BATCH_INTERVAL: Duration = Duration::from_millis(50);
 pub(super) struct ResourceSnapshot {
     items: Vec<ResourceObject>,
     resource_version: String,
+    columns: Vec<TableColumn>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -90,6 +91,8 @@ struct Signal {
     resource_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    columns: Vec<TableColumn>,
 }
 
 fn metadata_row(metadata: ObjectMeta) -> ResourceObject {
@@ -106,6 +109,110 @@ fn metadata_row(metadata: ObjectMeta) -> ResourceObject {
         cpu_usage: None,
         memory_usage: None,
         node_name: None,
+        cells: None,
+    }
+}
+
+/// One server-printed column, as `kubectl get` shows it.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct TableColumn {
+    name: String,
+    #[serde(rename = "type")]
+    kind: String,
+    priority: i64,
+}
+
+// Ask for the server's Table rendering (the columns `kubectl get` prints, including CRD
+// printer columns), falling back to plain JSON where an API does not offer tables.
+const TABLE_ACCEPT: &str = "application/json;as=Table;v=v1;g=meta.k8s.io, application/json";
+
+fn as_table(mut request: http::Request<Vec<u8>>) -> Result<http::Request<Vec<u8>>, String> {
+    let uri = request.uri().to_string();
+    let separator = if uri.contains('?') { '&' } else { '?' };
+    *request.uri_mut() = format!("{uri}{separator}includeObject=Metadata")
+        .parse()
+        .map_err(|error| format!("Could not build the table request: {error}"))?;
+    request.headers_mut().insert(
+        http::header::ACCEPT,
+        http::HeaderValue::from_static(TABLE_ACCEPT),
+    );
+    Ok(request)
+}
+
+fn cell_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Null => String::new(),
+        Value::Array(items) => items.iter().map(cell_text).collect::<Vec<_>>().join(","),
+        other => other.to_string(),
+    }
+}
+
+fn table_columns(table: &Value) -> Vec<TableColumn> {
+    table["columnDefinitions"]
+        .as_array()
+        .map(|columns| {
+            columns
+                .iter()
+                .map(|column| TableColumn {
+                    name: column["name"].as_str().unwrap_or_default().to_string(),
+                    kind: column["type"].as_str().unwrap_or("string").to_string(),
+                    priority: column["priority"].as_i64().unwrap_or(0),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn table_rows(table: &Value) -> Vec<ResourceObject> {
+    table["rows"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    let metadata =
+                        serde_json::from_value::<ObjectMeta>(row["object"]["metadata"].clone())
+                            .unwrap_or_default();
+                    let mut object = metadata_row(metadata);
+                    object.cells = Some(
+                        row["cells"]
+                            .as_array()
+                            .map(|cells| cells.iter().map(cell_text).collect())
+                            .unwrap_or_default(),
+                    );
+                    object
+                })
+                .filter(|object| !object.name.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn unsupported_table(error: &kube::Error) -> bool {
+    matches!(error, kube::Error::Api(response) if response.code == 406 || response.code == 415)
+}
+
+async fn table_page(
+    client: &Client,
+    request: &ResourceRequest,
+    params: &ListParams,
+) -> Result<Option<(Vec<ResourceObject>, ListMeta, Vec<TableColumn>)>, String> {
+    let api = dynamic_api_for_request(client.clone(), request);
+    let http_request = as_table(
+        kube::core::Request::new(api.resource_url())
+            .list(params)
+            .map_err(|error| error.to_string())?,
+    )?;
+    match client.request::<Value>(http_request).await {
+        Ok(table) if table["kind"] == "Table" => {
+            let metadata =
+                serde_json::from_value::<ListMeta>(table["metadata"].clone()).unwrap_or_default();
+            Ok(Some((table_rows(&table), metadata, table_columns(&table))))
+        }
+        Ok(_) => Ok(None),
+        Err(error) if unsupported_table(&error) => Ok(None),
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -139,6 +246,8 @@ async fn snapshot_with_client(
     let mut items = Vec::new();
     let mut continuation = String::new();
     let mut version = None;
+    let mut columns = Vec::new();
+    let mut use_table = !(request.kind == "Pod" && request.group.is_empty());
     loop {
         let params = ListParams::default()
             .limit(PAGE_SIZE)
@@ -156,7 +265,17 @@ async fn snapshot_with_client(
                     .collect::<Vec<_>>(),
                 response.metadata,
             )
+        } else if let Some((rows, metadata, page_columns)) = if use_table {
+            table_page(&client, request, &params).await?
         } else {
+            None
+        } {
+            if columns.is_empty() {
+                columns = page_columns;
+            }
+            (rows, metadata)
+        } else {
+            use_table = false;
             let response = dynamic_api_for_request(client.clone(), request)
                 .list_metadata(&params)
                 .await
@@ -189,6 +308,7 @@ async fn snapshot_with_client(
     Ok(ResourceSnapshot {
         items,
         resource_version: version.unwrap_or_default(),
+        columns,
     })
 }
 
@@ -239,6 +359,19 @@ fn project_event<T>(event: WatchEvent<T>, project: impl FnOnce(T) -> ResourceObj
     }
 }
 
+fn project_table_event(event: WatchEvent<Value>) -> RowEvent {
+    let first_row = |table: Value| table_rows(&table).into_iter().next();
+    match event {
+        WatchEvent::Added(table) | WatchEvent::Modified(table) => first_row(table)
+            .map(RowEvent::Upsert)
+            .unwrap_or(RowEvent::Bookmark(String::new())),
+        WatchEvent::Deleted(table) => first_row(table)
+            .map(RowEvent::Delete)
+            .unwrap_or(RowEvent::Bookmark(String::new())),
+        other => project_event(other, |_| metadata_row(ObjectMeta::default())),
+    }
+}
+
 async fn watch_stream(
     client: Client,
     request: &ResourceRequest,
@@ -254,6 +387,32 @@ async fn watch_stream(
             })
             .boxed())
     } else {
+        let url = dynamic_api_for_request(client.clone(), request)
+            .resource_url()
+            .to_string();
+        let table_request = kube::core::Request::new(url)
+            .watch(&params, version)
+            .map_err(kube::Error::BuildRequest)
+            .and_then(|request| {
+                as_table(request)
+                    .map_err(|error| kube::Error::Service(std::io::Error::other(error).into()))
+            })?;
+        match client.request_events::<Value>(table_request).await {
+            Ok(stream) => {
+                return Ok(stream
+                    // A row the client cannot parse is skipped, never fatal to the watch.
+                    .filter_map(|event| async move {
+                        match event {
+                            Err(kube::Error::SerdeError(_)) => None,
+                            other => Some(other),
+                        }
+                    })
+                    .map(|event| event.map(project_table_event))
+                    .boxed());
+            }
+            Err(error) if unsupported_table(&error) => {}
+            Err(error) => return Err(error),
+        }
         Ok(dynamic_api_for_request(client, request)
             .watch_metadata(&params, version)
             .await?
@@ -269,6 +428,7 @@ struct Publisher {
     id: String,
     sequence: u64,
     pending: Vec<Change>,
+    columns: Vec<TableColumn>,
 }
 
 impl Publisher {
@@ -295,6 +455,11 @@ impl Publisher {
                 items,
                 resource_version: version,
                 error,
+                columns: if action == "resetEnd" {
+                    std::mem::take(&mut self.columns)
+                } else {
+                    Vec::new()
+                },
             },
         );
     }
@@ -327,6 +492,7 @@ pub(super) async fn run_resource_watch(
         id: watch_id,
         sequence: 0,
         pending: Vec::with_capacity(BATCH_SIZE),
+        columns: Vec::new(),
     };
     let mut delay = 1_u64;
     loop {
@@ -349,6 +515,7 @@ pub(super) async fn run_resource_watch(
                     tokio::task::yield_now().await;
                 }
                 version = Some(snapshot.resource_version);
+                publisher.columns = snapshot.columns;
                 publisher.emit("resetEnd", Vec::new(), version.clone(), None);
             }
             let opening = tokio::time::timeout(
@@ -477,6 +644,66 @@ mod tests {
             None,
             "a wall-clock step back is not sleep"
         );
+    }
+
+    #[test]
+    fn server_tables_become_rows_with_cells_and_identity() {
+        let table = serde_json::json!({
+            "kind": "Table",
+            "metadata": { "resourceVersion": "42" },
+            "columnDefinitions": [
+                { "name": "Name", "type": "string", "priority": 0 },
+                { "name": "Type", "type": "string", "priority": 0 },
+                { "name": "Cluster-IP", "type": "string", "priority": 0 },
+                { "name": "Port(s)", "type": "string", "priority": 0 },
+                { "name": "Selector", "type": "string", "priority": 1 }
+            ],
+            "rows": [
+                { "cells": ["api", "ClusterIP", "10.0.0.12", "80/TCP,443/TCP", null], "object": { "metadata": { "name": "api", "namespace": "shop", "uid": "u1", "resourceVersion": "41" } } },
+                { "cells": ["bad"], "object": { "metadata": {} } }
+            ]
+        });
+        let columns = table_columns(&table);
+        assert_eq!(columns.len(), 5);
+        assert_eq!(columns[4].priority, 1);
+        let rows = table_rows(&table);
+        assert_eq!(rows.len(), 1, "rows without a name are dropped");
+        assert_eq!(rows[0].uid.as_deref(), Some("u1"));
+        assert_eq!(
+            rows[0].cells.as_deref(),
+            Some(
+                &[
+                    "api".to_string(),
+                    "ClusterIP".into(),
+                    "10.0.0.12".into(),
+                    "80/TCP,443/TCP".into(),
+                    String::new()
+                ][..]
+            )
+        );
+        assert_eq!(cell_text(&serde_json::json!(["a", 2])), "a,2");
+    }
+
+    #[test]
+    fn table_requests_ask_for_metadata_and_the_table_format() {
+        let request = as_table(
+            kube::core::Request::new("/api/v1/namespaces/shop/services")
+                .list(&ListParams::default().limit(500))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(request
+            .uri()
+            .to_string()
+            .ends_with("&includeObject=Metadata"));
+        assert!(request.headers()[http::header::ACCEPT]
+            .to_str()
+            .unwrap()
+            .contains("as=Table"));
+        match project_table_event(WatchEvent::Deleted(serde_json::json!({ "rows": [] }))) {
+            RowEvent::Bookmark(cursor) => assert!(cursor.is_empty()),
+            _ => panic!("an empty table event must not delete anything"),
+        }
     }
 
     #[test]
