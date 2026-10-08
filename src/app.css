@@ -7676,7 +7676,7 @@ main .ov-row.ov-row-active { background: var(--ui-surface-muted); box-shadow: in
 .ov-health > * { flex-shrink: 0; }
 
 /* Events: grouped by the object they describe, warnings first. */
-.events-groups { display: grid; gap: 10px; margin-top: 8px; }
+.events-groups { display: grid; align-content: start; grid-auto-rows: max-content; gap: 10px; flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; margin-top: 8px; padding-bottom: 16px; }
 .events-group { border: 1px solid var(--ui-border); border-radius: 12px; background: var(--ui-surface); overflow: hidden; }
 .events-group.events-group-warning { border-color: #f0dcb4; }
 main.theme-dark .events-group.events-group-warning { border-color: rgba(214, 160, 60, .35); }
@@ -8415,10 +8415,44 @@ html body main .ocm-work-row { grid-template-columns: minmax(180px, 1.4fr) minma
 .topology-line { display: inline-block; width: 22px; border-top: 1.5px solid var(--ui-border-strong); }
 .topology-line-uses { border-top-style: dashed; }
 .topology-note { margin: 0 0 10px; color: var(--ui-muted); font-size: 12px; }
-.topology-scroll { max-height: calc(100vh - 250px); min-height: 320px; }
+.topology-scroll { flex: 1 1 auto; min-height: 240px; }
 .topology-band { position: absolute; left: 0; right: 0; display: flex; align-items: center; gap: 7px; height: 26px; padding: 0 10px; border-bottom: 1px solid var(--ui-border); color: var(--ui-muted); font-size: 12px; pointer-events: none; }
 .topology-band strong { color: var(--ui-ink); font-size: 12.5px; }
 .topology-band small { font-size: 11px; }
 .topology-node { width: 220px; }
 .argo-edge.topology-edge-uses { stroke-dasharray: 4 4; opacity: .75; }
 .topology-missing { border-style: dashed; border-left-style: solid; background: transparent; }
+.topology-page { position: relative; }
+.topology-selected { outline: 2px solid var(--ui-accent); outline-offset: 2px; }
+.topology-popup { position: absolute; top: 14px; right: 14px; bottom: 14px; z-index: 20; display: flex; flex-direction: column; width: min(400px, calc(100% - 28px)); border: 1px solid var(--ui-border-strong); border-radius: 14px; color: var(--ui-ink); background: var(--ui-surface); box-shadow: 0 18px 48px rgba(0, 0, 0, .22); outline: none; overflow: hidden; }
+.topology-popup header { display: flex; align-items: center; gap: 10px; padding: 14px 14px 10px; }
+.topology-popup header > div { display: grid; min-width: 0; flex: 1; line-height: 1.3; }
+.topology-popup header small { color: var(--ui-muted); font-size: 11px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; }
+.topology-popup header strong { overflow: hidden; font-size: 15px; text-overflow: ellipsis; white-space: nowrap; }
+.topology-popup-close { display: grid; place-items: center; width: 28px; height: 28px; border: 1px solid var(--ui-border); border-radius: 8px; color: var(--ui-muted); background: transparent; font-size: 18px; line-height: 1; cursor: pointer; }
+.topology-popup-close:hover { color: var(--ui-ink); background: var(--ui-surface-strong); }
+.topology-popup-status { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 0 14px 10px; color: var(--ui-muted); font-size: 12px; }
+.topology-popup-note { margin: 0 14px 10px; padding: 8px 10px; border: 1px solid rgba(217, 105, 92, .35); border-radius: 9px; color: var(--ui-ink); background: rgba(217, 105, 92, .08); font-size: 12px; line-height: 1.45; }
+.topology-popup-tabs { display: flex; gap: 4px; padding: 0 14px; border-bottom: 1px solid var(--ui-border); }
+.topology-popup-tabs button { padding: 7px 10px; border: 0; border-bottom: 2px solid transparent; color: var(--ui-muted); background: transparent; font: inherit; font-size: 12.5px; font-weight: 650; cursor: pointer; }
+.topology-popup-tabs button.active { border-bottom-color: var(--ui-accent); color: var(--ui-ink); }
+.topology-popup-body { display: grid; align-content: start; gap: 14px; min-height: 0; flex: 1; overflow: auto; padding: 12px 14px 16px; }
+.topology-popup-body h4 { margin: 0 0 7px; color: var(--ui-muted); font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+.topology-popup-body .argo-facts { margin: 0; }
+.topology-popup-body .argo-values pre { max-height: none; }
+.topology-popup-container { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 0; border-top: 1px solid var(--ui-border); }
+.topology-popup-container > div { display: grid; min-width: 0; }
+.topology-popup-container strong { font-size: 12.5px; }
+.topology-popup-container code { overflow: hidden; color: var(--ui-muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.topology-popup-link { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; padding: 6px 8px; border: 0; border-radius: 8px; color: var(--ui-muted); background: transparent; font: inherit; font-size: 12px; text-align: left; cursor: pointer; }
+.topology-popup-link:hover { background: var(--ui-surface-strong); }
+.topology-popup-link b { display: inline-flex; align-items: center; gap: 5px; min-width: 0; overflow: hidden; color: var(--argo-fg, var(--ui-ink)); font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.topology-popup-event { display: grid; gap: 4px; padding: 8px 0; border-top: 1px solid var(--ui-border); }
+.topology-popup-event .argo-badge { justify-self: start; }
+.topology-popup-event p { margin: 0; font-size: 12px; line-height: 1.45; }
+.topology-popup-event small { color: var(--ui-muted); font-size: 11px; }
+.topology-popup footer { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--ui-border); }
+.topology-popup footer button { display: inline-flex; align-items: center; gap: 6px; }
+/* Settings is a plain document page: it scrolls as a whole when its sections outgrow the window. */
+.content.settings-content { overflow-y: auto; }
+.content.settings-content > * { flex-shrink: 0; }

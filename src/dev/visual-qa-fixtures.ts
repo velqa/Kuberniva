@@ -762,3 +762,33 @@ export function visualQaTopology(args: Record<string, unknown>) {
   const kept = new Set(nodes.filter((node) => keep(node.namespace)).map((node) => node.id));
   return { nodes: nodes.filter((node) => kept.has(node.id)), edges: edges.filter((edge) => kept.has(edge.from) && kept.has(edge.to)), warnings: [] as string[] };
 }
+
+export function visualQaTopologyDetail(args: Record<string, unknown>) {
+  const request = (args.request || {}) as Record<string, string>;
+  const { kind, name, namespace } = request;
+  const metadata = { name, namespace, creationTimestamp: new Date(Date.now() - 3 * 3600_000).toISOString(), labels: { app: name.replace(/-[a-z0-9]{5,10}(-[a-z0-9]{5})?$/, ''), 'app.kubernetes.io/part-of': namespace } };
+  const manifests: Record<string, Record<string, unknown>> = {
+    Pod: {
+      metadata: { ...metadata, ownerReferences: [{ kind: 'ReplicaSet', name: name.replace(/-[a-z0-9]{5}$/, '') }] },
+      spec: { nodeName: 'ip-10-0-3-17.ec2.internal', serviceAccountName: 'default', containers: [{ name: 'app', image: `registry.acme.example.com/${namespace}/${name.split('-')[0]}:1.42.0` }, { name: 'istio-proxy', image: 'docker.io/istio/proxyv2:1.23.2' }] },
+      status: {
+        phase: 'Running', podIP: '10.0.3.88', qosClass: 'Burstable',
+        containerStatuses: name.endsWith('r2t6w')
+          ? [{ name: 'app', ready: false, restartCount: 14, state: { waiting: { reason: 'CrashLoopBackOff' } } }, { name: 'istio-proxy', ready: true, restartCount: 0, state: { running: {} } }]
+          : [{ name: 'app', ready: true, restartCount: 0, state: { running: {} } }, { name: 'istio-proxy', ready: true, restartCount: 0, state: { running: {} } }],
+      },
+    },
+    Deployment: { metadata, spec: { replicas: 7, strategy: { type: 'RollingUpdate' }, selector: { matchLabels: { app: name } }, template: { spec: { containers: [{ name: 'app', image: `registry.acme.example.com/${namespace}/${name}:1.42.0` }] } } }, status: { readyReplicas: 6 } },
+    Service: { metadata, spec: { type: 'ClusterIP', clusterIP: '10.96.41.12', selector: { app: name }, ports: [{ name: 'http', port: 8080, targetPort: 8080 }] } },
+    ConfigMap: { metadata, data: { 'application.yaml': 'server:\n  port: 8080\n', LOG_LEVEL: 'info', FEATURE_CHECKOUT_V2: 'true' } },
+    Secret: { metadata, type: 'Opaque', data: { API_KEY: 'c2tfbGl2ZV9xYQ==', WEBHOOK_SECRET: 'd2hzZWNfcWE=' } },
+  };
+  const manifest = { apiVersion: 'v1', kind, ...(manifests[kind] || { metadata, spec: {} }) };
+  const yaml = JSON.stringify(manifest, null, 2).replace(/"([^"]+)":/g, '$1:').replace(/[{}[\],]/g, '').split('\n').filter((line) => line.trim()).join('\n');
+  return { manifest, yaml };
+}
+
+export const visualQaTopologyEvents = [
+  { name: 'e1', eventType: 'Warning', reason: 'BackOff', message: 'Back-off restarting failed container app in pod checkout-6d8f9c7b5-r2t6w', count: 52, lastObserved: new Date(Date.now() - 60_000).toISOString() },
+  { name: 'e2', eventType: 'Normal', reason: 'Pulled', message: 'Container image "registry.acme.example.com/payments/checkout:1.42.0" already present on machine', count: 14, lastObserved: new Date(Date.now() - 120_000).toISOString() },
+];

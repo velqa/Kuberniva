@@ -5,7 +5,8 @@
   import { LiveResourceStore, panePercent, type RowChange } from './lib/live-resources';
   import { KeyedFeedStore, newestEvents, type FeedChange } from './lib/live-feed';
   import { layoutGraph, type GraphInput } from './lib/argo-graph';
-  import { layoutTopology, PROBLEM_HEALTH, type Topology, type PlacedNode } from './lib/topology';
+  import { layoutTopology, PROBLEM_HEALTH, type Topology, type TopologyNode } from './lib/topology';
+  import { redactSecret, summarizeObject } from './lib/object-summary';
   import { clusterSet as ocmClusterSet, managedCluster, manifestWork as ocmManifestWork, ocmTone, placement as ocmPlacement, policy as ocmPolicy, type OcmCluster } from './lib/ocm';
   import { columnFromDrag, dragResize, leftColumnWidths, percentOfContainer, widthFromDrag } from './lib/drag-resize';
   import { admissionPolicyView, isAdmissionPolicyKind, tokenizeCel, type CelEntry } from './lib/admission-policy';
@@ -324,6 +325,9 @@
   let resumeRecoveryPending = false;
   let resumeRecoveryContext: LiveRefreshContext | null = null;
   let lastHiddenAt = 0;
+  let lastBackendResumeAt = 0;
+  /** Away at least this long and the backend reconnects every live view on return. */
+  const BACKEND_RESUME_AFTER_MS = 60_000;
   let resumeRecoveryTimer: ReturnType<typeof window.setTimeout> | undefined;
   let stopWindowFocusListening: (() => void) | undefined;
   let relatedObject: ResourceObject | null = null;
@@ -695,8 +699,10 @@
       const fixtures = await import('./dev/visual-qa-fixtures');
       return (command === 'list_helm_releases' ? fixtures.visualQaHelmReleases : fixtures.visualQaHelmDetail(args)) as T;
     }
-    if (import.meta.env.DEV && visualQaRecoveryScenario === 'topology' && command === 'cluster_topology') {
+    if (import.meta.env.DEV && visualQaRecoveryScenario === 'topology' && ['cluster_topology', 'get_resource_detail', 'read_object_events'].includes(command)) {
       const fixtures = await import('./dev/visual-qa-fixtures');
+      if (command === 'get_resource_detail') return fixtures.visualQaTopologyDetail(args) as T;
+      if (command === 'read_object_events') return fixtures.visualQaTopologyEvents as T;
       return fixtures.visualQaTopology(args) as T;
     }
     if (import.meta.env.DEV && visualQaRecoveryScenario === 'argocd' && command === 'argocd_resource_tree') {
@@ -1171,16 +1177,118 @@
     }, 15_000);
   }
 
-  function openTopologyNode(node: PlacedNode) {
+  type TopologyTab = 'overview' | 'yaml' | 'events';
+  type TopologyLink = { label: string; node: TopologyNode };
+  let topologySelected: TopologyNode | null = null;
+  let topologyTab: TopologyTab = 'overview';
+  let topologyDetail: ResourceDetail | null = null;
+  let topologyDetailError = '';
+  let loadingTopologyDetail = false;
+  let topologyEvents: ClusterEvent[] = [];
+  let loadingTopologyEvents = false;
+  let topologyDetailKey = '';
+  const TOPOLOGY_LINK_LABELS: Record<string, [string, string]> = {
+    routes: ['Routes to', 'Routed from'], selects: ['Selects', 'Selected by'], owns: ['Owns', 'Owned by'], uses: ['Uses', 'Used by'],
+  };
+  const topologyId = (node: Pick<TopologyNode, 'kind' | 'namespace' | 'name'>) => `${node.kind}/${node.namespace}/${node.name}`;
+  // The selected object as of the latest refresh; null once it has left the cluster.
+  $: topologyCurrent = topologySelected && topology ? topology.nodes.find((node) => node.id === topologyId(topologySelected!)) || null : null;
+  $: topologyLinks = topologySelected && topology ? linksFor(topologyId(topologySelected), topology) : [];
+  $: topologySummary = topologySelected && topologyDetail ? summarizeObject(topologySelected.kind, topologyDetail.manifest) : null;
+  $: if (activeView !== 'Topology' && topologySelected) closeTopologyDetail();
+
+  function linksFor(id: string, graph: Topology): TopologyLink[] {
+    const byId = new Map(graph.nodes.map((node) => [node.id, node]));
+    const links: TopologyLink[] = [];
+    for (const edge of graph.edges) {
+      const [outLabel, inLabel] = TOPOLOGY_LINK_LABELS[edge.relation] || ['Links to', 'Linked from'];
+      if (edge.from === id && byId.has(edge.to)) links.push({ label: outLabel, node: byId.get(edge.to)! });
+      if (edge.to === id && byId.has(edge.from)) links.push({ label: inLabel, node: byId.get(edge.from)! });
+    }
+    return links;
+  }
+
+  function topologyDescriptor(node: TopologyNode) {
+    return catalog.resources.find((candidate) => candidate.group === node.group && candidate.kind === node.kind) || null;
+  }
+
+  /** Opens an object's details over the map; the map stays where it is. */
+  function openTopologyNode(node: TopologyNode) {
     if (node.moreOf) {
       topologyExpanded = new Set([...topologyExpanded, node.moreOf]);
       return;
     }
-    if (node.health === 'Missing') {
-      notify(`${node.kind} ${node.namespace}/${node.name} is referenced but could not be found in the cluster`);
+    topologySelected = node;
+    topologyTab = 'overview';
+    topologyDetail = null;
+    topologyDetailError = '';
+    topologyEvents = [];
+    topologyDetailKey = `${activeClusterId}|${topologyId(node)}`;
+    if (node.health !== 'Missing') void loadTopologyDetail(node, topologyDetailKey);
+  }
+
+  function closeTopologyDetail() {
+    topologySelected = null;
+    topologyDetail = null;
+    topologyDetailKey = '';
+  }
+
+  async function loadTopologyDetail(node: TopologyNode, key: string) {
+    const descriptor = topologyDescriptor(node);
+    if (!descriptor) {
+      topologyDetailError = `${node.kind} is not served by this cluster's API`;
       return;
     }
-    void openArgoResource({ group: node.group, version: '', kind: node.kind, name: node.name, namespace: node.namespace, sync: '', health: node.health, healthMessage: '', requiresPruning: false, hook: false });
+    loadingTopologyDetail = true;
+    try {
+      const detail = await invokeRead<ResourceDetail>('get_resource_detail', {
+        request: {
+          kubeconfigPath: activeKubeconfigPath || kubeconfigPath || null, context: activeCluster,
+          group: descriptor.group, version: descriptor.version, kind: descriptor.kind, plural: descriptor.plural,
+          namespaced: descriptor.namespaced, namespace: node.namespace || null, name: node.name,
+        },
+      });
+      if (topologyDetailKey !== key) return;
+      // Secret values never reach the popup: only key names are kept.
+      topologyDetail = node.kind === 'Secret' ? { manifest: redactSecret('Secret', detail.manifest), yaml: '' } : detail;
+      topologyDetailError = '';
+    } catch (error) {
+      if (topologyDetailKey === key) topologyDetailError = String(error).replace(/^Error:\s*/, '');
+    } finally {
+      if (topologyDetailKey === key) loadingTopologyDetail = false;
+    }
+  }
+
+  async function showTopologyTab(tab: TopologyTab) {
+    topologyTab = tab;
+    if (tab !== 'events' || !topologySelected || loadingTopologyEvents) return;
+    const node = topologySelected;
+    const key = topologyDetailKey;
+    loadingTopologyEvents = true;
+    try {
+      const events = await invokeRead<ClusterEvent[]>('read_object_events', {
+        kubeconfigPath: activeKubeconfigPath || kubeconfigPath || null, context: activeCluster,
+        namespace: node.namespace, kind: node.kind, name: node.name,
+      });
+      if (topologyDetailKey === key) topologyEvents = events;
+    } catch {
+      if (topologyDetailKey === key) topologyEvents = [];
+    } finally {
+      loadingTopologyEvents = false;
+    }
+  }
+
+  function openTopologyIn(node: TopologyNode, action: 'open' | 'logs' | 'shell') {
+    const object = { name: node.name, namespace: node.namespace };
+    closeTopologyDetail();
+    if (action === 'logs') {
+      void openPodLogs(object, [], 'Topology');
+      return;
+    }
+    void openArgoResource({ group: node.group, version: '', kind: node.kind, name: node.name, namespace: node.namespace, sync: '', health: node.health, healthMessage: '', requiresPruning: false, hook: false }).then(() => {
+      const descriptor = topologyDescriptor(node);
+      if (action === 'shell' && descriptor) void openWorkloadTerminal(descriptor, object);
+    });
   }
 
   const TOPOLOGY_ICONS: Record<string, typeof Globe> = {
@@ -3205,6 +3313,19 @@
     return Number.isFinite(time) ? Date.now() - time : Number.POSITIVE_INFINITY;
   }
 
+  /**
+   * After the window has been in the background (another app, Stage Manager, minimized),
+   * pooled connections and cached credentials may have gone stale without an error. The
+   * backend drops them and every live list and feed reopens from its last cursor, so only
+   * what changed while away arrives; nothing on screen resets.
+   */
+  function resumeBackendAfterAway(hiddenDuration: number) {
+    if (hiddenDuration < BACKEND_RESUME_AFTER_MS || !activeClusterId || !('__TAURI_INTERNALS__' in window)) return;
+    if (Date.now() - lastBackendResumeAt < BACKEND_RESUME_AFTER_MS) return;
+    lastBackendResumeAt = Date.now();
+    void import('@tauri-apps/api/core').then(({ invoke }) => invoke('resume_live_connections')).catch(() => undefined);
+  }
+
   function queueLiveResumeRecovery(_hiddenDuration = 0) {
     if (!activeClusterId || !['Overview', 'Events', 'Workloads', 'Resources', 'Logs'].includes(activeView)) return;
     const feedView = activeView === 'Overview' || activeView === 'Events';
@@ -3254,6 +3375,7 @@
         }
         const hiddenDuration = lastHiddenAt ? Date.now() - lastHiddenAt : 0;
         lastHiddenAt = 0;
+        resumeBackendAfterAway(hiddenDuration);
         queueLiveResumeRecovery(hiddenDuration);
       });
     } catch {
@@ -6076,11 +6198,13 @@
       }
       const hiddenDuration = lastHiddenAt ? Date.now() - lastHiddenAt : 0;
       lastHiddenAt = 0;
+      resumeBackendAfterAway(hiddenDuration);
       queueLiveResumeRecovery(hiddenDuration);
     };
     const handleWindowFocus = () => {
       const hiddenDuration = lastHiddenAt ? Date.now() - lastHiddenAt : 0;
       lastHiddenAt = 0;
+      resumeBackendAfterAway(hiddenDuration);
       queueLiveResumeRecovery(hiddenDuration);
     };
     const handleNetworkOnline = () => {
@@ -6805,7 +6929,7 @@
     </header>
 
 
-    <div class:resource-workspace-content={activeView === 'Resources'} class:workload-workspace-content={activeView === 'Workloads'} class="content">
+    <div class:settings-content={activeView === 'Settings'} class:resource-workspace-content={activeView === 'Resources'} class:workload-workspace-content={activeView === 'Workloads'} class="content">
       <div class:cluster-page-heading={activeView === 'Clusters'} class:resource-page-heading={activeView === 'Resources'} class="page-heading">
         <div>
           <div class="title-line"><h1>{activeViewTitle}</h1>{#if activeClusterId && !catalogError && pageLive}<span class="live-pill live-state-{pageLive.state}" title={pageLive.tooltip} aria-label={pageLive.tooltip} aria-live="polite"><b></b> {pageLive.text}</span>{/if}</div>
@@ -7256,7 +7380,7 @@
                   <svg class="argo-graph-edges" width={topologyLayout.width} height={topologyLayout.height} aria-hidden="true">{#each topologyLayout.edges as edge (`${edge.from}>${edge.to}`)}<path d={edge.path} class="argo-edge topology-edge-{edge.relation} argo-tone-{topologyTone(edge.tone)}" />{/each}</svg>
                   {#each topologyLayout.bands as band (band.namespace)}<div class="topology-band" style:top={`${band.y}px`}><Boxes size={13} /><strong>{band.namespace || 'cluster'}</strong><small>{band.groups} {band.groups === 1 ? 'group' : 'groups'}</small></div>{/each}
                   {#each topologyLayout.nodes as node (node.id)}
-                    <button type="button" class:argo-graph-more={Boolean(node.moreOf)} class:topology-missing={node.health === 'Missing'} class="argo-graph-node topology-node argo-tone-{topologyTone(node.health)}" style:left={`${node.x}px`} style:top={`${node.y}px`} title={`${node.kind} ${node.namespace ? `${node.namespace}/` : ''}${node.name}${node.info ? ` · ${node.info}` : ''}`} on:click={() => openTopologyNode(node)}>
+                    <button type="button" class:argo-graph-more={Boolean(node.moreOf)} class:topology-missing={node.health === 'Missing'} class:topology-selected={topologySelected !== null && topologyId(node) === topologyId(topologySelected)} class="argo-graph-node topology-node argo-tone-{topologyTone(node.health)}" style:left={`${node.x}px`} style:top={`${node.y}px`} title={`${node.kind} ${node.namespace ? `${node.namespace}/` : ''}${node.name}${node.info ? ` · ${node.info}` : ''}`} on:click={() => openTopologyNode(node)}>
                       {#if node.moreOf}<strong>{node.name}</strong><small>{node.info} · show all</small>
                       {:else}
                         <span class="argo-graph-icon"><svelte:component this={TOPOLOGY_ICONS[node.kind] || Boxes} size={14} /></span>
@@ -7266,6 +7390,57 @@
                   {/each}
                 </div>
               </div>
+              {#if topologySelected}
+                {@const shown = topologyCurrent || topologySelected}
+                <div class="topology-popup" role="dialog" aria-label={`${shown.kind} ${shown.name}`} tabindex="-1" use:focusOnMount on:keydown={(event) => event.key === 'Escape' && closeTopologyDetail()}>
+                  <header>
+                    <span class="argo-graph-icon argo-tone-{topologyTone(shown.health)}"><svelte:component this={TOPOLOGY_ICONS[shown.kind] || Boxes} size={16} /></span>
+                    <div><small>{shown.kind}{shown.namespace ? ` · ${shown.namespace}` : ''}</small><strong title={shown.name}>{shown.name}</strong></div>
+                    <button type="button" class="topology-popup-close" aria-label="Close details" on:click={closeTopologyDetail}>×</button>
+                  </header>
+                  <div class="topology-popup-status">
+                    <span class="argo-badge argo-tone-{topologyTone(shown.health)}">{shown.health}</span>
+                    {#if shown.info}<span>{shown.info}</span>{/if}
+                  </div>
+                  {#if !topologyCurrent && topologyKey}<p class="topology-popup-note">This object is no longer in the cluster. It was removed after the map was drawn.</p>{/if}
+                  {#if shown.health === 'Missing'}<p class="topology-popup-note">Nothing with this name exists in {shown.namespace}. Workloads that use it may fail to start until it is created.</p>{/if}
+                  <div class="topology-popup-tabs" role="tablist">
+                    {#each [['overview', 'Overview'], ['yaml', 'YAML'], ['events', 'Events']] as [tab, label]}
+                      {#if tab !== 'yaml' || shown.kind !== 'Secret'}<button type="button" role="tab" aria-selected={topologyTab === tab} class:active={topologyTab === tab} on:click={() => showTopologyTab(tab as TopologyTab)}>{label}</button>{/if}
+                    {/each}
+                  </div>
+                  <div class="topology-popup-body">
+                    {#if topologyTab === 'overview'}
+                      {#if loadingTopologyDetail && !topologyDetail}<p class="argo-muted">Loading details…</p>
+                      {:else if topologyDetailError}<p class="topology-popup-note">{topologyDetailError}</p>{/if}
+                      {#if topologySummary}
+                        {#if topologySummary.facts.length}<dl class="argo-facts">{#each topologySummary.facts as item}<div><dt>{item.label}</dt><dd title={item.value}>{item.value}</dd></div>{/each}</dl>{/if}
+                        {#if topologySummary.containers.length}
+                          <section><h4>Containers</h4>{#each topologySummary.containers as container}<div class="topology-popup-container"><div><strong>{container.name}{container.init ? ' (init)' : ''}</strong><code title={container.image}>{container.image}</code></div>{#if container.state}<span class="argo-badge argo-tone-{container.ready ? 'ok' : container.state === 'Running' || container.state === 'Completed' ? 'warn' : 'bad'}">{container.state}{container.restarts ? ` · ${container.restarts} restarts` : ''}</span>{/if}</div>{/each}</section>
+                        {/if}
+                        {#if topologySummary.keys.length}<section><h4>{shown.kind === 'Secret' ? 'Keys (values hidden)' : 'Keys'}</h4><div class="policy-rules">{#each topologySummary.keys as key}<code class="ocm-chip">{key}</code>{/each}</div></section>{/if}
+                      {/if}
+                      {#if topologyLinks.length}
+                        <section><h4>Connections</h4>{#each topologyLinks.slice(0, 14) as link}<button type="button" class="topology-popup-link" on:click={() => openTopologyNode(link.node)}><span>{link.label}</span><b class="argo-tone-{topologyTone(link.node.health)}"><svelte:component this={TOPOLOGY_ICONS[link.node.kind] || Boxes} size={12} />{link.node.kind} {link.node.name}</b></button>{/each}{#if topologyLinks.length > 14}<small class="argo-muted">+{topologyLinks.length - 14} more</small>{/if}</section>
+                      {/if}
+                      {#if topologySummary?.labels.length}<section><h4>Labels</h4><div class="policy-rules">{#each topologySummary.labels as item}<code class="ocm-chip" title={`${item.label}=${item.value}`}>{item.label}={item.value}</code>{/each}</div></section>{/if}
+                    {:else if topologyTab === 'yaml'}
+                      {#if topologyDetail?.yaml}<div class="argo-values"><div><span>Manifest</span><button type="button" class="argo-node-actions-copy" on:click={() => copyText(topologyDetail?.yaml || '', 'YAML')}><Copy size={12} />Copy</button></div><pre>{topologyDetail.yaml}</pre></div>
+                      {:else}<p class="argo-muted">{loadingTopologyDetail ? 'Loading…' : topologyDetailError || 'No manifest available.'}</p>{/if}
+                    {:else}
+                      {#if loadingTopologyEvents}<p class="argo-muted">Loading events…</p>
+                      {:else if topologyEvents.length}{#each topologyEvents as event}<div class="topology-popup-event"><span class="argo-badge argo-tone-{event.eventType === 'Warning' ? 'bad' : 'ok'}">{event.reason || event.eventType}</span><p>{event.message}</p><small>{eventAge(event)}{event.count && event.count > 1 ? ` · ×${event.count}` : ''}</small></div>{/each}
+                      {:else}<p class="argo-muted">No recent events for this object.</p>{/if}
+                    {/if}
+                  </div>
+                  {#if shown.health !== 'Missing' && topologyCurrent}
+                    <footer>
+                      {#if shown.kind === 'Pod'}<button type="button" class="secondary" on:click={() => openTopologyIn(shown, 'logs')}><ScrollText size={13} />Logs</button><button type="button" class="secondary" on:click={() => openTopologyIn(shown, 'shell')}><Terminal size={13} />Shell</button>{/if}
+                      <button type="button" class="secondary" on:click={() => openTopologyIn(shown, 'open')}>Open in {topologyDescriptor(shown)?.category === 'Workloads' ? 'Workloads' : 'Resources'}</button>
+                    </footer>
+                  {/if}
+                </div>
+              {/if}
               {#if topologyLayout.hidden}<p class="topology-note">{topologyLayout.hidden} more objects are not drawn. Pick a namespace or filter to see them.</p>{/if}
             {:else}
               <div class="argo-empty"><strong>{topologySearch || topologyProblemsOnly ? 'Nothing matches' : 'No objects here'}</strong><small>{topologyProblemsOnly ? 'No failing or missing objects in this scope.' : topologySearch ? 'Try a different filter.' : 'This namespace has no workloads, Services, or routes.'}</small></div>
