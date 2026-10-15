@@ -32,7 +32,7 @@ export type DragResizeOptions = {
   /** Maps a pointer position to a value. */
   fromPointer: (event: { clientX: number }, start: DragStart) => number;
   onChange: (value: number) => void;
-  onCommit?: (value: number) => void;
+  onCommit?: (value: number, node: HTMLElement) => void;
 };
 
 export function clampValue(value: number, min: number, max: number) {
@@ -52,7 +52,7 @@ export function dragResize(node: HTMLElement, initial: DragResizeOptions) {
   const set = (value: number, commit = false) => {
     const next = clampValue(value, options.min, options.max);
     options.onChange(next);
-    if (commit) options.onCommit?.(next);
+    if (commit) options.onCommit?.(next, node);
   };
   const onPointerDown = (event: PointerEvent) => {
     if (event.button !== 0) return;
@@ -93,7 +93,7 @@ export function dragResize(node: HTMLElement, initial: DragResizeOptions) {
       window.removeEventListener('pointerup', stop);
       window.removeEventListener('pointercancel', stop);
       document.body.classList.remove('is-resizing');
-      options.onCommit?.(latest);
+      options.onCommit?.(latest, node);
       stopDrag = undefined;
     };
     stopDrag = () => stop();
@@ -110,6 +110,8 @@ export function dragResize(node: HTMLElement, initial: DragResizeOptions) {
           : event.key === 'End' ? options.max : null;
     if (next === null) return;
     event.preventDefault();
+    const target = options.target?.(node) || node.parentElement || node;
+    options.onStart?.(node, { value: options.value, x: 0, node, layoutWidth: target.offsetWidth, scale: renderScale(target) });
     set(next, true);
   };
   const onDoubleClick = (event: MouseEvent) => {

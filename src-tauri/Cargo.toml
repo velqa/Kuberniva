@@ -1,6 +1,6 @@
 [package]
 name = "kuberniva"
-version = "0.6.1"
+version = "0.6.2"
 description = "A focused Kubernetes control surface"
 authors = ["Vijay Kumar Sevakula"]
 license = "MIT"
@@ -30,7 +30,7 @@ tauri-plugin-log = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-clipboard-manager = "2"
 kube = { version = "4.2.0", features = ["client", "config", "rustls-tls", "ws"] }
-futures-util = "0.3"
+futures-util = { version = "0.3", features = ["io"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process"] }
 k8s-openapi = { version = "0.28.0", features = ["v1_32"] }
 base64 = "0.22"

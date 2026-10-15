@@ -8456,3 +8456,40 @@ html body main .ocm-work-row { grid-template-columns: minmax(180px, 1.4fr) minma
 /* Settings is a plain document page: it scrolls as a whole when its sections outgrow the window. */
 .content.settings-content { overflow-y: auto; }
 .content.settings-content > * { flex-shrink: 0; }
+.log-stream-state { display: inline-flex; align-items: center; gap: 6px; }
+.log-stream-state::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--ui-border-strong); }
+.log-stream-live::before { background: #3fa66b; box-shadow: 0 0 0 3px rgba(63, 166, 107, .18); animation: log-stream-pulse 1.8s ease-in-out infinite; }
+.log-stream-reconnecting::before { background: #d49b2e; }
+@keyframes log-stream-pulse { 50% { box-shadow: 0 0 0 5px rgba(63, 166, 107, 0); } }
+@media (prefers-reduced-motion: reduce) { .log-stream-live::before { animation: none; } }
+
+/* Sidebar motion: the item under the pointer lifts with an accent bar, its icon pops, and a
+   newly selected page springs into place. */
+.sidebar nav .nav-item,
+.sidebar nav .sidebar-tree-item,
+.sidebar nav .sidebar-tree-section { position: relative; transition: color .16s ease, background-color .16s ease, transform .24s cubic-bezier(.34, 1.56, .64, 1); }
+.sidebar nav .nav-item::before,
+.sidebar nav .sidebar-tree-item::before { content: ""; position: absolute; left: 0; top: 50%; width: 3px; height: 62%; border-radius: 0 3px 3px 0; background: var(--ui-accent, #c45c32); opacity: 0; transform: translateY(-50%) scaleY(0); transition: transform .24s cubic-bezier(.34, 1.56, .64, 1), opacity .16s ease; pointer-events: none; }
+.sidebar nav .nav-item:hover,
+.sidebar nav .nav-item:focus-visible,
+.sidebar nav .sidebar-tree-item:hover,
+.sidebar nav .sidebar-tree-item:focus-visible,
+.sidebar nav .sidebar-tree-section:hover { transform: translateX(3px); }
+.sidebar nav .nav-item:not(.active):hover::before,
+.sidebar nav .nav-item:not(.active):focus-visible::before,
+.sidebar nav .sidebar-tree-item:not(.sidebar-tree-item-selected):hover::before { opacity: .55; transform: translateY(-50%) scaleY(1); }
+.sidebar nav .nav-icon svg,
+.sidebar nav .sidebar-tree-item svg:first-child { transition: transform .28s cubic-bezier(.34, 1.56, .64, 1); }
+.sidebar nav .nav-item:hover .nav-icon svg,
+.sidebar nav .sidebar-tree-item:hover svg:first-child { transform: scale(1.16) rotate(-4deg); }
+.sidebar nav .nav-item:active,
+.sidebar nav .sidebar-tree-item:active { transform: translateX(3px) scale(.97); }
+.sidebar nav .nav-item.active,
+.sidebar nav .sidebar-tree-item-selected { animation: sidebar-select .38s cubic-bezier(.34, 1.56, .64, 1); }
+.sidebar nav .nav-item.active .nav-icon svg { animation: sidebar-icon-pop .42s cubic-bezier(.34, 1.56, .64, 1); }
+@keyframes sidebar-select { 0% { transform: translateX(-4px) scale(.96); } 55% { transform: translateX(2px) scale(1.02); } 100% { transform: none; } }
+@keyframes sidebar-icon-pop { 0% { transform: scale(.7); } 60% { transform: scale(1.22); } 100% { transform: none; } }
+@media (prefers-reduced-motion: reduce) {
+  .sidebar nav .nav-item, .sidebar nav .sidebar-tree-item, .sidebar nav .sidebar-tree-section,
+  .sidebar nav .nav-icon svg, .sidebar nav .sidebar-tree-item svg:first-child { transition: color .16s ease, background-color .16s ease; animation: none !important; transform: none !important; }
+}

@@ -40,6 +40,7 @@ use x509_parser::{parse_x509_certificate, pem::parse_x509_pem};
 mod helm;
 mod live_feeds;
 mod live_resources;
+mod log_stream;
 mod topology;
 use live_resources::{
     run_resource_watch, spawn_sleep_monitor, ResourceSnapshot, ResourceWatchRequest,
@@ -5641,6 +5642,8 @@ pub fn run() {
             argocd_resource_tree,
             list_helm_releases,
             cluster_topology,
+            log_stream::start_log_stream,
+            log_stream::stop_log_stream,
             get_helm_release,
             read_object_events,
             get_resource_detail,
