@@ -117,7 +117,11 @@ async fn container_finished(pods: &Api<Pod>, pod: &str, container: Option<&str>)
     }
 }
 
-async fn follow(app: tauri::AppHandle, request: LogStreamRequest, mut stop: oneshot::Receiver<()>) {
+async fn follow<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    request: LogStreamRequest,
+    mut stop: oneshot::Receiver<()>,
+) {
     let emit = |lines: Vec<String>, status: &'static str, message: Option<String>| {
         let _ = app.emit(
             "kuberniva://log-stream",
@@ -220,9 +224,11 @@ async fn follow(app: tauri::AppHandle, request: LogStreamRequest, mut stop: ones
     }
 }
 
+// Async so Tauri runs it on its runtime, not the main thread; the task itself is started
+// with Tauri's runtime handle, which works from any thread.
 #[tauri::command]
-pub(super) fn start_log_stream(
-    app: tauri::AppHandle,
+pub(super) async fn start_log_stream<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     request: LogStreamRequest,
 ) -> Result<(), String> {
     if request.stream_id.is_empty() || request.stream_id.len() > 128 {
@@ -242,7 +248,7 @@ pub(super) fn start_log_stream(
         streams.insert(request.stream_id.clone(), stop_tx);
     }
     let id = request.stream_id.clone();
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         follow(app, request, stop_rx).await;
         if let Ok(mut streams) = registry().lock() {
             if streams.get(&id).is_some_and(|sender| sender.is_closed()) {
@@ -268,6 +274,34 @@ pub(super) fn stop_log_stream(stream_id: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Opening logs must never take the app down: the stream starts on Tauri's runtime and an
+    /// unreachable cluster is reported as a reconnecting stream, not a crash.
+    #[test]
+    fn starting_a_stream_outside_a_runtime_reports_errors_instead_of_crashing() {
+        use tauri::Listener;
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let (sender, receiver) = std::sync::mpsc::channel::<String>();
+        handle.listen_any("kuberniva://log-stream", move |event| {
+            let _ = sender.send(event.payload().to_string());
+        });
+        let request = LogStreamRequest {
+            stream_id: "test-stream".into(),
+            kubeconfig_path: Some("/nonexistent/kubeconfig".into()),
+            context: Some("missing".into()),
+            namespace: "default".into(),
+            pod: "api".into(),
+            container: None,
+            since_time: None,
+        };
+        tauri::async_runtime::block_on(start_log_stream(handle.clone(), request)).unwrap();
+        let event = receiver
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the stream reports its state");
+        assert!(event.contains("\"status\":\"reconnecting\""), "{event}");
+        stop_log_stream("test-stream".into()).unwrap();
+    }
 
     #[test]
     fn reconnects_skip_lines_already_shown_but_keep_new_ones_in_the_same_second() {
