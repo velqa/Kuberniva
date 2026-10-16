@@ -8,6 +8,7 @@
   import { layoutTopology, PROBLEM_HEALTH, type Topology, type TopologyNode } from './lib/topology';
   import { redactSecret, summarizeObject } from './lib/object-summary';
   import { columnTracks, columnsRightOf, measureColumns, trackMinimum } from './lib/column-tracks';
+  import { groupLogLines, prettyJson } from './lib/log-format';
   import { clusterSet as ocmClusterSet, managedCluster, manifestWork as ocmManifestWork, ocmTone, placement as ocmPlacement, policy as ocmPolicy, type OcmCluster } from './lib/ocm';
   import { columnFromDrag, dragResize, leftColumnWidths, percentOfContainer, widthFromDrag } from './lib/drag-resize';
   import { admissionPolicyView, isAdmissionPolicyKind, tokenizeCel, type CelEntry } from './lib/admission-policy';
@@ -269,6 +270,9 @@
   let favoriteClusterNames: Record<string, string> = {};
   let favoriteContextMenu: { clusterId: string; x: number; y: number } | null = null;
   let favoriteRenameId = '';
+  // The ⋯ menu on an open object's details, which holds destructive actions like Delete.
+  let objectMenuOpen = false;
+  $: editorObject, (objectMenuOpen = false);
   let favoriteRenameValue = '';
   let selectedNodeName = '';
   let nodeDetailTab: NodeDetailTab = 'Overview';
@@ -559,9 +563,10 @@
     .filter(({ entry }) => !editorEntrySearch.trim()
       || `${entry.key} ${editorEntryDisplayValue(entry, revealSecret)}`.toLowerCase().includes(editorEntrySearch.trim().toLowerCase()));
   $: normalizedLogSearch = logSearch.trim().toLowerCase();
-  $: visibleLogLines = normalizedLogSearch
-    ? logLines.filter((line) => line.toLowerCase().includes(normalizedLogSearch))
-    : logLines;
+  // Multi-line output (pretty-printed dicts, JSON, stack traces) reads as one entry each.
+  let logPrettyJson = false;
+  $: logEntries = groupLogLines(logLines);
+  $: visibleLogEntries = normalizedLogSearch ? logEntries.filter((entry) => entry.text.toLowerCase().includes(normalizedLogSearch)) : logEntries;
   $: normalizedYamlSearch = yamlSearch.trim().toLowerCase();
   $: yamlSearchMatchCount = normalizedYamlSearch
     ? yamlText.toLowerCase().split(normalizedYamlSearch).length - 1
@@ -3007,6 +3012,18 @@
     return favoriteClusterNames[cluster.id] || cluster.name;
   }
 
+  /** Two letters that tell favorites apart at a glance: "payments-staging" → "PS". */
+  function favoriteInitials(label: string) {
+    const words = label.split(/[^A-Za-z0-9]+/).filter(Boolean);
+    const letters = words.length > 1 ? words[0][0] + words[1][0] : (words[0] || label).slice(0, 2);
+    return letters.toUpperCase();
+  }
+
+  /** Each favorite slot gets its own hue, spread around the color wheel. */
+  function favoriteHue(index: number) {
+    return String([18, 152, 212, 280, 45, 330, 110, 190, 250, 0][index % 10]);
+  }
+
   function openFavoriteContextMenu(event: MouseEvent, cluster: Cluster) {
     event.preventDefault();
     const menuWidth = 190;
@@ -4253,16 +4270,6 @@
   function eventAge(event: ClusterEvent) {
     const stamp = event.lastObserved || event.firstObserved;
     return stamp ? resourceAge(stamp) : '—';
-  }
-
-  // Split a leading RFC 3339 timestamp and detect the level so logs scan easily.
-  function parseLogLine(line: string): { time: string; text: string; level: 'error' | 'warn' | 'info' } {
-    const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\s+(.*)$/.exec(line);
-    const time = match ? match[1] : '';
-    const text = match ? match[2] : line;
-    const level = /\b(ERROR|ERR|FATAL|PANIC|CRITICAL)\b|level=(error|fatal)/i.test(text) ? 'error'
-      : /\b(WARN|WARNING)\b|level=warn/i.test(text) ? 'warn' : 'info';
-    return { time, text, level };
   }
 
   function kindLabel(resource: ResourceDescriptor) {
@@ -6181,7 +6188,8 @@
       const target = event.target instanceof Element ? event.target : null;
       if (!target?.closest('.cluster-selector')) clusterPickerOpen = false;
       if (!target?.closest('.namespace-picker')) namespaceOpen = false;
-      if (!target?.closest('.favorite-context-menu, .favorite-shortcut, .favorite-card-open')) favoriteContextMenu = null;
+      if (!target?.closest('.favorite-context-menu, .favorite-shortcut, .favorite-chip, .favorite-card-open')) favoriteContextMenu = null;
+      if (!target?.closest('.object-more')) objectMenuOpen = false;
     };
     const closeFloatingMenusOnEscape = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
@@ -6842,6 +6850,7 @@
   }
 </script>
 
+{#snippet objectMoreMenu()}{#if editorResource && editorObject}<div class="object-more"><button type="button" class:object-more-open={objectMenuOpen} class="object-more-trigger" aria-label="More actions" title="More actions" aria-haspopup="menu" aria-expanded={objectMenuOpen} on:click={() => (objectMenuOpen = !objectMenuOpen)}>⋯</button>{#if objectMenuOpen}<div class="object-more-menu" role="menu" aria-label={`Actions for ${editorObject.name}`} tabindex="-1" on:keydown={(event) => event.key === 'Escape' && (objectMenuOpen = false)}><button type="button" role="menuitem" on:click={() => { objectMenuOpen = false; void copyText(editorObject?.name || '', 'name'); }}><Copy size={13} />Copy name</button>{#if editorObject.namespace}<button type="button" role="menuitem" on:click={() => { objectMenuOpen = false; void copyText(`${editorObject?.namespace}/${editorObject?.name}`, 'namespace/name'); }}><Copy size={13} />Copy namespace/name</button>{/if}{#if editorPermissionSet.canDelete}<hr /><button type="button" role="menuitem" class="object-more-danger" disabled={loadingEditor || savingEditor} on:click={() => { objectMenuOpen = false; requestResourceDeletion(editorResource!, editorObject!); }}>Delete {editorResource.kind}…</button>{/if}</div>{/if}</div>{/if}{/snippet}
 {#snippet resizableHeaderCells(columns: GridColumn[], scope: string)}{#each columns as column (column.key)}<span class="column-cell" data-column={column.key} data-min={trackMinimum(column.width)}><span class="column-label" title={column.label}>{column.label}</span><!-- svelte-ignore a11y_no_noninteractive_tabindex --><i class="column-resizer" role="separator" tabindex="0" aria-orientation="vertical" aria-label={`Resize the ${column.label} column`} title="Drag to resize · double-click to reset" use:dragResize={{ value: columnWidths[scope]?.[column.key] || 0, min: 0, max: 1200, reset: 0, step: 16, onStart: freezeLeftColumns(scope), fromPointer: columnWidthFromDrag, onChange: (value) => setColumnWidth(scope, column.key, value), onCommit: commitColumnWidths(scope) }}></i></span>{/each}{/snippet}
 
 {#snippet noteInline(parts: Inline[])}{#each parts as part}{#if part.bold}<strong>{part.text}</strong>{:else if part.code}<code>{part.text}</code>{:else}{part.text}{/if}{/each}{/snippet}
@@ -6905,25 +6914,6 @@
       {/each}
     </nav>
 
-    <section class="sidebar-favorites" aria-label="Favorite cluster shortcuts">
-      <div class="sidebar-favorites-heading">
-        <p class="eyebrow">Favorites</p>
-        <button class:active={activeView === 'Favorites'} class="sidebar-favorites-manage" type="button" title="Manage favorites" on:click={() => navigateTo('Favorites')}>{favoriteClusters.length}/10</button>
-      </div>
-      {#if favoriteClusters.length}
-        <div class="favorite-list" role="list">
-          {#each favoriteClusters as cluster, index}
-            <div class:favorite-row-active={cluster.id === activeClusterId} class="favorite-row" role="listitem">
-              <button class="favorite-shortcut" type="button" aria-current={cluster.id === activeClusterId ? 'true' : undefined} title={`${favoriteLabel(cluster)} · ${cluster.status}`} on:click={() => { favoriteContextMenu = null; void selectCluster(cluster.id); }} on:contextmenu={(event) => openFavoriteContextMenu(event, cluster)}><i class="status-dot {cluster.tone}"></i><span>{favoriteLabel(cluster)}</span>{#if index < 9}<kbd>⌘{index + 1}</kbd>{/if}</button>
-              <button class="favorite-row-menu" type="button" aria-label={`Rename or remove ${favoriteLabel(cluster)}`} title="Rename or remove" on:click={(event) => openFavoriteContextMenu(event, cluster)}>⋯</button>
-            </div>
-          {/each}
-        </div>
-      {:else}<p class="favorite-shortcut-none">Star clusters in the cluster manager to pin them here.</p>{/if}
-      {#if favoriteRenameId}
-        <form class="favorite-rename favorite-rename-grid" on:submit|preventDefault={saveFavoriteRename}><input bind:value={favoriteRenameValue} maxlength="80" aria-label="Rename favorite shortcut" /><button type="submit" aria-label="Save shortcut name" title="Save">✓</button><button type="button" aria-label="Cancel shortcut rename" title="Cancel" on:click={cancelFavoriteRename}>×</button></form>
-      {/if}
-    </section>
 
     {#if favoriteContextMenu && favoriteContextCluster}
       <div class="favorite-context-menu" style:left={`${favoriteContextMenu.x}px`} style:top={`${favoriteContextMenu.y}px`} role="menu" aria-label={`Actions for ${favoriteLabel(favoriteContextCluster)}`}>
@@ -6954,6 +6944,19 @@
             <button class="global-namespace-trigger" disabled={namespaceControlBusy} aria-label={`Namespace: ${namespace === 'all namespaces' ? 'All namespaces' : namespace}`} aria-expanded={namespaceOpen} on:click={() => (namespaceOpen = !namespaceOpen)}><span class="namespace-dot"></span><span class="global-namespace-copy"><small>Namespace</small><strong>{namespace === 'all namespaces' ? 'All namespaces' : namespace}</strong></span><span class="chevron">⌄</span></button>
             {#if namespaceOpen}
               <div class="namespace-menu global-namespace-menu" role="menu" aria-label="Select namespace"><button class:namespace-selected={namespace === 'all namespaces'} on:click={() => chooseNamespace('all namespaces')}><span>All namespaces</span>{#if namespace === 'all namespaces'}✓{/if}</button>{#each catalog.namespaces as availableNamespace}<button class:namespace-selected={namespace === availableNamespace} on:click={() => chooseNamespace(availableNamespace)}><span>{availableNamespace}</span>{#if namespace === availableNamespace}✓{/if}</button>{/each}</div>
+            {/if}
+          </div>
+        {/if}
+        {#if favoriteClusters.length}
+          <div class="favorite-strip" role="toolbar" aria-label="Favorite clusters">
+            {#each favoriteClusters as cluster, index (cluster.id)}
+              <button class:favorite-chip-active={cluster.id === activeClusterId} class="favorite-chip" type="button" style:--favorite-hue={favoriteHue(index)} aria-current={cluster.id === activeClusterId ? 'true' : undefined} title={`${favoriteLabel(cluster)} · ${cluster.status}${index < 9 ? ` · ⌘${index + 1}` : ''} · right-click to rename or remove`} on:click={() => { favoriteContextMenu = null; void selectCluster(cluster.id); }} on:contextmenu={(event) => openFavoriteContextMenu(event, cluster)}>
+                <span class="favorite-chip-mark">{favoriteInitials(favoriteLabel(cluster))}{#if index < 9}<b>{index + 1}</b>{/if}</span><span class="favorite-chip-name">{favoriteLabel(cluster)}</span><i class="status-dot {cluster.tone}"></i>
+              </button>
+            {/each}
+            <button class:active={activeView === 'Favorites'} class="favorite-strip-manage" type="button" title="Manage favorites" aria-label="Manage favorites" on:click={() => navigateTo('Favorites')}><Star size={14} /></button>
+            {#if favoriteRenameId}
+              <form class="favorite-rename favorite-rename-grid favorite-rename-popover" on:submit|preventDefault={saveFavoriteRename}><input bind:value={favoriteRenameValue} maxlength="80" aria-label="Rename favorite shortcut" use:focusOnMount /><button type="submit" aria-label="Save shortcut name" title="Save">✓</button><button type="button" aria-label="Cancel shortcut rename" title="Cancel" on:click={cancelFavoriteRename}>×</button></form>
             {/if}
           </div>
         {/if}
@@ -7703,10 +7706,10 @@
               {#if configModalOpen}<div class="config-modal-backdrop" role="presentation" on:click={requestCloseConfigEditor}></div>{/if}
               <aside class:resource-inspector-modal={configModalOpen} class="resource-inspector" aria-label="Resource details" role={configModalOpen ? 'dialog' : undefined} aria-modal={configModalOpen ? 'true' : undefined}>
                 <div class="resource-inspector-surface">
-                {#if configModalOpen && editorResource && editorObject}<header class="config-modal-heading"><div><p class="eyebrow">{editorResource.kind}</p><h2 title={editorObject.name}>{editorObject.name}</h2><small>{editorObject.namespace || 'cluster scoped'} · {activeCluster}{#if configEditorDirty} · <b>unsaved changes</b>{/if}</small></div><button class="config-modal-close" type="button" aria-label={`Close ${editorObject.name}`} title="Close · Esc" disabled={savingEditor} on:click={requestCloseConfigEditor}>×</button></header>{/if}
-                {#if !(editorResource && (editorResource.kind === 'Secret' || editorResource.kind === 'ConfigMap'))}<div class="resource-details-heading resource-pane-heading"><span>02</span><div><strong>Details</strong><small>Live properties and actions</small></div></div>{/if}
+                {#if configModalOpen && editorResource && editorObject}<header class="config-modal-heading"><div><p class="eyebrow">{editorResource.kind}</p><h2 title={editorObject.name}>{editorObject.name}</h2><small>{editorObject.namespace || 'cluster scoped'} · {activeCluster}{#if configEditorDirty} · <b>unsaved changes</b>{/if}</small></div><div class="config-modal-actions">{@render objectMoreMenu()}<button class="config-modal-close" type="button" aria-label={`Close ${editorObject.name}`} title="Close · Esc" disabled={savingEditor} on:click={requestCloseConfigEditor}>×</button></div></header>{/if}
+                {#if !(editorResource && (editorResource.kind === 'Secret' || editorResource.kind === 'ConfigMap'))}<div class="resource-details-heading resource-pane-heading"><span>02</span><div><strong>Details</strong></div></div>{/if}
                 {#if editorResource && editorObject}
-                  {#if editorResource.kind !== 'Secret' && editorResource.kind !== 'ConfigMap'}<div class="drawer-heading inspector-heading"><div><span class:custom={editorResource.custom}>⌁</span><div><h2>{editorObject.name}</h2><p>{editorResource.kind} · {editorObject.namespace || 'cluster scoped'}</p></div></div><div class="inspector-heading-actions">{#if editorPermissionSet.canGet}<button class="secondary" disabled={loadingEditor} on:click={() => openYamlEditor(editorResource!, editorObject!)}>YAML</button>{/if}<button aria-label="Back to resource objects" on:click={() => closeEditor()}>×</button></div></div>{/if}
+                  {#if editorResource.kind !== 'Secret' && editorResource.kind !== 'ConfigMap'}<div class="drawer-heading inspector-heading"><div><span class:custom={editorResource.custom}>⌁</span><div><h2>{editorObject.name}</h2><p>{editorResource.kind} · {editorObject.namespace || 'cluster scoped'}</p></div></div><div class="inspector-heading-actions">{#if editorPermissionSet.canGet}<button class="secondary" disabled={loadingEditor} on:click={() => openYamlEditor(editorResource!, editorObject!)}>YAML</button>{/if}{@render objectMoreMenu()}<button aria-label="Back to resource objects" on:click={() => closeEditor()}>×</button></div></div>{/if}
                   {#if loadingEditor}
                     <div class="drawer-state"><i></i>Loading live resource details…</div>
                   {:else}
@@ -7794,7 +7797,7 @@
                     {/if}
                   {/if}
                   {#if configDiscardPrompt}<div class="config-discard-bar" role="alertdialog" aria-label="Unsaved changes"><span>Discard unsaved changes to {editorObject.name}?</span><button type="button" class="secondary" on:click={() => (configDiscardPrompt = false)}>Keep editing</button><button type="button" class="destructive" on:click={discardConfigEditor}>Discard</button></div>{/if}
-                  <div class="drawer-footer drawer-footer-compact"><div class="editor-footer-actions">{#if editorPermissionSet.resolved && !editorPermissionSet.canUpdate && !editorPermissionSet.canDelete}<span class="permission-readonly-badge">Read only</span>{/if}{#if editorResource.kind !== 'Secret' && editorResource.kind !== 'ConfigMap' && editorPermissionSet.canGet}<button class="secondary" disabled={loadingEditor} on:click={() => openYamlEditor(editorResource!, editorObject!)}>YAML</button>{/if}{#if editorPermissionSet.canDelete}<button class="destructive" disabled={loadingEditor || savingEditor} on:click={() => requestResourceDeletion(editorResource!, editorObject!)}>Delete</button>{/if}{#if configModalOpen}<button class="secondary" type="button" disabled={savingEditor} on:click={requestCloseConfigEditor}>Cancel</button>{/if}{#if (editorResource.kind === 'Secret' || editorResource.kind === 'ConfigMap') && editorPermissionSet.canUpdate}<button class="primary" disabled={loadingEditor || savingEditor} on:click={saveEditor}>{savingEditor ? 'Saving…' : 'Save'}</button>{/if}</div></div>
+                  <div class="drawer-footer drawer-footer-compact"><div class="editor-footer-actions">{#if editorPermissionSet.resolved && !editorPermissionSet.canUpdate && !editorPermissionSet.canDelete}<span class="permission-readonly-badge">Read only</span>{/if}{#if editorResource.kind !== 'Secret' && editorResource.kind !== 'ConfigMap' && editorPermissionSet.canGet}<button class="secondary" disabled={loadingEditor} on:click={() => openYamlEditor(editorResource!, editorObject!)}>YAML</button>{/if}{#if configModalOpen}<button class="secondary" type="button" disabled={savingEditor} on:click={requestCloseConfigEditor}>Cancel</button>{/if}{#if (editorResource.kind === 'Secret' || editorResource.kind === 'ConfigMap') && editorPermissionSet.canUpdate}<button class="primary" disabled={loadingEditor || savingEditor} on:click={saveEditor}>{savingEditor ? 'Saving…' : 'Save'}</button>{/if}</div></div>
                 {:else}
                   <div class="inspector-empty"><span>{selectedResource?.crd ? '◇' : '⌁'}</span><h3>{selectedResource ? `Choose a ${selectedResource.kind}` : 'Ready when you are'}</h3><p>{selectedResource ? 'Select an object from the list to view its live properties, edit supported data, or open YAML.' : 'Pick an API type to load its objects. Kuberniva does not fan out requests in the background.'}</p></div>
                 {/if}
@@ -7868,15 +7871,15 @@
                   <div class="workload-log-body">
                     <nav class="workload-log-level-bar" aria-label="Log navigation"><button type="button" on:click={returnToWorkloadList}>← All {workloadResource?.plural || 'workloads'}</button><span>{logScopeLabel || 'Pod'} / {logTarget.pod}</span></nav>
                     <section class="workload-log-pod-picker"><div><div><strong>Pod stream</strong><small>{logPods.length} available for this workload</small></div><label>Switch Pod<select value={logTargetKey(logTarget)} on:change={(event) => selectLogPodByKey(event.currentTarget.value)}>{#each logPods as pod}<option value={logPodKey(pod)}>{pod.name} · {pod.namespace || namespace}</option>{/each}</select></label></div></section>
-                    <section class="workload-log-toolbar"><div><strong>Live logs</strong><small class="log-stream-state log-stream-{logStreamStatus}">{openingLogsTarget ? 'Opening the stream…' : loadingLogs ? 'Loading…' : logStatusLabel}</small></div><div class="log-search" role="search"><Search size={13} /><input bind:value={logSearch} placeholder="Search logs" aria-label="Search log output" spellcheck="false" />{#if logSearch}<span>{visibleLogLines.length}/{logLines.length}</span><button type="button" aria-label="Clear log search" on:click={() => (logSearch = '')}>×</button>{/if}</div><div class="workload-log-toolbar-actions">{#if logContainers.length > 1}<label>Container <select bind:value={selectedLogContainer} on:change={() => loadLogs(true)}>{#each logContainers as container}<option value={container}>{container}</option>{/each}</select></label>{/if}<button class="log-tool-button" disabled={loadingLogs || !logTarget} aria-label="Refresh logs now" title="Refresh logs now" on:click={() => loadLogs(true)}><RefreshCw size={13} class={loadingLogs ? 'animate-spin' : ''} /><span>{loadingLogs ? 'Refreshing' : 'Refresh'}</span></button><button class:log-tool-button-copied={logsCopied} class="log-tool-button" disabled={!logLines.length} aria-label="Copy all logs" title="Copy all logs" on:click={copyLogs}>{#if logsCopied}<Check size={13} />{:else}<Copy size={13} />{/if}<span>{logsCopied ? 'Copied' : 'Copy'}</span></button><button class="log-tool-button" disabled={!logLines.length || downloadingLogs} aria-label="Download current logs" title="Download current logs" on:click={downloadLogs}><Download size={13} /><span>{downloadingLogs ? 'Saving' : 'Download'}</span></button></div></section>
+                    <section class="workload-log-toolbar"><div><strong>Live logs</strong><small class="log-stream-state log-stream-{logStreamStatus}">{openingLogsTarget ? 'Opening the stream…' : loadingLogs ? 'Loading…' : logStatusLabel}</small></div><div class="log-search" role="search"><Search size={13} /><input bind:value={logSearch} placeholder="Search logs" aria-label="Search log output" spellcheck="false" />{#if logSearch}<span>{visibleLogEntries.length}/{logEntries.length}</span><button type="button" aria-label="Clear log search" on:click={() => (logSearch = '')}>×</button>{/if}</div><div class="workload-log-toolbar-actions">{#if logContainers.length > 1}<label>Container <select bind:value={selectedLogContainer} on:change={() => loadLogs(true)}>{#each logContainers as container}<option value={container}>{container}</option>{/each}</select></label>{/if}<button class="log-tool-button" disabled={loadingLogs || !logTarget} aria-label="Refresh logs now" title="Refresh logs now" on:click={() => loadLogs(true)}><RefreshCw size={13} class={loadingLogs ? 'animate-spin' : ''} /><span>{loadingLogs ? 'Refreshing' : 'Refresh'}</span></button><button class:log-tool-button-active={logPrettyJson} class="log-tool-button" aria-pressed={logPrettyJson} title="Expand JSON log lines" on:click={() => (logPrettyJson = !logPrettyJson)}><span class="log-tool-glyph">{"{ }"}</span><span>JSON</span></button><button class:log-tool-button-copied={logsCopied} class="log-tool-button" disabled={!logLines.length} aria-label="Copy all logs" title="Copy all logs" on:click={copyLogs}>{#if logsCopied}<Check size={13} />{:else}<Copy size={13} />{/if}<span>{logsCopied ? 'Copied' : 'Copy'}</span></button><button class="log-tool-button" disabled={!logLines.length || downloadingLogs} aria-label="Download current logs" title="Download current logs" on:click={downloadLogs}><Download size={13} /><span>{downloadingLogs ? 'Saving' : 'Download'}</span></button></div></section>
                     {#if logPorts.length}<section class="workload-log-ports"><strong>Container ports</strong><div>{#each logPorts as port}<span title={`${port.container}${port.name ? ` · ${port.name}` : ''} · ${port.protocol}`}>{port.port}/{port.protocol}<small>{port.container}</small></span>{/each}</div></section>{/if}
-                    {#if loadingLogs && logLines.length === 0}<div class="workload-log-opening"><RefreshCw size={18} class="animate-spin" /><div><strong>Opening logs…</strong><small>Connecting to {logTarget.pod}{selectedLogContainer ? ` · ${selectedLogContainer}` : ''}</small></div></div>{:else}<pre bind:this={logViewport} class="workload-log-output" aria-label={`${logTarget.pod} logs`}>{#if logLines.length}{#if visibleLogLines.length}{#each visibleLogLines as line}{@const parsed = parseLogLine(line)}<span class="log-line log-level-{parsed.level}">{#if parsed.time}<span class="log-time">{parsed.time}</span> {/if}{parsed.text}{'\n'}</span>{/each}{:else}No log lines match “{logSearch}”.{/if}{:else}No log lines returned yet.{/if}</pre>{/if}
+                    {#if loadingLogs && logLines.length === 0}<div class="workload-log-opening"><RefreshCw size={18} class="animate-spin" /><div><strong>Opening logs…</strong><small>Connecting to {logTarget.pod}{selectedLogContainer ? ` · ${selectedLogContainer}` : ''}</small></div></div>{:else}<pre bind:this={logViewport} class="workload-log-output" aria-label={`${logTarget.pod} logs`}>{#if logLines.length}{#if visibleLogEntries.length}{#each visibleLogEntries as entry}<span class="log-line log-level-{entry.level}" class:log-line-multi={entry.lines > 1}><span class="log-time" title={entry.stamp}>{entry.time}</span><span class="log-text">{logPrettyJson ? prettyJson(entry.text) : entry.text}</span></span>{/each}{:else}No log lines match “{logSearch}”.{/if}{:else}No log lines returned yet.{/if}</pre>{/if}
                   </div>
                 </aside>
               {:else if editorResource && editorObject && editorResource.category === 'Workloads'}
                 <aside class="workload-inspector" aria-label="Workload details">
-                  <div class="workload-inspector-heading workload-details-heading"><div><h3 title={editorObject.name}>{editorObject.name}</h3><p>{editorResource.kind} · {editorObject.namespace || 'cluster scoped'} <b class={`workload-status-label workload-details-status ${workloadStatusTone(editorObject)}`}>{workloadStatusLabel(editorObject)}</b>{#if editorPermissionSet.resolved && !editorPermissionSet.canUpdate && !editorPermissionSet.canDelete}<span class="permission-readonly-badge">Read only</span>{/if}</p></div><div class="workload-inspector-actions"><button aria-label="Close workload details" title="Close" on:click={() => closeEditor()}>×</button></div></div>
-                  {#if !loadingEditor && workloadDetailMode !== 'terminal'}<nav class="workload-details-toolbar" aria-label="Workload actions">{#if editorPermissionSet.canGet}<button type="button" on:click={() => openYamlEditor(editorResource!, editorObject!)}><Command size={13} />YAML</button>{/if}{#if editorPermissionSet.canDelete}<button type="button" class="workload-details-delete" on:click={() => requestResourceDeletion(editorResource!, editorObject!)}>Delete</button>{/if}</nav>{/if}
+                  <div class="workload-inspector-heading workload-details-heading"><div><h3 title={editorObject.name}>{editorObject.name}</h3><p>{editorResource.kind} · {editorObject.namespace || 'cluster scoped'} <b class={`workload-status-label workload-details-status ${workloadStatusTone(editorObject)}`}>{workloadStatusLabel(editorObject)}</b>{#if editorPermissionSet.resolved && !editorPermissionSet.canUpdate && !editorPermissionSet.canDelete}<span class="permission-readonly-badge">Read only</span>{/if}</p></div><div class="workload-inspector-actions">{@render objectMoreMenu()}<button aria-label="Close workload details" title="Close" on:click={() => closeEditor()}>×</button></div></div>
+                  {#if !loadingEditor && workloadDetailMode !== 'terminal'}<nav class="workload-details-toolbar" aria-label="Workload actions">{#if editorPermissionSet.canGet}<button type="button" on:click={() => openYamlEditor(editorResource!, editorObject!)}><Command size={13} />YAML</button>{/if}</nav>{/if}
                   {#if loadingEditor}
                     <div class="drawer-state"><i></i>Loading live workload details…</div>
                   {:else if workloadDetailMode === 'terminal'}
@@ -7958,8 +7961,8 @@
             <div class="pane-splitter" role="separator" tabindex="0" aria-orientation="vertical" aria-label="Resize the Pod list" aria-valuenow={Math.round(logSidebarWidth)} aria-valuemin={180} aria-valuemax={520} use:dragResize={{ value: logSidebarWidth, min: 180, max: 520, reset: 258, step: 16, fromPointer: widthFromDrag, onChange: (value) => (logSidebarWidth = value), onCommit: (value) => savePaneSize(layoutStorageKeys.logSidebar, value) }}></div>
             <div class="log-stream-panel">
               <div class="log-stream-heading"><div><p class="eyebrow">Streaming output</p><h2>{logTarget.pod}</h2><p>{activeCluster} · {logScopeLabel || 'Pod'} · {logTarget.namespace}</p></div><div class="table-actions"><button class="secondary" on:click={() => { closeLogs(); void navigateTo('Workloads') }}>← Back to workloads</button></div></div>
-              <div class="log-toolbar"><div><strong>Live logs</strong><small class="log-stream-state log-stream-{logStreamStatus}">{openingLogsTarget ? 'Opening the stream…' : loadingLogs ? 'Loading…' : logStatusLabel}</small></div><div class="log-search" role="search"><Search size={13} /><input bind:value={logSearch} placeholder="Search logs" aria-label="Search log output" spellcheck="false" />{#if logSearch}<span>{visibleLogLines.length}/{logLines.length}</span><button type="button" aria-label="Clear log search" on:click={() => (logSearch = '')}>×</button>{/if}</div><div class="log-toolbar-actions">{#if logContainers.length > 1}<label>Container <select bind:value={selectedLogContainer} on:change={() => loadLogs(true)}>{#each logContainers as container}<option value={container}>{container}</option>{/each}</select></label>{/if}<button class="log-tool-button" disabled={loadingLogs || !logTarget} on:click={() => loadLogs(true)}><RefreshCw size={13} class={loadingLogs ? 'animate-spin' : ''} /><span>{loadingLogs ? 'Refreshing' : 'Refresh'}</span></button><button class:log-tool-button-copied={logsCopied} class="log-tool-button" disabled={!logLines.length} on:click={copyLogs}>{#if logsCopied}<Check size={13} />{:else}<Copy size={13} />{/if}<span>{logsCopied ? 'Copied' : 'Copy'}</span></button><button class="log-tool-button" disabled={!logLines.length || downloadingLogs} on:click={downloadLogs}><Download size={13} /><span>{downloadingLogs ? 'Saving' : 'Download'}</span></button></div></div>
-              {#if loadingLogs && logLines.length === 0}<div class="log-opening-state"><span><RefreshCw size={22} class="animate-spin" /></span><div><p class="eyebrow">Opening logs</p><h3>{logTarget.pod}</h3><p>Connecting to the Pod and preparing the first live output. You can switch Pods from the left after it opens.</p></div></div>{:else}<pre class="live-log-output" bind:this={logViewport} aria-label={`${logTarget.pod} logs`}>{#if logLines.length}{#if visibleLogLines.length}{#each visibleLogLines as line}{@const parsed = parseLogLine(line)}<span class="log-line log-level-{parsed.level}">{#if parsed.time}<span class="log-time">{parsed.time}</span> {/if}{parsed.text}{'\n'}</span>{/each}{:else}No log lines match “{logSearch}”.{/if}{:else}The Pod returned no log lines for this container yet.{/if}</pre>{/if}
+              <div class="log-toolbar"><div><strong>Live logs</strong><small class="log-stream-state log-stream-{logStreamStatus}">{openingLogsTarget ? 'Opening the stream…' : loadingLogs ? 'Loading…' : logStatusLabel}</small></div><div class="log-search" role="search"><Search size={13} /><input bind:value={logSearch} placeholder="Search logs" aria-label="Search log output" spellcheck="false" />{#if logSearch}<span>{visibleLogEntries.length}/{logEntries.length}</span><button type="button" aria-label="Clear log search" on:click={() => (logSearch = '')}>×</button>{/if}</div><div class="log-toolbar-actions">{#if logContainers.length > 1}<label>Container <select bind:value={selectedLogContainer} on:change={() => loadLogs(true)}>{#each logContainers as container}<option value={container}>{container}</option>{/each}</select></label>{/if}<button class="log-tool-button" disabled={loadingLogs || !logTarget} on:click={() => loadLogs(true)}><RefreshCw size={13} class={loadingLogs ? 'animate-spin' : ''} /><span>{loadingLogs ? 'Refreshing' : 'Refresh'}</span></button><button class:log-tool-button-active={logPrettyJson} class="log-tool-button" aria-pressed={logPrettyJson} title="Expand JSON log lines" on:click={() => (logPrettyJson = !logPrettyJson)}><span class="log-tool-glyph">{"{ }"}</span><span>JSON</span></button><button class:log-tool-button-copied={logsCopied} class="log-tool-button" disabled={!logLines.length} on:click={copyLogs}>{#if logsCopied}<Check size={13} />{:else}<Copy size={13} />{/if}<span>{logsCopied ? 'Copied' : 'Copy'}</span></button><button class="log-tool-button" disabled={!logLines.length || downloadingLogs} on:click={downloadLogs}><Download size={13} /><span>{downloadingLogs ? 'Saving' : 'Download'}</span></button></div></div>
+              {#if loadingLogs && logLines.length === 0}<div class="log-opening-state"><span><RefreshCw size={22} class="animate-spin" /></span><div><p class="eyebrow">Opening logs</p><h3>{logTarget.pod}</h3><p>Connecting to the Pod and preparing the first live output. You can switch Pods from the left after it opens.</p></div></div>{:else}<pre class="live-log-output" bind:this={logViewport} aria-label={`${logTarget.pod} logs`}>{#if logLines.length}{#if visibleLogEntries.length}{#each visibleLogEntries as entry}<span class="log-line log-level-{entry.level}" class:log-line-multi={entry.lines > 1}><span class="log-time" title={entry.stamp}>{entry.time}</span><span class="log-text">{logPrettyJson ? prettyJson(entry.text) : entry.text}</span></span>{/each}{:else}No log lines match “{logSearch}”.{/if}{:else}The Pod returned no log lines for this container yet.{/if}</pre>{/if}
             </div>
           </section>
         {:else}

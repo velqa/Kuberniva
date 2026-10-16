@@ -4363,7 +4363,6 @@ main.theme-dark .workload-action-card > span {
 main.theme-dark .workload-terminal-action > span { color: #8fe1d5; background: rgba(56,166,155,.17); }
 main.theme-dark .workload-action-card strong { font-size: 13px; }
 main.theme-dark .workload-action-card small { font-size: 10.5px; }
-main.theme-dark .workload-action-card:hover:not(:disabled) { background: #fff !important; }
 main.theme-dark .workload-status-grid > div,
 main.theme-dark .workload-pod-facts > div {
   border-color: #42423f;
@@ -4987,7 +4986,6 @@ main.theme-dark .nav-item.active .count { color: #302f2d !important; background:
 /* Final dark-theme contrast pass: controls, transient surfaces, and dense
    operational data use the same graphite scale as the main workbench. */
 main.theme-dark { color-scheme: dark; }
-main.theme-dark * { scrollbar-color: #60605d transparent; }
 main.theme-dark *::-webkit-scrollbar-thumb { border-color: transparent; background: #60605d; background-clip: padding-box; }
 main.theme-dark *::-webkit-scrollbar-thumb:hover { background: #7b7a77; background-clip: padding-box; }
 main.theme-dark input::placeholder,
@@ -6446,8 +6444,6 @@ main.theme-dark .workload-inspector-heading h3 { font-size: 19px; }
 main.theme-dark .workload-inspector-body { padding: 14px; }
 .workload-action-grid,
 main.theme-dark .workload-action-grid { gap: 10px; }
-.workload-action-card,
-main.theme-dark .workload-action-card { min-height: 105px; padding: 13px; }
 main.theme-dark .workload-action-card strong { font-size: 13px; }
 main.theme-dark .workload-action-card small { font-size: 11px; }
 main.theme-dark .resource-object-namespace,
@@ -8493,3 +8489,60 @@ html body main .ocm-work-row { grid-template-columns: minmax(180px, 1.4fr) minma
   .sidebar nav .nav-item, .sidebar nav .sidebar-tree-item, .sidebar nav .sidebar-tree-section,
   .sidebar nav .nav-icon svg, .sidebar nav .sidebar-tree-item svg:first-child { transition: color .16s ease, background-color .16s ease; animation: none !important; transform: none !important; }
 }
+
+/* Log entries: a fixed time column, so multi-line output (dicts, lists, JSON, stack traces)
+   stays indented under its message instead of wrapping under the timestamp. */
+:is(.workload-log-output, .live-log-output) .log-line { display: grid; grid-template-columns: 12.5ch minmax(0, 1fr); column-gap: 12px; }
+:is(.workload-log-output, .live-log-output) .log-time { white-space: nowrap; }
+:is(.workload-log-output, .live-log-output) .log-text { min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+:is(.workload-log-output, .live-log-output) .log-line-multi { margin: 2px 0; padding: 2px 0 2px 0; border-left: 2px solid rgba(255, 255, 255, .08); margin-left: -8px; padding-left: 6px; }
+.log-tool-button.log-tool-button-active { color: var(--ui-accent, #c45c32); border-color: currentColor; }
+.log-tool-glyph { font-family: "DM Mono", monospace; font-size: 10px; font-weight: 700; }
+
+/* The shell reads like the logs: same type size, and its output fills the panel. */
+.workload-terminal { display: flex; flex-direction: column; }
+.workload-terminal > * { flex-shrink: 0; }
+.workload-terminal .terminal-output { flex: 1 1 auto; min-height: 220px; max-height: none; font-size: 11px; line-height: 1.72; }
+
+/* Favorite clusters in the top bar: a colored monogram with its ⌘ number, then the name. */
+.toolbar-leading { min-width: 0; flex: 1 1 auto; }
+.favorite-strip { position: relative; display: flex; align-items: center; gap: 6px; min-width: 0; flex: 1 1 auto; margin-left: 4px; padding-left: 10px; border-left: 1px solid var(--ui-border); overflow-x: auto; scrollbar-width: none; container-type: inline-size; }
+.favorite-strip::-webkit-scrollbar { display: none; }
+.favorite-chip { --favorite-color: hsl(var(--favorite-hue) 62% 48%); display: inline-flex; flex: 0 0 auto; align-items: center; gap: 7px; height: 36px; max-width: 168px; padding: 0 9px 0 4px; border: 1px solid var(--ui-border); border-radius: 10px; color: var(--ui-ink); background: var(--ui-surface); font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; transition: border-color .15s ease, background-color .15s ease, transform .22s cubic-bezier(.34, 1.56, .64, 1), box-shadow .15s ease; }
+.favorite-chip:hover { border-color: var(--favorite-color); transform: translateY(-1px); box-shadow: 0 4px 12px hsl(var(--favorite-hue) 60% 40% / .18); }
+.favorite-chip:active { transform: scale(.97); }
+.favorite-chip-active { border-color: var(--favorite-color); background: hsl(var(--favorite-hue) 70% 50% / .12); box-shadow: inset 0 0 0 1px var(--favorite-color); }
+.favorite-chip-mark { position: relative; display: grid; place-items: center; flex: 0 0 auto; width: 28px; height: 28px; border-radius: 8px; color: #fff; background: var(--favorite-color); font-size: 11px; font-weight: 800; letter-spacing: .02em; }
+.favorite-chip-mark b { position: absolute; right: -5px; bottom: -5px; display: grid; place-items: center; min-width: 15px; height: 15px; padding: 0 3px; border: 2px solid var(--ui-surface); border-radius: 999px; color: var(--ui-ink); background: var(--ui-surface-strong, #eee); font-size: 9px; font-weight: 800; line-height: 1; }
+.favorite-chip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.favorite-chip .status-dot { flex: 0 0 auto; width: 6px; height: 6px; }
+.favorite-strip-manage { display: grid; place-items: center; flex: 0 0 auto; width: 30px; height: 30px; border: 1px dashed var(--ui-border-strong); border-radius: 9px; color: var(--ui-muted); background: transparent; cursor: pointer; }
+.favorite-strip-manage:hover, .favorite-strip-manage.active { color: var(--ui-accent, #c45c32); border-color: currentColor; }
+.favorite-rename-popover { position: fixed; z-index: 80; margin-top: 46px; width: 260px; padding: 6px; border: 1px solid var(--ui-border-strong); border-radius: 10px; background: var(--ui-surface); box-shadow: 0 12px 32px rgba(0, 0, 0, .22); }
+/* Narrow windows keep just the monograms; names stay in the tooltip. */
+@container (max-width: 380px) { .favorite-chip-name { display: none; } .favorite-chip { padding-right: 7px; } }
+
+/* ⋯ More actions on an open object: Delete lives here, away from everyday actions. */
+.object-more { position: relative; display: inline-flex; }
+.object-more-trigger { display: grid; place-items: center; width: 30px; height: 30px; border: 1px solid var(--ui-border); border-radius: 8px; color: var(--ui-muted); background: var(--ui-surface); font-size: 17px; font-weight: 700; line-height: 1; cursor: pointer; }
+.object-more-trigger:hover, .object-more-trigger.object-more-open { color: var(--ui-ink); border-color: var(--ui-border-strong); background: var(--ui-surface-strong); }
+.object-more-menu { position: absolute; top: calc(100% + 6px); right: 0; z-index: 60; display: grid; min-width: 210px; padding: 5px; border: 1px solid var(--ui-border-strong); border-radius: 11px; background: var(--ui-surface); box-shadow: 0 14px 36px rgba(0, 0, 0, .2); animation: object-more-in .14s ease-out; }
+.object-more-menu button { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border: 0; border-radius: 7px; color: var(--ui-ink); background: transparent; font: inherit; font-size: 12.5px; text-align: left; cursor: pointer; }
+.object-more-menu button:hover:not(:disabled) { background: var(--ui-surface-strong); }
+.object-more-menu hr { margin: 4px 2px; border: 0; border-top: 1px solid var(--ui-border); }
+.object-more-menu .object-more-danger { color: #c4473b; font-weight: 650; }
+.object-more-menu .object-more-danger:hover:not(:disabled) { color: #fff; background: #c4473b; }
+.config-modal-actions { display: flex; align-items: center; gap: 8px; }
+.workload-inspector-actions, .inspector-heading-actions { display: flex; align-items: center; gap: 8px; }
+@keyframes object-more-in { from { opacity: 0; transform: translateY(-4px); } }
+html body main .object-more-menu button.object-more-danger { color: #c4473b !important; }
+html body main .object-more-menu button.object-more-danger:hover:not(:disabled) { color: #fff !important; background: #c4473b; }
+html body main .object-more-menu button:not(.object-more-danger) { color: var(--ui-ink) !important; }
+html body main .object-more-trigger { color: var(--ui-muted) !important; }
+html body main .object-more-trigger:hover, html body main .object-more-trigger.object-more-open { color: var(--ui-ink) !important; }
+/* Dark mode: action cards (View logs, Terminal) lift on hover and stay readable. */
+html body main.theme-dark .workload-action-card:hover:not(:disabled) { color: var(--ui-ink) !important; border-color: var(--ui-accent) !important; background: var(--ui-surface-strong) !important; }
+html body main.theme-dark .workload-action-card:hover:not(:disabled) :is(strong, small) { color: var(--ui-ink) !important; }
+/* View logs / Terminal cards: one compact size in both themes. */
+html body main .workload-inspector-body .workload-action-card { min-height: 0; padding: 12px 14px; }
+html body main .workload-inspector-body { scrollbar-gutter: stable; }

@@ -294,6 +294,22 @@ export const visualQaLogLines = [
   '2026-08-19T05:10:34.991Z ERROR upstream timeout service=payments attempt=1',
   '2026-08-19T05:10:35.112Z INFO retry succeeded service=payments attempt=2',
   '2026-08-19T05:10:39.440Z INFO request completed method=POST path=/v1/jobs status=202 duration=46ms',
+  "2026-08-19T05:10:41.002Z INFO job payload = {",
+  "2026-08-19T05:10:41.002Z     'job_id': 'b7c1-42',",
+  "2026-08-19T05:10:41.002Z     'tenant': 'acme',",
+  "2026-08-19T05:10:41.002Z     'items': [",
+  "2026-08-19T05:10:41.002Z         {'sku': 'A-100', 'qty': 2},",
+  "2026-08-19T05:10:41.002Z         {'sku': 'B-220', 'qty': 1},",
+  "2026-08-19T05:10:41.002Z     ],",
+  "2026-08-19T05:10:41.002Z     'priority': True,",
+  "2026-08-19T05:10:41.002Z }",
+  '2026-08-19T05:10:42.310Z {"level":"info","msg":"job queued","job_id":"b7c1-42","queue":"default","attempt":1}',
+  "2026-08-19T05:10:43.870Z ERROR job failed: {'job_id': 'b7c1-42', 'error': 'card declined', 'retryable': False}",
+  '2026-08-19T05:10:43.871Z Traceback (most recent call last):',
+  '2026-08-19T05:10:43.871Z   File "/app/worker.py", line 88, in run',
+  '2026-08-19T05:10:43.871Z     charge(job)',
+  '2026-08-19T05:10:43.871Z   File "/app/billing.py", line 41, in charge',
+  '2026-08-19T05:10:43.871Z     raise PaymentError("card declined")',
 ];
 
 export const visualQaConfigMaps = [
