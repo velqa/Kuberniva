@@ -67,3 +67,13 @@ test('lists, tuples, and indented blocks (YAML, nested output) group the same wa
   ]);
   assert.deepEqual(entries.map((entry) => entry.lines), [4, 2, 3, 1]);
 });
+
+test('search highlights every match in place and numbers them for next and previous', async () => {
+  const { highlightMatches } = await import('./log-format.ts');
+  const { pieces, total } = highlightMatches(['INFO request ok', 'no hit', 'Request then REQUEST'], 'request');
+  assert.equal(total, 3);
+  assert.deepEqual(pieces[0], [{ text: 'INFO ' }, { text: 'request', match: 0 }, { text: ' ok' }]);
+  assert.equal(pieces[1], null);
+  assert.deepEqual(pieces[2], [{ text: 'Request', match: 1 }, { text: ' then ' }, { text: 'REQUEST', match: 2 }]);
+  assert.equal(highlightMatches(['abc'], '  ').total, 0);
+});

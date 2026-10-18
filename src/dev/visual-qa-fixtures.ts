@@ -291,6 +291,7 @@ export const visualQaLogLines = [
   '2026-08-19T05:10:24.410Z INFO request completed method=GET path=/health status=200 duration=3ms',
   '2026-08-19T05:10:29.028Z WARN cache miss key=tenant-settings',
   '2026-08-19T05:10:29.041Z INFO database query completed duration=12ms',
+  '2026-08-19T05:10:30.552Z INFO request completed method=GET path=/v1/tenants/acme/projects/checkout-service/environments/production/deployments?limit=50&cursor=eyJpZCI6IjEyMzQ1Njc4OTAifQ status=200 duration=184ms user_agent="kubectl/v1.30.4 (darwin/arm64) kubernetes/abc1234" trace_id=4bf92f3577b34da6a3ce929d0e0e4736',
   '2026-08-19T05:10:34.991Z ERROR upstream timeout service=payments attempt=1',
   '2026-08-19T05:10:35.112Z INFO retry succeeded service=payments attempt=2',
   '2026-08-19T05:10:39.440Z INFO request completed method=POST path=/v1/jobs status=202 duration=46ms',

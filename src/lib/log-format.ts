@@ -120,3 +120,39 @@ export function prettyJson(text: string) {
   }
   return text;
 }
+
+export type Highlight = { text: string; match?: number };
+
+/**
+ * Splits each text into plain and matching pieces for a case-insensitive search, numbering
+ * every match across all texts in order, so the view can step through them.
+ */
+export function highlightMatches(texts: readonly string[], query: string, limit = 10_000) {
+  const needle = query.trim().toLowerCase();
+  const pieces: (Highlight[] | null)[] = [];
+  let total = 0;
+  for (const text of texts) {
+    if (!needle || total >= limit) {
+      pieces.push(null);
+      continue;
+    }
+    const lower = text.toLowerCase();
+    let from = 0;
+    let at = lower.indexOf(needle);
+    if (at < 0) {
+      pieces.push(null);
+      continue;
+    }
+    const parts: Highlight[] = [];
+    while (at >= 0 && total < limit) {
+      if (at > from) parts.push({ text: text.slice(from, at) });
+      parts.push({ text: text.slice(at, at + needle.length), match: total });
+      total += 1;
+      from = at + needle.length;
+      at = lower.indexOf(needle, from);
+    }
+    if (from < text.length) parts.push({ text: text.slice(from) });
+    pieces.push(parts);
+  }
+  return { pieces, total };
+}

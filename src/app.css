@@ -8492,9 +8492,12 @@ html body main .ocm-work-row { grid-template-columns: minmax(180px, 1.4fr) minma
 
 /* Log entries: a fixed time column, so multi-line output (dicts, lists, JSON, stack traces)
    stays indented under its message instead of wrapping under the timestamp. */
-:is(.workload-log-output, .live-log-output) .log-line { display: grid; grid-template-columns: 12.5ch minmax(0, 1fr); column-gap: 12px; }
+/* Each line keeps its own shape: a long single line stays on one line and the view scrolls
+   sideways; dicts, lists, and traces keep their own line breaks and indentation. */
+html body main :is(.workload-log-output, .live-log-output) { white-space: pre; overflow-wrap: normal; overflow-x: auto; }
+:is(.workload-log-output, .live-log-output) .log-line { display: grid; grid-template-columns: 12.5ch max-content; column-gap: 12px; width: max-content; min-width: 100%; }
 :is(.workload-log-output, .live-log-output) .log-time { white-space: nowrap; }
-:is(.workload-log-output, .live-log-output) .log-text { min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+:is(.workload-log-output, .live-log-output) .log-text { white-space: pre; overflow-wrap: normal; }
 :is(.workload-log-output, .live-log-output) .log-line-multi { margin: 2px 0; padding: 2px 0 2px 0; border-left: 2px solid rgba(255, 255, 255, .08); margin-left: -8px; padding-left: 6px; }
 .log-tool-button.log-tool-button-active { color: var(--ui-accent, #c45c32); border-color: currentColor; }
 .log-tool-glyph { font-family: "DM Mono", monospace; font-size: 10px; font-weight: 700; }
@@ -8546,3 +8549,47 @@ html body main.theme-dark .workload-action-card:hover:not(:disabled) :is(strong,
 /* View logs / Terminal cards: one compact size in both themes. */
 html body main .workload-inspector-body .workload-action-card { min-height: 0; padding: 12px 14px; }
 html body main .workload-inspector-body { scrollbar-gutter: stable; }
+
+/* Favorites rail: a slim column of cluster monograms on either edge of the window. */
+.cluster-rail { position: relative; z-index: 40; order: -1; display: flex; flex: 0 0 62px; flex-direction: column; align-items: center; justify-content: space-between; gap: 10px; width: 62px; height: 100vh; padding: 14px 0 12px; border-right: 1px solid var(--ui-border); background: var(--ui-canvas, var(--ui-surface)); view-transition-name: cluster-rail; }
+.cluster-rail-right { order: 99; border-right: 0; border-left: 1px solid var(--ui-border); }
+.cluster-rail-list { display: grid; justify-items: center; gap: 10px; }
+.cluster-rail-item, .cluster-rail-add, .cluster-rail-flip { position: relative; display: grid; justify-items: center; gap: 3px; padding: 0; border: 0; color: var(--ui-muted); background: transparent; font: inherit; cursor: pointer; }
+.cluster-rail-mark { --favorite-color: hsl(var(--favorite-hue) 62% 48%); position: relative; display: grid; place-items: center; width: 40px; height: 40px; border-radius: 50%; color: #fff; background: var(--favorite-color); font-size: 13px; font-weight: 800; letter-spacing: .02em; transition: border-radius .28s cubic-bezier(.34, 1.56, .64, 1), transform .28s cubic-bezier(.34, 1.56, .64, 1), box-shadow .2s ease; }
+.cluster-rail-mark .status-dot { position: absolute; right: -1px; bottom: -1px; width: 11px; height: 11px; border: 2.5px solid var(--ui-canvas, var(--ui-surface)); border-radius: 50%; }
+.cluster-rail-item:hover .cluster-rail-mark, .cluster-rail-item:focus-visible .cluster-rail-mark { border-radius: 13px; transform: translateY(-1px) scale(1.06); box-shadow: 0 6px 16px hsl(var(--favorite-hue) 60% 35% / .35); }
+.cluster-rail-active .cluster-rail-mark { border-radius: 13px; box-shadow: 0 0 0 2px var(--ui-canvas, var(--ui-surface)), 0 0 0 4px var(--favorite-color); }
+.cluster-rail-item:active .cluster-rail-mark { transform: scale(.94); }
+/* Edge indicator: a dot on hover that grows into a bar for the active cluster. */
+.cluster-rail-item::before { content: ""; position: absolute; left: -11px; top: 20px; width: 4px; height: 8px; border-radius: 0 4px 4px 0; background: var(--ui-ink); opacity: 0; transform: translateY(-50%) scaleY(.5); transition: transform .28s cubic-bezier(.34, 1.56, .64, 1), opacity .16s ease, height .28s cubic-bezier(.34, 1.56, .64, 1); }
+.cluster-rail-right .cluster-rail-item::before { left: auto; right: -11px; border-radius: 4px 0 0 4px; }
+.cluster-rail-item:hover::before { opacity: .7; transform: translateY(-50%) scaleY(1); }
+.cluster-rail-active::before { height: 30px; opacity: 1 !important; transform: translateY(-50%) scaleY(1); }
+.cluster-rail-key { color: var(--ui-muted); font-family: "DM Mono", monospace; font-size: 9px; font-weight: 600; }
+.cluster-rail-active .cluster-rail-key { color: var(--ui-ink); }
+.cluster-rail-add > svg, .cluster-rail-flip > svg { box-sizing: content-box; padding: 11px; border: 1px dashed var(--ui-border-strong); border-radius: 50%; transition: border-radius .28s cubic-bezier(.34, 1.56, .64, 1), color .15s ease, border-color .15s ease; }
+.cluster-rail-flip > svg { padding: 8px; border-style: solid; border-color: var(--ui-border); }
+.cluster-rail-add:hover > svg, .cluster-rail-add.active > svg, .cluster-rail-flip:hover > svg { border-radius: 12px; color: var(--ui-accent, #c45c32); border-color: currentColor; }
+.cluster-rail-flip:hover > svg { transform: rotate(180deg); transition: transform .4s cubic-bezier(.34, 1.56, .64, 1), border-radius .28s ease, color .15s ease; }
+/* Flyout name tag, sliding out toward the content. */
+.cluster-rail-label { position: absolute; left: calc(100% + 14px); top: 20px; z-index: 5; display: grid; gap: 1px; min-width: 150px; max-width: 260px; padding: 7px 11px; border: 1px solid var(--ui-border-strong); border-radius: 10px; color: var(--ui-ink); background: var(--ui-surface); box-shadow: 0 10px 28px rgba(0, 0, 0, .22); text-align: left; white-space: nowrap; opacity: 0; pointer-events: none; transform: translate(-6px, -50%); transition: opacity .14s ease, transform .2s cubic-bezier(.34, 1.56, .64, 1); }
+.cluster-rail-flip .cluster-rail-label { top: 16px; }
+.cluster-rail-right .cluster-rail-label { left: auto; right: calc(100% + 14px); transform: translate(6px, -50%); }
+.cluster-rail-label strong { overflow: hidden; font-size: 12.5px; text-overflow: ellipsis; }
+.cluster-rail-label small { color: var(--ui-muted); font-size: 11px; }
+:is(.cluster-rail-item, .cluster-rail-add, .cluster-rail-flip):is(:hover, :focus-visible) .cluster-rail-label { opacity: 1; transform: translate(0, -50%); }
+.cluster-rail-rename { position: absolute; left: calc(100% + 10px); bottom: 60px; z-index: 6; width: 240px; padding: 6px; border: 1px solid var(--ui-border-strong); border-radius: 10px; background: var(--ui-surface); box-shadow: 0 12px 32px rgba(0, 0, 0, .22); }
+.cluster-rail-right .cluster-rail-rename { left: auto; right: calc(100% + 10px); }
+::view-transition-group(cluster-rail) { animation-duration: .5s; animation-timing-function: cubic-bezier(.34, 1.25, .64, 1); }
+::view-transition-old(root), ::view-transition-new(root) { animation-duration: .35s; }
+@media (prefers-reduced-motion: reduce) { .cluster-rail *, .cluster-rail *::before { transition: none !important; } }
+.segmented-control { display: inline-flex; gap: 2px; padding: 3px; border: 1px solid var(--ui-border); border-radius: 10px; background: var(--ui-surface-strong); }
+.segmented-control button { padding: 6px 14px; border: 0; border-radius: 7px; color: var(--ui-muted); background: transparent; font: inherit; font-size: 12.5px; font-weight: 650; cursor: pointer; }
+.segmented-control button.segmented-active { color: var(--ui-ink); background: var(--ui-surface); box-shadow: 0 1px 3px rgba(0, 0, 0, .12); }
+
+/* Log search: every match is highlighted in place; the current one stands out. */
+:is(.workload-log-output, .live-log-output) mark { padding: 0 1px; border-radius: 3px; color: inherit; background: rgba(250, 199, 117, .28); box-shadow: 0 0 0 1px rgba(250, 199, 117, .35); }
+:is(.workload-log-output, .live-log-output) mark.log-mark-current { color: #1a1912; background: #fac775; box-shadow: 0 0 0 2px #ef9f27; }
+.log-search button:disabled { opacity: .4; cursor: default; }
+.log-search span.log-search-none { color: #e24b4a; }
+.log-search button + button { margin-left: 2px; }
