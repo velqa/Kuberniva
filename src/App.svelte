@@ -18,7 +18,7 @@
   import { matchesSearch, searchTokens } from './lib/object-search';
   import { parseReleaseNotes, type Inline } from './lib/release-notes';
   import { readDeadlineMs, resumeAction, usesInteractiveAuth, withRequestDeadline } from './lib/request-recovery';
-  import { Bell, Blocks, Boxes, Check, ChevronDown, ChevronRight, Command, Container, Copy, Database, Download, FileText, GitBranch, Ghost, HardDrive, Heart, HeartCrack, Pause, CircleCheck, CircleArrowUp, CircleQuestionMark, Undo2, Ban, Clock, ArrowLeft, Zap, Package, Network as NetworkIcon, Globe, KeyRound, LayoutDashboard, LoaderCircle, Menu, Moon, Network, RefreshCw, Search, ScrollText, Server, Settings2, Shield, ShieldCheck, Star, Sun, Terminal, WifiOff, Workflow, Waypoints, ArrowLeftRight, Plus } from '@lucide/svelte';
+  import { Bell, Blocks, Boxes, Check, ChevronDown, ChevronRight, Command, Container, Copy, Database, Download, FileText, GitBranch, Ghost, HardDrive, Heart, HeartCrack, Pause, CircleCheck, CircleArrowUp, CircleQuestionMark, Undo2, Ban, Clock, ArrowLeft, Zap, Package, Network as NetworkIcon, Globe, KeyRound, LayoutDashboard, LoaderCircle, Menu, Moon, Network, RefreshCw, Search, ScrollText, Server, Settings2, Shield, ShieldCheck, Star, Sun, Terminal, WifiOff, Workflow, Waypoints, ArrowLeftRight, Plus, Trash2 } from '@lucide/svelte';
 
   type View = 'Clusters' | 'Favorites' | 'Overview' | 'Topology' | 'Events' | 'Argo CD' | 'Helm' | 'OCM' | 'Resources' | 'Workloads' | 'Explore' | 'Logs' | 'Settings';
   type ThemeMode = 'light' | 'dark';
@@ -3529,18 +3529,40 @@
   }
 
   let updateDialogOpen = false;
-  let dismissedUpdateVersion = '';
+  // Updates are checked hourly; "Later" snoozes the reminder for that version for 6 hours.
+  const UPDATE_CHECK_EVERY_MS = 60 * 60 * 1000;
+  const UPDATE_SNOOZE_MS = 6 * 60 * 60 * 1000;
+  const updateSnoozeKey = 'kuberniva.update-snooze.v1';
+  let lastUpdateCheckAt = 0;
+
+  function updateSnoozed(version: string) {
+    try {
+      const saved = JSON.parse(window.localStorage.getItem(updateSnoozeKey) || 'null') as { version?: string; at?: number } | null;
+      return saved?.version === version && Date.now() - (saved.at || 0) < UPDATE_SNOOZE_MS;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Runs a quiet check when the last one is an hour old; the wall clock survives sleep and App Nap. */
+  function maybeCheckForUpdates() {
+    if (Date.now() - lastUpdateCheckAt >= UPDATE_CHECK_EVERY_MS) void checkForUpdates(true);
+  }
   let updatePollTimer: ReturnType<typeof window.setInterval> | undefined;
   let stopUpdateMenuListening: (() => void) | undefined;
 
   function dismissUpdateDialog() {
     updateDialogOpen = false;
-    if (updateState === 'available' && pendingUpdate) dismissedUpdateVersion = pendingUpdate.version;
+    if (updateState === 'available' && pendingUpdate) {
+      try { window.localStorage.setItem(updateSnoozeKey, JSON.stringify({ version: pendingUpdate.version, at: Date.now() })); } catch { /* Optional reminder state. */ }
+    }
   }
 
-  /** The Kuberniva menu's "Check for Updates…" and a quiet check every 6 hours. */
+  /** The Kuberniva menu's "Check for Updates…" and a quiet check every hour. */
   async function setupUpdateChecks() {
-    updatePollTimer = window.setInterval(() => void checkForUpdates(true), 6 * 60 * 60 * 1000);
+    updatePollTimer = window.setInterval(maybeCheckForUpdates, 5 * 60 * 1000);
+    window.addEventListener('focus', maybeCheckForUpdates);
+    document.addEventListener('visibilitychange', maybeCheckForUpdates);
     if (!('__TAURI_INTERNALS__' in window)) return;
     try {
       const { listen } = await import('@tauri-apps/api/event');
@@ -3555,6 +3577,10 @@
 
   async function checkForUpdates(silent = false) {
     if (!('__TAURI_INTERNALS__' in window) || updateState === 'checking' || updateState === 'downloading' || updateState === 'ready') return;
+    // A quiet check never disturbs the update window while it is open.
+    if (silent && updateDialogOpen) return;
+    lastUpdateCheckAt = Date.now();
+    const previousState = updateState;
     updateState = 'checking';
     updateError = '';
     try {
@@ -3562,11 +3588,10 @@
       const update = await check();
       updateCheckedAt = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
       if (update) {
-        const isNew = pendingUpdate?.version !== update.version;
         pendingUpdate = update as unknown as PendingUpdate;
         updateState = 'available';
-        // A new version opens the update window once on its own; a manual check always does.
-        if (!silent || (isNew && dismissedUpdateVersion !== update.version)) updateDialogOpen = true;
+        // A new version asks on its own; after "Later" it asks again 6 hours on. A manual check always shows it.
+        if (!silent || !updateSnoozed(update.version)) updateDialogOpen = true;
       } else {
         pendingUpdate = null;
         updateState = 'current';
@@ -3576,7 +3601,7 @@
       }
     } catch (error) {
       // A quiet launch check never interrupts; a manual check explains what happened.
-      updateState = silent ? 'idle' : 'error';
+      updateState = silent ? (previousState === 'available' && pendingUpdate ? 'available' : 'idle') : 'error';
       updateError = silent ? '' : friendlyUpdateError(error);
     }
   }
@@ -4749,6 +4774,10 @@
     }
   }
 
+  function isBase64(value: string) {
+    return /^[A-Za-z0-9+/]*={0,2}$/.test(value) && value.length % 4 === 0;
+  }
+
   function encodeSecret(value: string) {
     const bytes = new TextEncoder().encode(value);
     let binary = '';
@@ -5485,6 +5514,14 @@
       notify('Keys must be unique before saving');
       return;
     }
+    if (editorResource.kind === 'Secret') {
+      // Secret data must be base64; values are edited decoded and encoded on input.
+      const invalid = editorEntries.findIndex((entry) => !isBase64(entry.value));
+      if (invalid >= 0) {
+        notify(`The value of ${normalizedKeys[invalid]} could not be encoded. Reveal decoded values and edit it as plain text`);
+        return;
+      }
+    }
     savingEditor = true;
     try {
       const resourceNamespace = objectNamespace(editorObject);
@@ -6213,6 +6250,8 @@
     logStreamUnlisten?.();
     stopLogStream();
     stopUpdateMenuListening?.();
+    window.removeEventListener('focus', maybeCheckForUpdates);
+    document.removeEventListener('visibilitychange', maybeCheckForUpdates);
     if (argoTreeTimer) window.clearInterval(argoTreeTimer);
     if (topologyTimer) window.clearInterval(topologyTimer);
     if (updatePollTimer) window.clearInterval(updatePollTimer);
@@ -7031,6 +7070,7 @@
         {/if}
       </div>
       <div class="top-actions">
+        {#if (updateState === 'available' || updateState === 'ready' || updateState === 'downloading') && pendingUpdate}<button type="button" class="update-pill" title="A new version is ready" on:click={() => (updateDialogOpen = true)}><CircleArrowUp size={14} /><span>{updateState === 'ready' ? 'Restart to update' : updateState === 'downloading' ? 'Downloading…' : `Update to ${pendingUpdate.version}`}</span></button>{/if}
         {#if connectionState !== 'idle'}
           {#if connectionState === 'attention'}<button type="button" class="connection-pill connection-pill-attention" title={connectionText} on:click={refreshCurrentView}><WifiOff size={13} /><span>Reconnect</span></button>
           {:else}<span class:connection-pill-deferred={connectionState === 'deferred'} class="connection-pill" role="status" aria-live="polite" title={connectionText}>{#if connectionState === 'busy'}<LoaderCircle size={13} class="workspace-loading-spinner" />{/if}<span>{connectionState === 'deferred' ? 'Recovery paused' : connectionText}</span></span>{/if}
@@ -7766,7 +7806,7 @@
                   <div class="resource-object-heading resource-pane-heading"><button type="button" class="resource-directory-back" aria-label="Back to all resource types" title="All resource types" on:click={showResourceDirectory}>←</button><div><span class:custom={selectedResource.crd} class="resource-pane-icon"><svelte:component this={resourceIcon(selectedResource)} size={16} strokeWidth={1.8} /></span><div><strong>{selectedResource.kind} objects</strong><small>{selectedResource.apiVersion} · {selectedResource.namespaced ? (namespace === 'all namespaces' ? 'All namespaces' : namespace) : 'Cluster-wide'}</small></div></div><span class:live-status-loading={liveDataStatus === 'loading'} class:live-status-loaded={liveDataStatus === 'loaded'} class:live-status-stale={liveDataStatus === 'stale'} class:live-status-paused={liveDataStatus === 'paused'} class:live-status-unavailable={liveDataStatus === 'unavailable'} class:live-status-live={liveDataStatus === 'live'} class="live-list-status resource-live-status" title={liveDataStatusTooltip} aria-label={liveDataStatusTooltip} aria-live="polite"><i></i></span><b>{resourceObjects.length}</b></div>
                   <label class="resource-object-search"><Search size={13} /><input bind:value={resourceObjectSearch} placeholder={`Filter ${selectedResource.plural} by name, namespace, or status`} aria-label={`Filter ${selectedResource.plural}`} spellcheck="false" />{#if resourceObjectSearch}<span>{visibleResourceObjects.length}/{resourceObjects.length}</span><button type="button" aria-label="Clear filter" on:click={() => (resourceObjectSearch = '')}>×</button>{/if}</label>
                   <div class="resource-object-columns" role="row" aria-label="Select shown resource objects">{#if selectedResourcePermissionSet.canDelete}<label class:resource-select-all-partial={resourceObjectsSelectionPartial} class="resource-select-all"><input type="checkbox" checked={allResourceObjectsSelected} disabled={deletingResource || loadingObjects || !visibleResourceObjects.length} aria-checked={resourceObjectsSelectionPartial ? 'mixed' : allResourceObjectsSelected ? 'true' : 'false'} aria-label={`Select all shown ${selectedResource.plural}`} on:change={toggleAllResourceObjects} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}<div class="table-header-cells resource-header-cells">{#each resourceListColumns as column (column.key)}<span class="column-cell" data-column={column.key} data-min={trackMinimum(column.auto)}><span class="column-label" title={column.label}>{column.label}</span>{#if column.resizable}<!-- svelte-ignore a11y_no_noninteractive_tabindex --><i class="column-resizer" role="separator" tabindex="0" aria-orientation="vertical" aria-label={`Resize the ${column.label} column`} title="Drag to resize · double-click to reset" use:dragResize={{ value: columnWidths[resourceColumnScope]?.[column.key] || 0, min: 0, max: 1200, reset: 0, step: 16, onStart: freezeLeftColumns(resourceColumnScope), fromPointer: columnWidthFromDrag, onChange: (value) => setColumnWidth(resourceColumnScope, column.key, value), onCommit: commitColumnWidths(resourceColumnScope) }}></i>{/if}</span>{/each}</div></div>
-                  {#if selectedResourceObjects.length && selectedResourcePermissionSet.canDelete}<div class="resource-bulk-toolbar" role="region" aria-label="Bulk resource actions"><span><strong>{selectedResourceObjects.length}</strong> selected</span><button class="destructive" type="button" disabled={deletingResource || loadingEditor || savingEditor || loadingYaml || savingYaml} on:click={() => requestBulkResourceDeletion(selectedResource!)}>Delete {selectedResourceObjects.length}</button><button class="resource-bulk-clear" type="button" disabled={deletingResource} on:click={clearResourceObjectSelection}>Clear</button></div>{/if}
+                  {#if selectedResourceObjects.length && selectedResourcePermissionSet.canDelete}<div class="resource-bulk-toolbar" role="region" aria-label="Bulk resource actions"><span><strong>{selectedResourceObjects.length}</strong> selected</span><button class="destructive bulk-delete-button" type="button" disabled={deletingResource || loadingEditor || savingEditor || loadingYaml || savingYaml} on:click={() => requestBulkResourceDeletion(selectedResource!)}><Trash2 size={13} />Delete {selectedResourceObjects.length}</button><button class="resource-bulk-clear" type="button" disabled={deletingResource} on:click={clearResourceObjectSelection}>Clear</button></div>{/if}
                   {#if loadingObjects}<div class="drawer-state"><i></i>Listing {selectedResource.plural}…</div>{:else if resourceObjects.length === 0}<div class="resource-object-empty"><span>○</span><strong>No {selectedResource.plural} found</strong><p>Try another namespace or use Refresh in the top bar.</p></div>{:else if visibleResourceObjects.length === 0}<div class="resource-object-empty"><span>○</span><strong>No {selectedResource.plural} match “{resourceObjectSearch}”</strong><p>Search matches name, namespace, and status.</p></div>{:else}<div class="object-list">{#each renderedResourceObjects as object}<div class:resource-object-row-selected={isResourceObjectSelected(object, selectedResourceKeySet)} class="resource-object-row">{#if selectedResourcePermissionSet.canDelete}<label class="resource-object-select"><input type="checkbox" checked={isResourceObjectSelected(object, selectedResourceKeySet)} disabled={deletingResource} aria-label={`Select ${selectedResource.kind} ${object.name}`} on:change={() => toggleResourceObjectSelection(object)} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}<button type="button" disabled={!selectedResourceCanOpen} aria-busy={selectedResource.kind === 'Pod' && isOpeningLogs('Pod', object)} class:object-selected={editorObject?.name === object.name && editorObject?.namespace === object.namespace} on:click={() => openObject(selectedResource!, object)}><div class="resource-object-primary"><strong>{object.name}</strong></div>{#each resourceServerColumns as column}<span class="resource-server-cell" title={object.cells?.[column.index] || ''}>{object.cells?.[column.index] || '—'}</span>{/each}<span class="resource-object-namespace">{object.namespace || 'cluster scoped'}</span><small class="resource-object-age">{object.createdAt ? resourceAge(object.createdAt) : '—'}</small><span class="resource-object-action">{selectedResourceCanOpen ? (selectedResource.kind === 'Pod' ? (isOpeningLogs('Pod', object) ? 'Opening…' : 'Logs →') : 'Open →') : ''}</span></button></div>{/each}{#if visibleResourceObjects.length > resourceRenderLimit}<div class="list-reveal-sentinel" use:revealOnView={() => (resourceRenderLimit += LIST_RENDER_BATCH * 2)}>Showing {resourceRenderLimit.toLocaleString()} of {visibleResourceObjects.length.toLocaleString()} · scroll for more</div>{/if}</div>{/if}
                 {:else}
                   <div class="resource-object-empty"><span>⌘</span><strong>Select a resource kind</strong></div>
@@ -7792,7 +7832,7 @@
                         {#if editorEntries.length === 0}
                           <div class="configuration-values-empty">No values yet.{#if editorPermissionSet.canUpdate}<button type="button" on:click={addEditorEntry}>Add the first key</button>{/if}</div>
                         {:else}
-                          <div class:configuration-preview-dense={editorEntries.length > 8} class="configuration-preview-list">{#each filteredEditorEntries as { entry, index }}{@const format = editorEntryFormat(entry, revealSecret)}<article class:configuration-preview-open={expandedEditorEntryIndex === index} class="configuration-preview-card"><button class="configuration-preview-toggle" type="button" aria-expanded={expandedEditorEntryIndex === index} on:click={() => toggleEditorEntry(index)}><span class={`configuration-preview-type configuration-preview-type-${format.tone}`}>{format.short}</span><span><strong>{entry.key || `Entry ${index + 1}`}</strong><small>{format.label}</small></span><code>{editorEntryPreview(entry, revealSecret)}</code><b>{expandedEditorEntryIndex === index ? '⌃' : '⌄'}</b></button>{#if expandedEditorEntryIndex === index}{#if editorPermissionSet.canUpdate}<div class="configuration-preview-editor"><label><span>Key</span><input value={entry.key} on:input={(event) => updateEditorEntryKey(index, event.currentTarget.value)} spellcheck="false" /></label><label><span>Value</span><textarea use:autoSizeTextarea={editorEntryDisplayValue(entry, revealSecret)} value={editorEntryDisplayValue(entry, revealSecret)} on:input={(event) => updateEditorEntryValue(index, event.currentTarget.value)} spellcheck="false"></textarea></label><button class="configuration-preview-remove" type="button" on:click={() => removeEditorEntry(index)}>Remove key</button></div>{:else}<div class="configuration-preview-readonly"><pre>{editorEntryDisplayValue(entry, revealSecret)}</pre></div>{/if}{/if}</article>{:else}<div class="configuration-filter-empty"><Search size={16} /><span>No keys match “{editorEntrySearch}”</span></div>{/each}</div>
+                          <div class:configuration-preview-dense={editorEntries.length > 8} class="configuration-preview-list">{#each filteredEditorEntries as { entry, index }}{@const format = editorEntryFormat(entry, revealSecret)}<article class:configuration-preview-open={expandedEditorEntryIndex === index} class="configuration-preview-card"><button class="configuration-preview-toggle" type="button" aria-expanded={expandedEditorEntryIndex === index} on:click={() => toggleEditorEntry(index)}><span class={`configuration-preview-type configuration-preview-type-${format.tone}`}>{format.short}</span><span><strong>{entry.key || `Entry ${index + 1}`}</strong><small>{format.label}</small></span><code>{editorEntryPreview(entry, revealSecret)}</code><b>{expandedEditorEntryIndex === index ? '⌃' : '⌄'}</b></button>{#if expandedEditorEntryIndex === index}{#if editorPermissionSet.canUpdate}<div class="configuration-preview-editor"><label><span>Key</span><input value={entry.key} on:input={(event) => updateEditorEntryKey(index, event.currentTarget.value)} spellcheck="false" /></label><label><span>Value{#if editorResource?.kind === 'Secret' && !revealSecret}<button type="button" class="secret-reveal-to-edit" on:click|preventDefault={() => (revealSecret = true)}>Reveal to edit</button>{/if}</span><textarea use:autoSizeTextarea={editorEntryDisplayValue(entry, revealSecret)} value={editorEntryDisplayValue(entry, revealSecret)} readonly={editorResource?.kind === 'Secret' && !revealSecret} title={editorResource?.kind === 'Secret' && !revealSecret ? 'Base64 shown. Reveal decoded values to edit as plain text.' : undefined} on:input={(event) => updateEditorEntryValue(index, event.currentTarget.value)} spellcheck="false"></textarea></label><button class="configuration-preview-remove" type="button" on:click={() => removeEditorEntry(index)}>Remove key</button></div>{:else}<div class="configuration-preview-readonly"><pre>{editorEntryDisplayValue(entry, revealSecret)}</pre></div>{/if}{/if}</article>{:else}<div class="configuration-filter-empty"><Search size={16} /><span>No keys match “{editorEntrySearch}”</span></div>{/each}</div>
                         {/if}
                       </section>
                     {:else}
@@ -7886,7 +7926,7 @@
               <nav class="kind-tabs" aria-label="Workload types">{#each workloadResources as resource}<button type="button" aria-pressed={workloadResource !== null && resourceKey(workloadResource) === resourceKey(resource)} class:kind-tab-active={workloadResource !== null && resourceKey(workloadResource) === resourceKey(resource)} title={kindLabel(resource)} on:click={() => selectWorkloadResource(resource)}>{kindTabLabel(resource)}</button>{/each}</nav>
             {/if}
             <div class:workload-detail-open={(editorResource?.category === 'Workloads' && editorObject !== null) || (workloadDetailMode === 'logs' && logTarget !== null)} class:workload-logs-open={workloadDetailMode === 'logs' && logTarget !== null} style:--workload-list-percent={`${workloadListPercent}%`} class="workload-grid grid min-h-[560px]">
-              <div class="workload-list-panel overflow-hidden rounded-2xl border border-white/10 bg-[#151924]/90 shadow-2xl shadow-black/10"><div class="workload-list-header flex items-center justify-between gap-4 border-b border-white/10 px-5 py-4"><div><div class="flex items-center gap-2"><Container size={18} class="text-cyan-300" /><h3 class="m-0 text-lg font-semibold text-white">{workloadResource?.kind || 'Select a type'}</h3></div><p class="mb-0 mt-1 text-xs text-slate-400">{namespace} · {workloadResource?.apiVersion || 'Kubernetes API'}</p></div><span class:live-status-loading={liveDataStatus === 'loading'} class:live-status-loaded={liveDataStatus === 'loaded'} class:live-status-stale={liveDataStatus === 'stale'} class:live-status-paused={liveDataStatus === 'paused'} class:live-status-unavailable={liveDataStatus === 'unavailable'} class:live-status-live={liveDataStatus === 'live'} class="live-list-status" title={liveDataStatusTooltip} aria-label={liveDataStatusTooltip} aria-live="polite"><i></i>{liveDataStatusText}</span><label class="flex h-10 w-72 items-center gap-2 rounded-lg border border-white/10 bg-black/20 px-3 text-slate-500 focus-within:border-indigo-400 focus-within:bg-black/30 focus-within:ring-2 focus-within:ring-indigo-500/20"><Search size={16} /><input class="min-w-0 flex-1 border-0 bg-transparent text-sm text-slate-100 outline-none placeholder:text-slate-500" bind:value={workloadSearch} placeholder={`Filter ${workloadResource?.plural || 'workloads'} by name or status`} /></label></div>
+              <div class="workload-list-panel overflow-hidden rounded-2xl border border-white/10 bg-[#151924]/90 shadow-2xl shadow-black/10"><div class="workload-list-header flex items-center justify-between gap-4 border-b border-white/10 px-5 py-4"><div><div class="flex items-center gap-2"><Container size={18} class="text-cyan-300" /><h3 class="m-0 text-lg font-semibold text-white">{workloadResource?.kind || 'Select a type'}</h3></div><p class="mb-0 mt-1 text-xs text-slate-400">{namespace === 'all namespaces' ? 'All namespaces' : namespace}</p></div><span class:live-status-loading={liveDataStatus === 'loading'} class:live-status-loaded={liveDataStatus === 'loaded'} class:live-status-stale={liveDataStatus === 'stale'} class:live-status-paused={liveDataStatus === 'paused'} class:live-status-unavailable={liveDataStatus === 'unavailable'} class:live-status-live={liveDataStatus === 'live'} class="live-list-status" title={liveDataStatusTooltip} aria-label={liveDataStatusTooltip} aria-live="polite"><i></i>{liveDataStatusText}</span><label class="flex h-10 w-72 items-center gap-2 rounded-lg border border-white/10 bg-black/20 px-3 text-slate-500 focus-within:border-indigo-400 focus-within:bg-black/30 focus-within:ring-2 focus-within:ring-indigo-500/20"><Search size={16} /><input class="min-w-0 flex-1 border-0 bg-transparent text-sm text-slate-100 outline-none placeholder:text-slate-500" bind:value={workloadSearch} placeholder={`Filter ${workloadResource?.plural || 'workloads'} by name or status`} /></label></div>
                 {#if loadingWorkloads}
                   <div class="grid min-h-96 place-items-center text-sm text-slate-400"><div class="flex items-center gap-3"><RefreshCw size={18} class="animate-spin text-cyan-300" />Loading {workloadResource?.plural || 'workloads'}…</div></div>
                 {:else if visibleWorkloadObjects.length === 0}
@@ -7894,7 +7934,7 @@
                 {:else}
                   <div style:--workload-table-min={`${workloadTableMinWidth}px`} style:--kv-workload-grid={workloadGridColumns} class="workload-object-list" aria-label={`${workloadResource?.kind || 'Workload'} list`}>
                     <div class:workload-pod-row={workloadResource?.kind === 'Pod'} class="workload-object-list-header workload-selection-header" aria-label="Workload columns">{#if workloadPermissionSet.canDelete}<label class:resource-select-all-partial={workloadObjectsSelectionPartial} class="resource-select-all"><input type="checkbox" checked={allWorkloadObjectsSelected} disabled={deletingResource || loadingWorkloads || !visibleWorkloadObjects.length} aria-checked={workloadObjectsSelectionPartial ? 'mixed' : allWorkloadObjectsSelected ? 'true' : 'false'} aria-label={`Select all shown ${workloadResource?.plural || 'workloads'}`} on:change={toggleAllWorkloadObjects} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}<div class="table-header-cells workload-header-cells">{#each workloadColumns as column (column.key)}<span class="column-cell" data-column={column.key}><span class="column-label" title={column.label}>{column.label}</span><!-- svelte-ignore a11y_no_noninteractive_tabindex --><i class="column-resizer" role="separator" tabindex="0" aria-orientation="vertical" aria-label={`Resize the ${column.label} column`} title="Drag to resize · double-click to reset" use:dragResize={{ value: columnWidths[workloadColumnScope]?.[column.key] || 0, min: 0, max: 1200, reset: 0, step: 16, onStart: freezeLeftColumns(workloadColumnScope), fromPointer: columnWidthFromDrag, onChange: (value) => setColumnWidth(workloadColumnScope, column.key, value), onCommit: commitColumnWidths(workloadColumnScope) }}></i></span>{/each}<span></span></div></div>
-                    {#if selectedWorkloadObjects.length && workloadPermissionSet.canDelete}<div class="resource-bulk-toolbar workload-bulk-toolbar" role="region" aria-label="Bulk workload actions"><span><strong>{selectedWorkloadObjects.length}</strong> selected</span><button class="destructive" type="button" disabled={deletingResource || loadingEditor || savingEditor || loadingYaml || savingYaml} on:click={() => workloadResource && requestBulkResourceDeletion(workloadResource, selectedWorkloadObjects)}>Delete {selectedWorkloadObjects.length}</button><button class="resource-bulk-clear" type="button" disabled={deletingResource} on:click={clearWorkloadObjectSelection}>Clear</button></div>{/if}
+                    {#if selectedWorkloadObjects.length && workloadPermissionSet.canDelete}<div class="resource-bulk-toolbar workload-bulk-toolbar" role="region" aria-label="Bulk workload actions"><span><strong>{selectedWorkloadObjects.length}</strong> selected</span><button class="destructive bulk-delete-button" type="button" disabled={deletingResource || loadingEditor || savingEditor || loadingYaml || savingYaml} on:click={() => workloadResource && requestBulkResourceDeletion(workloadResource, selectedWorkloadObjects)}><Trash2 size={13} />Delete {selectedWorkloadObjects.length}</button><button class="resource-bulk-clear" type="button" disabled={deletingResource} on:click={clearWorkloadObjectSelection}>Clear</button></div>{/if}
                     {#each renderedWorkloadObjects as workload}
                       <div class:workload-pod-row={workloadResource?.kind === 'Pod'} class:resource-object-row-selected={isWorkloadObjectSelected(workload, selectedWorkloadKeySet)} class="resource-object-row workload-selection-row">
                         {#if workloadPermissionSet.canDelete}<label class="resource-object-select"><input type="checkbox" checked={isWorkloadObjectSelected(workload, selectedWorkloadKeySet)} disabled={deletingResource} aria-label={`Select ${workloadResource?.kind || 'workload'} ${workload.name}`} on:change={() => toggleWorkloadObjectSelection(workload)} /></label>{:else}<span class="resource-permission-spacer"></span>{/if}
@@ -7997,7 +8037,6 @@
                       <dl class="detail-placement">
                         {#if editorResource.kind === 'Pod' && editorObject.nodeName}<div><dt>Node</dt><dd>{editorObject.nodeName}</dd></div>{/if}
                         <div><dt>Namespace</dt><dd>{editorObject.namespace || 'cluster scoped'}</dd></div>
-                        <div><dt>API</dt><dd>{editorResource.apiVersion}</dd></div>
                       </dl>
                       {#if editorResource.kind === 'Pod'}<section class="pod-diagnostics-card"><div class="pod-diagnostics-heading"><strong>Diagnostics</strong><span>{selectedPodEvents.filter((event) => event.eventType === 'Warning').length} warnings</span></div>{#if podContainerDiagnostics(editorManifest).length}<div class="pod-container-diagnostics">{#each podContainerDiagnostics(editorManifest) as container}<article class:pod-diagnostic-warning={!container.ready || container.state !== 'Running'}><span class="pod-diagnostic-dot"></span><div><strong>{container.name}</strong><small>{container.state}{container.reason ? ` · ${container.reason}` : ''}{container.restarts ? ` · ${container.restarts} restarts` : ''}</small>{#if container.message}<p>{container.message}</p>{/if}</div></article>{/each}</div>{/if}{#if podConditionDiagnostics(editorManifest).length}<div class="pod-condition-strip">{#each podConditionDiagnostics(editorManifest) as condition}<span class:pod-condition-false={condition.status !== 'True'} title={condition.message || condition.reason}><b>{condition.type}</b>{condition.status}</span>{/each}</div>{/if}<div class="pod-event-list">{#each selectedPodEvents as event}<article class:pod-event-warning={event.eventType === 'Warning'}><span>{event.eventType === 'Warning' ? '!' : '✓'}</span><div><strong>{event.reason || event.action || event.eventType}</strong><p>{event.message || 'No event message returned.'}</p></div><time>{resourceAge(event.lastObserved)}</time></article>{:else}{#if loadingEvents}<div class="pod-events-loading"><i></i></div>{:else}<small class="pod-events-empty">No recent Pod events.</small>{/if}{/each}</div></section>{/if}
                       <section class="workload-detail-card"><div class="workload-detail-card-heading"><div><strong>Containers</strong></div><b>{workloadImages(editorManifest).length}</b></div>{#if workloadImages(editorManifest).length}<div class="workload-image-list">{#each workloadImages(editorManifest) as container}<div><span>{container.init ? 'Init' : 'App'}</span><strong>{container.name}</strong><small title={container.image}>{container.image}</small></div>{/each}</div>{:else}<p>No container image is declared on this resource.</p>{/if}</section>
@@ -8135,7 +8174,7 @@
           <h2 id="deletion-dialog-title">Are you sure?</h2>
           <p id="deletion-dialog-description" class="deletion-intro">This is the final confirmation. Kubernetes will receive the exact deletion request described above, and the action cannot be undone.</p>
           {#if bulkDeleteProgress}<p class="bulk-delete-progress" aria-live="polite">Deleting {bulkDeleteProgress.completed} of {bulkDeleteProgress.total}… {bulkDeleteProgress.failed ? `${bulkDeleteProgress.failed} failed so far` : 'No failures so far'}</p>{/if}
-          <div class="deletion-actions"><button class="secondary" disabled={deletingResource} on:click={() => { deletionStep = 1; void tick().then(() => deletionDialog?.focus()); }}>Back</button><button bind:this={deletionConfirmButton} class="destructive" disabled={deletingResource} on:click={confirmDeletion}>{deletingResource ? 'Deleting…' : deletionTarget.type === 'resource' ? 'Delete resource' : deletionTarget.type === 'bulk-resource' ? `Delete ${deletionTarget.objects.length} objects` : 'Remove from Kuberniva'}</button></div>
+          <div class="deletion-actions"><button class="secondary" disabled={deletingResource} on:click={() => { deletionStep = 1; void tick().then(() => deletionDialog?.focus()); }}>Back</button><button bind:this={deletionConfirmButton} class="destructive" disabled={deletingResource} on:click={confirmDeletion}>{deletingResource ? 'Deleting…' : deletionTarget.type === 'resource' ? 'Delete resource' : deletionTarget.type === 'bulk-resource' ? `Delete ${deletionTarget.objects.length} objects` : 'Remove context'}</button></div>
         {/if}
       </div>
     </div>
@@ -8244,7 +8283,7 @@
           {#if editorResource.kind === 'Secret' || editorResource.kind === 'ConfigMap'}
             <section class="configuration-values-editor">
               <div class="configuration-values-toolbar"><small>{editorEntries.length} {editorEntries.length === 1 ? 'key' : 'keys'}{editorEntrySearch ? ` · ${filteredEditorEntries.length} shown` : ''}{editorResource.kind === 'Secret' ? (revealSecret ? ' · decoded' : ' · base64') : ''}</small><div>{#if editorEntries.length > 8}<label class="configuration-key-search"><Search size={12} /><input bind:value={editorEntrySearch} placeholder="Filter keys" aria-label="Filter configuration keys" spellcheck="false" />{#if editorEntrySearch}<button type="button" aria-label="Clear key filter" on:click={() => (editorEntrySearch = '')}>×</button>{/if}</label>{/if}{#if editorResource.kind === 'Secret'}<button class="reveal-button" on:click={() => (revealSecret = !revealSecret)}>{revealSecret ? 'Hide decoded' : 'Reveal decoded'}</button>{/if}{#if editorPermissionSet.canUpdate}<button class="configuration-add-key" type="button" on:click={addEditorEntry}>＋ Add key</button>{/if}</div></div>
-              {#if editorEntries.length === 0}<div class="configuration-values-empty">No values yet.{#if editorPermissionSet.canUpdate}<button type="button" on:click={addEditorEntry}>Add the first key</button>{/if}</div>{:else}<div class:configuration-preview-dense={editorEntries.length > 8} class="configuration-preview-list">{#each filteredEditorEntries as { entry, index }}{@const format = editorEntryFormat(entry, revealSecret)}<article class:configuration-preview-open={expandedEditorEntryIndex === index} class="configuration-preview-card"><button class="configuration-preview-toggle" type="button" aria-expanded={expandedEditorEntryIndex === index} on:click={() => toggleEditorEntry(index)}><span class={`configuration-preview-type configuration-preview-type-${format.tone}`}>{format.short}</span><span><strong>{entry.key || `Entry ${index + 1}`}</strong><small>{format.label}</small></span><code>{editorEntryPreview(entry, revealSecret)}</code><b>{expandedEditorEntryIndex === index ? '⌃' : '⌄'}</b></button>{#if expandedEditorEntryIndex === index}{#if editorPermissionSet.canUpdate}<div class="configuration-preview-editor"><label><span>Key</span><input value={entry.key} on:input={(event) => updateEditorEntryKey(index, event.currentTarget.value)} spellcheck="false" /></label><label><span>Value</span><textarea use:autoSizeTextarea={editorEntryDisplayValue(entry, revealSecret)} value={editorEntryDisplayValue(entry, revealSecret)} on:input={(event) => updateEditorEntryValue(index, event.currentTarget.value)} spellcheck="false"></textarea></label><button class="configuration-preview-remove" type="button" on:click={() => removeEditorEntry(index)}>Remove key</button></div>{:else}<div class="configuration-preview-readonly"><pre>{editorEntryDisplayValue(entry, revealSecret)}</pre></div>{/if}{/if}</article>{:else}<div class="configuration-filter-empty"><Search size={16} /><span>No keys match “{editorEntrySearch}”</span></div>{/each}</div>{/if}
+              {#if editorEntries.length === 0}<div class="configuration-values-empty">No values yet.{#if editorPermissionSet.canUpdate}<button type="button" on:click={addEditorEntry}>Add the first key</button>{/if}</div>{:else}<div class:configuration-preview-dense={editorEntries.length > 8} class="configuration-preview-list">{#each filteredEditorEntries as { entry, index }}{@const format = editorEntryFormat(entry, revealSecret)}<article class:configuration-preview-open={expandedEditorEntryIndex === index} class="configuration-preview-card"><button class="configuration-preview-toggle" type="button" aria-expanded={expandedEditorEntryIndex === index} on:click={() => toggleEditorEntry(index)}><span class={`configuration-preview-type configuration-preview-type-${format.tone}`}>{format.short}</span><span><strong>{entry.key || `Entry ${index + 1}`}</strong><small>{format.label}</small></span><code>{editorEntryPreview(entry, revealSecret)}</code><b>{expandedEditorEntryIndex === index ? '⌃' : '⌄'}</b></button>{#if expandedEditorEntryIndex === index}{#if editorPermissionSet.canUpdate}<div class="configuration-preview-editor"><label><span>Key</span><input value={entry.key} on:input={(event) => updateEditorEntryKey(index, event.currentTarget.value)} spellcheck="false" /></label><label><span>Value{#if editorResource?.kind === 'Secret' && !revealSecret}<button type="button" class="secret-reveal-to-edit" on:click|preventDefault={() => (revealSecret = true)}>Reveal to edit</button>{/if}</span><textarea use:autoSizeTextarea={editorEntryDisplayValue(entry, revealSecret)} value={editorEntryDisplayValue(entry, revealSecret)} readonly={editorResource?.kind === 'Secret' && !revealSecret} title={editorResource?.kind === 'Secret' && !revealSecret ? 'Base64 shown. Reveal decoded values to edit as plain text.' : undefined} on:input={(event) => updateEditorEntryValue(index, event.currentTarget.value)} spellcheck="false"></textarea></label><button class="configuration-preview-remove" type="button" on:click={() => removeEditorEntry(index)}>Remove key</button></div>{:else}<div class="configuration-preview-readonly"><pre>{editorEntryDisplayValue(entry, revealSecret)}</pre></div>{/if}{/if}</article>{:else}<div class="configuration-filter-empty"><Search size={16} /><span>No keys match “{editorEntrySearch}”</span></div>{/each}</div>{/if}
             </section>
           {:else if !editorCertificate}
             <div class="drawer-state">This resource has no editable data view yet.</div>
