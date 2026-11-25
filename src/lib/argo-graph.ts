@@ -21,9 +21,12 @@ export type GraphNode = GraphInput & { x: number; y: number; depth: number };
 export type GraphEdge = { from: string; to: string; path: string; tone: string };
 export type GraphOptions = { columnWidth: number; columnGap: number; rowHeight: number; rowGap: number; maxChildren: number };
 
-export const DEFAULT_GRAPH_OPTIONS: GraphOptions = { columnWidth: 232, columnGap: 64, rowHeight: 54, rowGap: 12, maxChildren: 8 };
+export const DEFAULT_GRAPH_OPTIONS: GraphOptions = { columnWidth: 264, columnGap: 72, rowHeight: 64, rowGap: 14, maxChildren: 8 };
 
-export function layoutGraph(input: GraphInput[], expanded: ReadonlySet<string> = new Set(), options: GraphOptions = DEFAULT_GRAPH_OPTIONS) {
+/** Lower is shown first; failing children come before healthy ones so they are never folded away. */
+export type GraphPriority = (node: GraphInput) => number;
+
+export function layoutGraph(input: GraphInput[], expanded: ReadonlySet<string> = new Set(), options: GraphOptions = DEFAULT_GRAPH_OPTIONS, priority?: GraphPriority, edgeTone?: (node: GraphInput) => string) {
   const byId = new Map(input.map((node) => [node.id, node]));
   const children = new Map<string, GraphInput[]>();
   const roots: GraphInput[] = [];
@@ -36,6 +39,7 @@ export function layoutGraph(input: GraphInput[], expanded: ReadonlySet<string> =
   const step = options.rowHeight + options.rowGap;
   const place = (node: GraphInput, depth: number): number => {
     let kids = children.get(node.id) || [];
+    if (priority) kids = [...kids].sort((left, right) => priority(left) - priority(right));
     // The application's own resources always show; long lists of live children collapse.
     if (node.parent && kids.length > options.maxChildren && !expanded.has(node.id)) {
       const shown = kids.slice(0, options.maxChildren - 1);
@@ -64,7 +68,7 @@ export function layoutGraph(input: GraphInput[], expanded: ReadonlySet<string> =
     const x2 = node.x;
     const y2 = node.y + options.rowHeight / 2;
     const bend = (x2 - x1) / 2;
-    edges.push({ from: parent.id, to: node.id, path: `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`, tone: node.health || '' });
+    edges.push({ from: parent.id, to: node.id, path: `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`, tone: edgeTone ? edgeTone(node) : node.health || '' });
   }
   const depth = Math.max(0, ...placed.map((node) => node.depth));
   return {

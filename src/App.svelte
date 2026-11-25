@@ -5,6 +5,7 @@
   import { LiveResourceStore, panePercent, type RowChange } from './lib/live-resources';
   import { KeyedFeedStore, newestEvents, type FeedChange } from './lib/live-feed';
   import { layoutGraph, type GraphInput } from './lib/argo-graph';
+  import { analyzeGraph, healthRank, isProblem, matchesFilter } from './lib/argo-health';
   import { layoutTopology, PROBLEM_HEALTH, type Topology, type TopologyNode } from './lib/topology';
   import { redactSecret, summarizeObject } from './lib/object-summary';
   import { columnTracks, columnsRightOf, measureColumns, trackMinimum } from './lib/column-tracks';
@@ -119,7 +120,7 @@
   let recentResourceKeys: string[] = [];
   let sidebarResourceCategory: ResourceCategory | 'All resources' = 'All resources';
   let theme: ThemeMode = 'light';
-  let uiScale = 0.9;
+  let uiScale = 1;
   let loadingCatalog = false;
   let selectedResource: ResourceDescriptor | null = null;
   let resourceObjects: ResourceObject[] = [];
@@ -399,7 +400,8 @@
     railFlipping = true;
     transition.call(document, apply).finished.finally(() => (railFlipping = false));
   }
-  const uiScaleStorageKey = 'kuberniva.ui-scale.v1';
+  // v2: 100% is the default; 90% rendered text at fractional pixel sizes and looked soft.
+  const uiScaleStorageKey = 'kuberniva.ui-scale.v2';
   const resourceNavigatorWidthStorageKey = 'kuberniva.resource-navigator-width.v1';
   const resourceObjectPaneWidthStorageKey = 'kuberniva.resource-object-width.v1';
   const workloadPaneStorageKey = 'kuberniva.workload-list-percent.v1';
@@ -784,6 +786,10 @@
       const fixtures = await import('./dev/visual-qa-fixtures');
       return fixtures.visualQaArgoTree(args) as T;
     }
+    if (import.meta.env.DEV && visualQaRecoveryScenario === 'argocd' && command === 'read_pod_logs') {
+      const fixtures = await import('./dev/visual-qa-fixtures');
+      return { lines: fixtures.visualQaLogLines, containers: ['api', 'istio-proxy'], selectedContainer: 'api', ports: [] } as T;
+    }
     if (import.meta.env.DEV && visualQaRecoveryEnabled) {
       const fixtures = await import('./dev/visual-qa-fixtures');
       return withRequestDeadline(fixtures.readVisualQaRequest(command, args, visualQaRecoveryScenario === 'recovery-timeout') as Promise<T>, 'Reading cluster data', visualQaRecoveryScenario === 'recovery-timeout' ? 150 : 3_000);
@@ -822,7 +828,78 @@
   let argoTreeError = '';
   let argoGraphExpanded = new Set<string>();
   let argoTreeTimer: ReturnType<typeof window.setInterval> | undefined;
-  $: argoGraph = selectedArgoApp ? layoutGraph(argoGraphInput(selectedArgoApp, argoTreeNodes), argoGraphExpanded) : null;
+  $: argoGraphNodes = selectedArgoApp ? argoGraphInput(selectedArgoApp, argoTreeNodes) : [];
+  $: argoGraphHealth = analyzeGraph(argoGraphNodes);
+  // Failing children are laid out first and edges take the worst status below them, so the
+  // path from the Application to a failure reads in red, like Argo CD's resource tree.
+  $: argoGraph = selectedArgoApp ? layoutGraph(argoGraphNodes, argoGraphExpanded, undefined, (node) => -healthRank(argoGraphHealth.nodes.get(node.id)?.rollup || ''), (node) => argoGraphHealth.nodes.get(node.id)?.rollup || node.health || '') : null;
+  let argoGraphFilter = 'all';
+  let argoGraphScale = 1;
+  let argoGraphViewport: HTMLDivElement | undefined;
+  let argoGraphFitKey = '';
+  let argoGraphFocus = '';
+  $: if (argoAppTab === 'graph' && argoGraph && argoGraphViewport && argoGraphFitKey !== argoTreeKey + argoGraph.nodes.length) {
+    argoGraphFitKey = argoTreeKey + argoGraph.nodes.length;
+    void tick().then(() => fitArgoGraph(0.85)).then(() => {
+      // Open on the first failure, so what is broken is in view without searching.
+      const first = argoGraphHealth.summary.failures[0];
+      if (first) void focusArgoGraphNode(first.id, false);
+    });
+  }
+
+  /** Scales the graph to fit the view (never above 100%), like Argo CD's "fit" control. */
+  function fitArgoGraph(floor = 0.45) {
+    if (!argoGraph || !argoGraphViewport) return;
+    const width = argoGraphViewport.clientWidth - 40;
+    const height = argoGraphViewport.clientHeight - 40;
+    argoGraphScale = Math.max(floor, Math.min(1, width / argoGraph.width, height / argoGraph.height));
+  }
+
+  function zoomArgoGraph(step: number) {
+    argoGraphScale = Math.max(0.35, Math.min(1.6, Math.round((argoGraphScale + step) * 100) / 100));
+  }
+
+  /** Centers a node in the view and briefly highlights it. */
+  async function focusArgoGraphNode(id: string, flash = true) {
+    const node = argoGraph?.nodes.find((candidate) => candidate.id === id);
+    if (!node && argoGraph) {
+      // The node is folded into "+N more": expand its parent first.
+      const parent = argoGraphNodes.find((candidate) => candidate.id === id)?.parent;
+      if (parent) argoGraphExpanded = new Set([...argoGraphExpanded, parent]);
+      await tick();
+    }
+    const target = argoGraph?.nodes.find((candidate) => candidate.id === id);
+    if (!target || !argoGraphViewport) return;
+    argoGraphViewport.scrollTo({ left: Math.max(0, (target.x + 132) * argoGraphScale - argoGraphViewport.clientWidth / 2 + 20), top: Math.max(0, (target.y + 32) * argoGraphScale - argoGraphViewport.clientHeight / 2 + 20), behavior: 'smooth' });
+    if (!flash) return;
+    argoGraphFocus = id;
+    window.setTimeout(() => { if (argoGraphFocus === id) argoGraphFocus = ''; }, 1800);
+  }
+
+  /** Drag the empty canvas to pan, like a map. */
+  function panArgoGraph(event: PointerEvent) {
+    if (!argoGraphViewport || (event.target as Element).closest('button') || event.button !== 0) return;
+    const viewport = argoGraphViewport;
+    const start = { x: event.clientX, y: event.clientY, left: viewport.scrollLeft, top: viewport.scrollTop };
+    viewport.classList.add('argo-graph-panning');
+    const move = (next: PointerEvent) => {
+      viewport.scrollLeft = start.left - (next.clientX - start.x);
+      viewport.scrollTop = start.top - (next.clientY - start.y);
+    };
+    const stop = () => {
+      viewport.classList.remove('argo-graph-panning');
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', stop);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', stop);
+  }
+
+  function argoGraphZoomKeys(event: WheelEvent) {
+    if (!event.ctrlKey && !event.metaKey) return;
+    event.preventDefault();
+    zoomArgoGraph(event.deltaY < 0 ? 0.08 : -0.08);
+  }
   $: syncArgoTree(argoAppTab === 'graph' && selectedArgoApp ? selectedArgoApp : null);
   let argoResourceFilter: 'all' | 'outofsync' | 'unhealthy' | 'prune' = 'all';
   let argoResourceSearch = '';
@@ -991,11 +1068,100 @@
     }
     if (!selectedArgoApp || node.id === 'app') return;
     if (node.kind === 'Pod') {
-      void openPodLogs({ name: node.name, namespace: node.namespace }, [], `Argo CD · ${selectedArgoApp.name}`);
+      void openArgoPodLogs(node.name, node.namespace || selectedArgoApp.namespace);
       return;
     }
     const managed = selectedArgoApp.resources.find((resource) => argoNodeId(resource.kind, resource.namespace, resource.name) === node.id);
     if (managed) void openArgoResource(managed);
+  }
+
+  // Live Pod logs inside the Argo CD view, like Argo CD's own Logs panel.
+  let argoLog: { pod: string; namespace: string } | null = null;
+  let argoLogLines: string[] = [];
+  let argoLogContainers: string[] = [];
+  let argoLogContainer = '';
+  let argoLogStatus: LogStreamStatus = 'off';
+  let argoLogError = '';
+  let argoLogLoading = false;
+  let argoLogStreamId = '';
+  let argoLogFollow = true;
+  let argoLogViewport: HTMLPreElement | undefined;
+  $: argoLogEntries = groupLogLines(argoLogLines);
+  $: if (argoLog && (activeView !== 'Argo CD' || !selectedArgoApp)) closeArgoLogs();
+
+  async function openArgoPodLogs(pod: string, namespace: string, container = '') {
+    stopArgoLogStream();
+    argoLog = { pod, namespace };
+    argoLogLines = [];
+    argoLogError = '';
+    argoLogContainer = container;
+    argoLogFollow = true;
+    argoLogLoading = true;
+    const target = `${namespace}/${pod}/${container}`;
+    try {
+      const response = await invokeRead<PodLogResponse>('read_pod_logs', {
+        request: { kubeconfigPath: activeKubeconfigPath || kubeconfigPath || null, context: activeCluster, namespace, pod, container: container || null, sinceTime: null, tailLines: 500 },
+      });
+      if (`${argoLog?.namespace}/${argoLog?.pod}/${container}` !== target) return;
+      argoLogContainers = response.containers;
+      argoLogContainer = response.selectedContainer || container;
+      argoLogLines = response.lines;
+      await tick();
+      if (argoLogViewport) argoLogViewport.scrollTop = argoLogViewport.scrollHeight;
+      const last = [...response.lines].reverse().map(logLineTimestamp).find(Boolean);
+      void startArgoLogStream(last || new Date().toISOString());
+    } catch (error) {
+      if (`${argoLog?.namespace}/${argoLog?.pod}/${container}` === target) argoLogError = String(error).replace(/^Error:\s*/, '');
+    } finally {
+      argoLogLoading = false;
+    }
+  }
+
+  async function startArgoLogStream(sinceTime: string) {
+    if (!argoLog || !('__TAURI_INTERNALS__' in window)) return;
+    const streamId = `argo-logs-${++logStreamSerial}`;
+    argoLogStreamId = streamId;
+    argoLogStatus = 'reconnecting';
+    try {
+      const [{ invoke }, { listen }] = await Promise.all([import('@tauri-apps/api/core'), import('@tauri-apps/api/event')]);
+      logStreamUnlisten ??= await listen<LogStreamSignal>('kuberniva://log-stream', ({ payload }) => handleLogStreamSignal(payload));
+      if (argoLogStreamId !== streamId || !argoLog) return;
+      await invoke('start_log_stream', { request: { streamId, kubeconfigPath: activeKubeconfigPath || kubeconfigPath || null, context: activeCluster, namespace: argoLog.namespace, pod: argoLog.pod, container: argoLogContainer || null, sinceTime } });
+    } catch (error) {
+      if (argoLogStreamId === streamId) {
+        argoLogStatus = 'off';
+        argoLogError = `Live streaming is unavailable: ${String(error)}`;
+      }
+    }
+  }
+
+  function stopArgoLogStream() {
+    if (!argoLogStreamId) return;
+    const streamId = argoLogStreamId;
+    argoLogStreamId = '';
+    argoLogStatus = 'off';
+    void import('@tauri-apps/api/core').then(({ invoke }) => invoke('stop_log_stream', { streamId })).catch(() => undefined);
+  }
+
+  function closeArgoLogs() {
+    stopArgoLogStream();
+    argoLog = null;
+    argoLogLines = [];
+  }
+
+  async function handleArgoLogSignal(signal: LogStreamSignal) {
+    argoLogStatus = signal.status;
+    if (!signal.lines.length) return;
+    const combined = [...argoLogLines, ...signal.lines];
+    argoLogLines = combined.length > 5_000 ? combined.slice(-5_000) : combined;
+    await tick();
+    if (argoLogFollow && argoLogViewport) argoLogViewport.scrollTop = argoLogViewport.scrollHeight;
+  }
+
+  function argoLogScrolled() {
+    if (!argoLogViewport) return;
+    // Scrolling up pauses following; scrolling back to the end resumes it, like Argo CD.
+    argoLogFollow = argoLogViewport.scrollHeight - argoLogViewport.scrollTop - argoLogViewport.clientHeight < 24;
   }
 
   function openArgoApp(app: ArgoApp) {
@@ -1195,11 +1361,15 @@
   let helmDetailError = '';
   let helmDetailTab: 'values' | 'notes' | 'manifest' | 'history' = 'values';
   let helmListPercent = 58;
-  const helmColumns: GridColumn[] = [
-    { key: 'name', label: 'Release', width: 'minmax(150px, 1.2fr)' }, { key: 'namespace', label: 'Namespace', width: 'minmax(100px, .8fr)' },
-    { key: 'chart', label: 'Chart', width: 'minmax(120px, 1fr)' }, { key: 'appVersion', label: 'App version', width: '110px' },
-    { key: 'revision', label: 'Rev', width: '56px' }, { key: 'status', label: 'Status', width: '112px' }, { key: 'updated', label: 'Updated', width: '84px' },
+  const helmColumnsAll: GridColumn[] = [
+    { key: 'name', label: 'Release', width: 'minmax(130px, 1.2fr)' }, { key: 'namespace', label: 'Namespace', width: 'minmax(90px, .8fr)' },
+    { key: 'chart', label: 'Chart', width: 'minmax(110px, 1fr)' }, { key: 'appVersion', label: 'App version', width: 'minmax(80px, .6fr)' },
+    { key: 'revision', label: 'Rev', width: '48px' }, { key: 'status', label: 'Status', width: '104px' }, { key: 'updated', label: 'Updated', width: '72px' },
   ];
+  // Beside an open release the list keeps only what identifies it, so nothing is cut off.
+  const HELM_COMPACT = new Set(['name', 'status']);
+  $: helmCompact = Boolean(selectedHelmKey);
+  $: helmColumns = helmCompact ? helmColumnsAll.filter((column) => HELM_COMPACT.has(column.key)) : helmColumnsAll;
   $: visibleHelmReleases = helmReleases.filter((release) => matchesSearch(searchTokens(helmSearch), [release.name, release.namespace, release.chart, release.chartVersion, release.appVersion, release.status]));
   $: selectedHelmRelease = helmReleases.find((release) => helmKey(release) === selectedHelmKey) || null;
   $: if (activeView === 'Helm' && activeClusterId && helmClusterKey && helmClusterKey !== `${activeClusterId}|${namespace}`) void loadHelmReleases(true);
@@ -1367,6 +1537,7 @@
   }
 
   const TOPOLOGY_ICONS: Record<string, typeof Globe> = {
+    Namespace: Boxes, ServiceAccount: KeyRound, Role: Shield, RoleBinding: Shield, ClusterRole: ShieldCheck, ClusterRoleBinding: ShieldCheck, HorizontalPodAutoscaler: Zap, EndpointSlice: NetworkIcon, Endpoints: NetworkIcon, NetworkPolicy: Shield, CustomResourceDefinition: Blocks,
     Gateway: Globe, Ingress: Globe, HTTPRoute: Globe, GRPCRoute: Globe, Service: Network,
     Deployment: Workflow, StatefulSet: Database, DaemonSet: Server, ReplicaSet: Blocks, CronJob: Clock, Job: Clock,
     Pod: Container, ConfigMap: FileText, Secret: KeyRound, PersistentVolumeClaim: HardDrive,
@@ -1466,11 +1637,14 @@
   $: visibleOcmClusters = ocmClusters.filter((cluster) => matchesSearch(ocmSearchTokens, [cluster.name, cluster.health, cluster.clusterSet, cluster.kubernetes, ...cluster.claims.map((claim) => claim.value), ...cluster.labels.map(([key, value]) => `${key}=${value}`)]));
   $: ocmSummary = { total: ocmClusters.length, healthy: ocmClusters.filter((cluster) => cluster.health === 'Healthy').length, degraded: ocmClusters.filter((cluster) => cluster.health === 'Degraded' || cluster.health === 'Unknown').length, pending: ocmClusters.filter((cluster) => cluster.health === 'Pending').length };
   $: selectedOcm = ocmClusters.find((cluster) => cluster.name === selectedOcmCluster) || null;
-  const ocmClusterColumns: GridColumn[] = [
-    { key: 'name', label: 'Cluster', width: 'minmax(150px, 1.2fr)' }, { key: 'health', label: 'Status', width: '112px' },
-    { key: 'set', label: 'Cluster set', width: 'minmax(100px, .8fr)' }, { key: 'version', label: 'Kubernetes', width: '100px' },
-    { key: 'platform', label: 'Platform', width: 'minmax(90px, .7fr)' }, { key: 'cpu', label: 'CPU', width: '90px' }, { key: 'memory', label: 'Memory', width: '84px' },
+  const ocmClusterColumnsAll: GridColumn[] = [
+    { key: 'name', label: 'Cluster', width: 'minmax(130px, 1.2fr)' }, { key: 'health', label: 'Status', width: '104px' },
+    { key: 'set', label: 'Cluster set', width: 'minmax(80px, .8fr)' }, { key: 'version', label: 'Kubernetes', width: 'minmax(80px, .6fr)' },
+    { key: 'platform', label: 'Platform', width: 'minmax(70px, .7fr)' }, { key: 'cpu', label: 'CPU', width: 'minmax(70px, .5fr)' }, { key: 'memory', label: 'Memory', width: 'minmax(70px, .5fr)' },
   ];
+  // Beside an open cluster the list keeps the name and status; the details show the rest.
+  $: ocmCompact = Boolean(selectedOcm);
+  $: ocmClusterColumns = ocmCompact ? ocmClusterColumnsAll.filter((column) => column.key === 'name' || column.key === 'health') : ocmClusterColumnsAll;
 
   function ocmClaim(cluster: OcmCluster, ...names: string[]) {
     return cluster.claims.find((claim) => names.includes(claim.name))?.value || '';
@@ -2934,9 +3108,9 @@
 
   type GridColumn = { key: string; label: string; width: string };
   const overviewNodeColumns: GridColumn[] = [
-    { key: 'node', label: 'Node', width: 'minmax(160px, 1.4fr)' }, { key: 'status', label: 'Status', width: '130px' },
-    { key: 'roles', label: 'Roles', width: 'minmax(100px, .8fr)' }, { key: 'cpu', label: 'CPU', width: 'minmax(120px, 1fr)' },
-    { key: 'memory', label: 'Memory', width: 'minmax(120px, 1fr)' }, { key: 'kubelet', label: 'Kubelet', width: '90px' },
+    { key: 'node', label: 'Node', width: 'minmax(120px, 1.4fr)' }, { key: 'status', label: 'Status', width: '96px' },
+    { key: 'roles', label: 'Roles', width: 'minmax(70px, .8fr)' }, { key: 'cpu', label: 'CPU', width: 'minmax(100px, 1fr)' },
+    { key: 'memory', label: 'Memory', width: 'minmax(100px, 1fr)' }, { key: 'kubelet', label: 'Kubelet', width: '72px' },
   ];
   const argoAppColumns: GridColumn[] = [
     { key: 'app', label: 'Application', width: 'minmax(170px, 1.3fr)' }, { key: 'health', label: 'Health', width: '118px' },
@@ -3643,9 +3817,9 @@
   function loadUiScalePreference() {
     try {
       const saved = Number(window.localStorage.getItem(uiScaleStorageKey));
-      return Number.isFinite(saved) && saved >= 0.8 && saved <= 1.25 ? saved : 0.9;
+      return Number.isFinite(saved) && saved >= 0.8 && saved <= 1.25 ? saved : 1;
     } catch {
-      return 0.9;
+      return 1;
     }
   }
 
@@ -4267,7 +4441,7 @@
   }
 
   function buildWorkloadColumnsAuto(pod: boolean, allNamespaces: boolean, density: 'compact' | 'medium' | 'full', server: { name: string; index: number }[]) {
-    const columns: { key: WorkloadColumnKey; label: string; width: string }[] = [{ key: 'name', label: 'Name', width: 'minmax(170px, 2fr)' }];
+    const columns: { key: WorkloadColumnKey; label: string; width: string }[] = [{ key: 'name', label: 'Name', width: 'minmax(130px, 2fr)' }];
     if (!pod && server.length) {
       // Deployments, StatefulSets, Jobs…: the server's own columns (Ready, Up-to-date, Completions…).
       const shown = density === 'compact' ? server.slice(0, 1) : density === 'medium' ? server.slice(0, 3) : server;
@@ -4286,13 +4460,13 @@
       return columns;
     }
     if (allNamespaces) columns.push({ key: 'namespace', label: 'Namespace', width: 'minmax(90px, .7fr)' });
-    if (pod) columns.push({ key: 'node', label: 'Node', width: 'minmax(110px, 1.1fr)' });
-    columns.push({ key: 'status', label: 'Status', width: '96px' });
+    if (pod) columns.push({ key: 'node', label: 'Node', width: 'minmax(80px, 1.1fr)' });
+    columns.push({ key: 'status', label: 'Status', width: 'minmax(84px, .5fr)' });
     if (pod) {
-      columns.push({ key: 'ready', label: 'Ready', width: '52px' }, { key: 'restarts', label: 'Restarts', width: '64px' });
-      columns.push({ key: 'cpu', label: 'CPU', width: '84px' }, { key: 'memory', label: 'Memory', width: '72px' });
+      columns.push({ key: 'ready', label: 'Ready', width: 'minmax(48px, .3fr)' }, { key: 'restarts', label: 'Restarts', width: 'minmax(58px, .35fr)' });
+      columns.push({ key: 'cpu', label: 'CPU', width: 'minmax(64px, .45fr)' }, { key: 'memory', label: 'Memory', width: 'minmax(64px, .45fr)' });
     }
-    columns.push({ key: 'age', label: 'Age', width: '44px' });
+    columns.push({ key: 'age', label: 'Age', width: 'minmax(44px, .3fr)' });
     return columns;
   }
 
@@ -5941,6 +6115,10 @@
   }
 
   async function handleLogStreamSignal(signal: LogStreamSignal) {
+    if (signal.streamId === argoLogStreamId) {
+      void handleArgoLogSignal(signal);
+      return;
+    }
     if (signal.streamId !== logStreamId) return;
     logStreamStatus = signal.status;
     if (!signal.lines.length) return;
@@ -6322,7 +6500,7 @@
         }
         if (event.key === '0') {
           event.preventDefault();
-          void applyUiScale(0.9);
+          void applyUiScale(1);
           return;
         }
       }
@@ -7204,6 +7382,24 @@
               <div class="argo-app-tabs" role="tablist" aria-label="Application sections">
                 {#each [['overview', 'Overview'], ['graph', 'Graph'], ['parameters', 'Parameters'], ['resources', `Resources ${app.resources.length}`], ['sync', 'Last sync'], ['history', `History ${app.history.length}`], ['events', 'Events']] as [tab, label]}<button type="button" role="tab" aria-selected={argoAppTab === tab} on:click={() => (argoAppTab = tab as ArgoAppTab)}>{label}</button>{/each}
               </div>
+              {#if argoLog}
+                <section class="argo-log-drawer" aria-label={`Logs for ${argoLog.pod}`}>
+                  <header>
+                    <span class="argo-graph-icon"><ScrollText size={15} /></span>
+                    <div><small>Pod logs · {argoLog.namespace}</small><strong title={argoLog.pod}>{argoLog.pod}</strong></div>
+                    <span class="log-stream-state log-stream-{argoLogStatus}">{argoLogLoading ? 'Loading…' : argoLogStatus === 'live' ? 'Live' : argoLogStatus === 'reconnecting' ? 'Connecting…' : argoLogStatus === 'ended' ? 'Container stopped' : 'Snapshot'}</span>
+                    <button type="button" class="topology-popup-close" aria-label="Close logs" on:click={closeArgoLogs}>×</button>
+                  </header>
+                  <div class="argo-log-tools">
+                    {#if argoLogContainers.length > 1}<label>Container <select value={argoLogContainer} on:change={(event) => argoLog && openArgoPodLogs(argoLog.pod, argoLog.namespace, event.currentTarget.value)}>{#each argoLogContainers as container}<option value={container}>{container}</option>{/each}</select></label>{/if}
+                    <button type="button" class:log-tool-button-active={argoLogFollow} class="log-tool-button" on:click={() => { argoLogFollow = !argoLogFollow; if (argoLogFollow && argoLogViewport) argoLogViewport.scrollTop = argoLogViewport.scrollHeight; }}>{argoLogFollow ? 'Following' : 'Follow'}</button>
+                    <button type="button" class="log-tool-button" on:click={() => argoLog && openArgoPodLogs(argoLog.pod, argoLog.namespace, argoLogContainer)}><RefreshCw size={13} />Reload</button>
+                    <button type="button" class="log-tool-button" on:click={() => { const target = argoLog; if (target && selectedArgoApp) { closeArgoLogs(); void openPodLogs({ name: target.pod, namespace: target.namespace }, [], `Argo CD · ${selectedArgoApp.name}`); } }}>Open full view</button>
+                  </div>
+                  {#if argoLogError}<p class="topology-popup-note">{argoLogError}</p>{/if}
+                  <pre class="live-log-output argo-log-output" bind:this={argoLogViewport} on:scroll={argoLogScrolled}>{#if argoLogEntries.length}{#each argoLogEntries as entry}<span class="log-line log-level-{entry.level}" class:log-line-multi={entry.lines > 1}><span class="log-time" title={entry.stamp}>{entry.time}</span><span class="log-text">{entry.text}</span></span>{/each}{:else if !argoLogLoading}No log lines yet. New lines appear here as the container writes them.{/if}</pre>
+                </section>
+              {/if}
               <div class="argo-app-body">
                 {#if argoAppTab === 'overview'}
                   <div class="argo-overview-grid">
@@ -7242,26 +7438,60 @@
                     </section>
                   </div>
                 {:else if argoAppTab === 'graph'}
+                  {@const summary = argoGraphHealth.summary}
                   <div class="argo-graph-toolbar">
-                    <div class="argo-graph-legend"><span class="argo-badge argo-tone-ok"><Heart size={11} />Healthy</span><span class="argo-badge argo-tone-warn"><LoaderCircle size={11} />Progressing</span><span class="argo-badge argo-tone-bad"><HeartCrack size={11} />Degraded</span><span class="argo-badge argo-tone-warn"><CircleArrowUp size={11} />Out of sync</span></div>
-                    <small>{app.inCluster ? (argoTreeLoading && !argoTreeNodes.length ? 'Finding ReplicaSets and Pods…' : argoTreeError ? `Live objects unavailable: ${argoTreeError}` : 'Live objects refresh every 10 seconds · click a node to open it') : 'Managed resources only · live objects are shown for apps deployed to this cluster'}</small>
+                    <div class="argo-graph-filters" role="radiogroup" aria-label="Show resources">
+                      <button type="button" role="radio" aria-checked={argoGraphFilter === 'all'} class:active={argoGraphFilter === 'all'} on:click={() => (argoGraphFilter = 'all')}>All<b>{argoGraphNodes.length - 1}</b></button>
+                      {#if summary.failures.length}<button type="button" role="radio" aria-checked={argoGraphFilter === 'problems'} class:active={argoGraphFilter === 'problems'} class="argo-filter-bad" on:click={() => (argoGraphFilter = argoGraphFilter === 'problems' ? 'all' : 'problems')}><HeartCrack size={12} />Problems<b>{summary.failures.length}</b></button>{/if}
+                      {#each ['Healthy', 'Progressing', 'Degraded', 'Suspended', 'Missing'] as health}{#if summary.health[health]}<button type="button" role="radio" aria-checked={argoGraphFilter === health} class:active={argoGraphFilter === health} class="argo-tone-{argoTone(health)}" on:click={() => (argoGraphFilter = argoGraphFilter === health ? 'all' : health)}><svelte:component this={argoHealthIcon(health)} size={12} />{health}<b>{summary.health[health]}</b></button>{/if}{/each}
+                      {#if summary.outOfSync}<button type="button" role="radio" aria-checked={argoGraphFilter === 'OutOfSync'} class:active={argoGraphFilter === 'OutOfSync'} class="argo-tone-warn" on:click={() => (argoGraphFilter = argoGraphFilter === 'OutOfSync' ? 'all' : 'OutOfSync')}><CircleArrowUp size={12} />Out of sync<b>{summary.outOfSync}</b></button>{/if}
+                    </div>
+                    <div class="argo-graph-zoom" role="group" aria-label="Zoom"><button type="button" aria-label="Zoom out" on:click={() => zoomArgoGraph(-0.1)}>−</button><output>{Math.round(argoGraphScale * 100)}%</output><button type="button" aria-label="Zoom in" on:click={() => zoomArgoGraph(0.1)}>+</button><button type="button" class="argo-graph-fit" on:click={() => fitArgoGraph()}>Fit</button></div>
                   </div>
+                  {#if summary.failures.length}
+                    <div class="argo-graph-failures" aria-label="Failing resources">
+                      {#each summary.failures.slice(0, 6) as failure (failure.id)}
+                        <button type="button" class="argo-tone-{argoTone(failure.health)}" title="Show on the graph" on:click={() => focusArgoGraphNode(failure.id)}><svelte:component this={argoHealthIcon(failure.health)} size={13} /><strong>{failure.kind} {failure.name}</strong><span>{failure.reason}</span></button>
+                      {/each}
+                      {#if summary.failures.length > 6}<small>+{summary.failures.length - 6} more · use Problems to see them all</small>{/if}
+                    </div>
+                  {/if}
+                  {#if !app.inCluster || argoTreeError || (argoTreeLoading && !argoTreeNodes.length)}<p class="argo-graph-note">{app.inCluster ? (argoTreeError ? `Live Pods and ReplicaSets are unavailable: ${argoTreeError}` : 'Finding ReplicaSets and Pods…') : 'Showing managed resources only; live Pods are shown for apps deployed to this cluster.'}</p>{/if}
                   {#if argoGraph}
-                    <div class="argo-graph-scroll">
-                      <div class="argo-graph" style:width={`${argoGraph.width}px`} style:height={`${argoGraph.height}px`}>
-                        <svg class="argo-graph-edges" width={argoGraph.width} height={argoGraph.height} aria-hidden="true">{#each argoGraph.edges as edge (edge.to)}<path d={edge.path} class="argo-edge argo-tone-{argoTone(edge.tone || 'Unknown')}" />{/each}</svg>
-                        {#each argoGraph.nodes as node (node.id)}
-                          <button type="button" class:argo-graph-root={node.id === 'app'} class:argo-graph-more={Boolean(node.more)} class="argo-graph-node argo-tone-{argoTone(node.health || (node.sync === 'OutOfSync' ? 'OutOfSync' : 'Unknown'))}" style:left={`${node.x}px`} style:top={`${node.y}px`} title={`${node.kind} ${node.namespace ? `${node.namespace}/` : ''}${node.name}${node.info ? ` · ${node.info}` : ''}`} on:click={() => openArgoGraphNode(node)}>
-                            {#if node.more}<strong>{node.name}</strong><small>Show all {node.kind}s</small>
-                            {:else}
-                              <span class="argo-graph-icon">{#if node.id === 'app'}<GitBranch size={15} />{:else}<svelte:component this={node.health ? argoHealthIcon(node.health) : CircleCheck} size={14} />{/if}</span>
-                              <span class="argo-graph-text"><small>{node.kind}</small><strong>{node.name}</strong>{#if node.info}<em>{node.info}</em>{/if}</span>
-                              {#if node.sync === 'OutOfSync'}<CircleArrowUp size={14} class="argo-graph-sync" />{/if}
-                            {/if}
-                          </button>
-                        {/each}
+                    <!-- svelte-ignore a11y_no_static_element_interactions -->
+                    <div class="argo-graph-scroll argo-graph-viewport" bind:this={argoGraphViewport} on:pointerdown={panArgoGraph} on:wheel={argoGraphZoomKeys}>
+                      <div class="argo-graph-sizer" style:width={`${argoGraph.width * argoGraphScale + 160}px`} style:height={`${argoGraph.height * argoGraphScale + 120}px`}>
+                        <div class="argo-graph" style:width={`${argoGraph.width}px`} style:height={`${argoGraph.height}px`} style:transform={`scale(${argoGraphScale})`}>
+                          <svg class="argo-graph-edges" width={argoGraph.width} height={argoGraph.height} aria-hidden="true">{#each argoGraph.edges as edge (edge.to)}{@const tone = argoTone(edge.tone || 'Unknown')}<path d={edge.path} class:argo-edge-flow={tone === 'bad' || tone === 'warn'} class:argo-graph-dim={argoGraphFilter !== 'all' && !matchesFilter(argoGraphFilter === 'problems' ? 'problems' : argoGraphFilter, argoGraph.nodes.find((candidate) => candidate.id === edge.to) ?? { id: '', parent: null, kind: '', name: '' }, argoGraphHealth.nodes.get(edge.to))} class="argo-edge argo-tone-{tone}" />{/each}</svg>
+                          {#each argoGraph.nodes as node (node.id)}
+                            {@const health = argoGraphHealth.nodes.get(node.id)}
+                            {@const own = health?.health || node.health || ''}
+                            {@const tone = node.more ? 'none' : argoTone(own || (node.sync === 'OutOfSync' ? 'OutOfSync' : 'Unknown'))}
+                            <button type="button" class:argo-graph-root={node.id === 'app'} class:argo-graph-more={Boolean(node.more)} class:argo-graph-dim={argoGraphFilter !== 'all' && node.id !== 'app' && !matchesFilter(argoGraphFilter, node, health)} class:argo-graph-focus={argoGraphFocus === node.id} class:argo-graph-missing={own === 'Missing'} class="argo-graph-node argo-tone-{tone}" style:left={`${node.x}px`} style:top={`${node.y}px`} title={`${node.kind} ${node.namespace ? `${node.namespace}/` : ''}${node.name}${own ? ` · ${own}` : ''}${node.sync ? ` · ${node.sync}` : ''}${node.info ? `\n${node.info}` : ''}`} on:click={() => openArgoGraphNode(node)}>
+                              {#if node.more}<strong>{node.name}</strong><small>{health?.problemsBelow ? `${health.problemsBelow} failing · ` : ''}show all {node.kind}s</small>
+                              {:else}
+                                <span class="argo-graph-icon">{#if node.id === 'app'}<GitBranch size={16} />{:else}<svelte:component this={TOPOLOGY_ICONS[node.kind] || Boxes} size={15} />{/if}</span>
+                                <span class="argo-graph-text">
+                                  <small>{node.kind}</small>
+                                  <strong>{node.name}</strong>
+                                  {#if health?.pod}
+                                    <em class="argo-pod-line"><span class="argo-pod-containers" aria-label={`${health.pod.ready} of ${health.pod.total} containers ready`}>{#each Array.from({ length: Math.min(health.pod.total, 8) }) as _, index}<i class:ready={index < health.pod.ready}></i>{/each}</span>{health.pod.state}{#if health.pod.restarts}<b class="argo-pod-restarts" title={`${health.pod.restarts} restarts`}>↻ {health.pod.restarts}</b>{/if}</em>
+                                  {:else if node.id === 'app'}<em>{own || 'Unknown'} · {node.sync || 'Unknown'}{node.info ? ` · ${node.info}` : ''}</em>
+                                  {:else if isProblem(own) && (node.info || own)}<em class="argo-graph-reason">{node.info || own}</em>
+                                  {:else if node.info}<em>{node.info}</em>{/if}
+                                </span>
+                                <span class="argo-graph-status">
+                                  {#if own}<span class="argo-graph-health argo-tone-{argoTone(own)}" title={`Health: ${own}`}><svelte:component this={argoHealthIcon(own)} size={14} class={own === 'Progressing' ? 'workspace-loading-spinner' : ''} /></span>{/if}
+                                  {#if node.sync}<span class="argo-graph-syncstate argo-tone-{argoTone(node.sync)}" title={`Sync: ${node.sync}`}><svelte:component this={argoSyncIcon(node.sync)} size={14} /></span>{/if}
+                                </span>
+                                {#if health && health.problemsBelow && !isProblem(own) && node.id !== 'app'}<span class="argo-graph-below" title="Resources below this one are failing">{health.problemsBelow} failing below</span>{/if}
+                              {/if}
+                            </button>
+                          {/each}
+                        </div>
                       </div>
                     </div>
+                    <small class="argo-graph-hint">{app.inCluster ? 'Live objects refresh every 10 seconds' : 'Managed resources'} · drag to pan · ⌘ + scroll to zoom · click a resource to open it</small>
                   {/if}
                 {:else if argoAppTab === 'parameters'}
                   <div class="argo-parameters-page">
@@ -7465,11 +7695,13 @@
                     <button type="button" role="row" class:argo-row-selected={selectedOcmCluster === cluster.name} class="argo-row ocm-row" on:click={() => (selectedOcmCluster = selectedOcmCluster === cluster.name ? '' : cluster.name)}>
                       <span class="argo-app-name"><strong>{cluster.name}</strong><small title={cluster.url}>{cluster.url.replace(/^https?:\/\//, '') || '—'}</small></span>
                       <span><span class="argo-badge argo-tone-{ocmTone(cluster.health)}">{cluster.health === 'Healthy' ? 'Available' : cluster.health === 'Degraded' ? 'Unavailable' : cluster.health}</span></span>
-                      <span class="argo-muted">{cluster.clusterSet || '—'}</span>
-                      <span class="argo-muted">{cluster.kubernetes || '—'}</span>
-                      <span class="argo-muted">{ocmClaim(cluster, 'platform.open-cluster-management.io', 'product.open-cluster-management.io') || '—'}</span>
-                      <span class="argo-muted">{cluster.cpu || '—'}</span>
-                      <span class="argo-muted">{cluster.memory || '—'}</span>
+                      {#if !ocmCompact}
+                        <span class="argo-muted">{cluster.clusterSet || '—'}</span>
+                        <span class="argo-muted">{cluster.kubernetes || '—'}</span>
+                        <span class="argo-muted">{ocmClaim(cluster, 'platform.open-cluster-management.io', 'product.open-cluster-management.io') || '—'}</span>
+                        <span class="argo-muted">{cluster.cpu || '—'}</span>
+                        <span class="argo-muted">{cluster.memory || '—'}</span>
+                      {/if}
                     </button>
                   {/each}
                 </div>
@@ -7623,12 +7855,11 @@
                 {#each visibleHelmReleases as release (helmKey(release))}
                   <button type="button" role="row" class:argo-row-selected={selectedHelmKey === helmKey(release)} class="argo-row helm-row" on:click={() => { helmDetailTab = 'values'; void loadHelmDetail(release); }}>
                     <span class="argo-app-name"><strong>{release.name}</strong><small>{release.description}</small></span>
-                    <span class="argo-muted">{release.namespace}</span>
-                    <span class="argo-muted" title={`${release.chart}-${release.chartVersion}`}>{release.chart} {release.chartVersion}</span>
-                    <span class="argo-muted">{release.appVersion || '—'}</span>
-                    <span>{release.revision}</span>
+                    {#if !helmCompact}<span class="argo-muted">{release.namespace}</span>{/if}
+                    {#if !helmCompact}<span class="argo-muted" title={`${release.chart}-${release.chartVersion}`}>{release.chart} {release.chartVersion}</span>{/if}
+                    {#if !helmCompact}<span class="argo-muted">{release.appVersion || '—'}</span><span>{release.revision}</span>{/if}
                     <span><span class="argo-badge argo-tone-{helmTone(release.status)}">{release.status}</span></span>
-                    <span class="argo-muted">{release.updated ? resourceAge(release.updated) : '—'}</span>
+                    {#if !helmCompact}<span class="argo-muted">{release.updated ? resourceAge(release.updated) : '—'}</span>{/if}
                   </button>
                 {/each}
               </div>

@@ -2,11 +2,10 @@
  * CSS grid tracks for tables with draggable columns.
  *
  * While a column is being dragged, dragged widths are exact pixels so the edge follows the
- * pointer. Once the drag ends, every measured width W becomes a share of the table width at
- * that moment (`REF_WIDTH`): `minmax(max(floor, W/REF %), W fr)`. At the same window size the
- * columns are exactly as dragged; when the window grows or shrinks, all columns scale
- * together and keep their shape, down to each column's own minimum, after which the table
- * scrolls sideways.
+ * pointer. Once the drag ends, every measured width W becomes a share of the table
+ * (`minmax(floor, W fr)`): when the window grows or shrinks, all columns scale together and
+ * keep their shape. Each column only stops at its own small minimum, so a narrow window still
+ * shows every column (Age, Memory…) before the table ever scrolls sideways.
  */
 export const REF_WIDTH = '__ref';
 export type TrackColumn = { key: string; width: string };
@@ -30,9 +29,7 @@ export function columnTracks<T extends TrackColumn>(columns: T[], widths: Record
     if (dragging) return width ? { ...column, natural, min: width, width: `${width}px` } : { ...column, natural, min: floor, width: natural };
     if (width) {
       const min = Math.min(width, floor);
-      const reference = widths[REF_WIDTH];
-      const share = reference > 0 ? `max(${min}px, ${+((100 * width) / reference).toFixed(4)}%)` : `${min}px`;
-      return { ...column, natural, min, width: `minmax(${share}, ${width}fr)` };
+      return { ...column, natural, min, width: `minmax(${min}px, ${width}fr)` };
     }
     // A column that appeared after the last drag (a new server column, say) joins in
     // proportion to its own minimum; fixed-width columns stay fixed.
